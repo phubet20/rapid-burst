@@ -1,1 +1,4 @@
 aiohttp>=3.9,<4
+# cloud engine mode (launcher + engine run beside the backend, MT5 via TickerAll)
+cryptography>=42
+psutil>=5.9

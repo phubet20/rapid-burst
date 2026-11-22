@@ -50,6 +50,12 @@ def make_broker():
     if factory:
         mod, fn = factory.split(":")
         return getattr(importlib.import_module(mod), fn)()
+    if os.environ.get("RB_BROKER", "mt5").strip().lower() == "tickerall":
+        # Linux/cloud path: hosted MT5 connection through TickerAll (no terminal, no Windows)
+        from rapidburst.broker_tickerall import TickerAllBroker
+        cfg = EngineConfig.load()
+        return TickerAllBroker(magic=cfg.magic, comment_prefix=cfg.comment_prefix,
+                               data_dir=os.environ.get("RB_DATA_DIR"))
     return MT5Broker(terminal_path=os.environ.get("MT5_PATH") or None,
                      portable=os.environ.get("MT5_PORTABLE", "1") == "1")
 

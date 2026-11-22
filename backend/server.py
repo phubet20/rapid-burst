@@ -22,6 +22,8 @@ from pathlib import Path
 import aiohttp
 from aiohttp import WSMsgType, web
 
+from .cloud import CloudEngine, cloud_mode_from_env
+
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
 STATIC = ROOT / "static"
@@ -59,6 +61,7 @@ class Hub:
         self.wake_url = wake_url.rstrip("/")
         self.last_wake = 0.0
         self.wakes_sent = 0
+        self.cloud: CloudEngine | None = None
 
     async def wake(self) -> None:
         """Ask the sleeping launcher to connect (ntfy publish of a content-free 'wake')."""
@@ -108,7 +111,9 @@ class Hub:
 
     def state(self) -> dict:
         return {"worker_online": self.worker_online(), "worker_seen": self.worker_seen,
-                "server_time": time.time(), "snapshot": self.snapshot}
+                "server_time": time.time(), "snapshot": self.snapshot,
+                "mode": "cloud" if self.cloud else "launcher",
+                "cloud": self.cloud.status() if self.cloud else None}
 
     async def broadcast(self, msg: dict) -> None:
         dead = []
@@ -187,7 +192,8 @@ async def index(request: web.Request) -> web.StreamResponse:
 
 async def healthz(request: web.Request) -> web.Response:
     hub: Hub = request.app[HUB]
-    return web.json_response({"ok": True, "worker_online": hub.worker_online()})
+    return web.json_response({"ok": True, "worker_online": hub.worker_online(),
+                              "mode": "cloud" if hub.cloud else "launcher"})
 
 
 async def check_ui_password(request: web.Request, password: str) -> web.Response | None:
@@ -292,6 +298,8 @@ async def api_cmd(request: web.Request) -> web.Response:
     if not hub.worker_online():
         await hub.wake()
         if not await hub.wait_worker(30):
+            if hub.cloud:
+                return web.json_response({"ok": False, "msg": "Cloud engine is starting - try again in a few seconds"})
             return web.json_response({"ok": False, "msg": "Launcher offline - wake signal sent but the Windows launcher "
                                                           "did not connect (is the PC/VPS on?)"})
     if cmd == "start":
@@ -332,6 +340,9 @@ async def worker_ws(request: web.Request) -> web.WebSocketResponse:
     if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), hub.worker_secret.encode())):
         await asyncio.sleep(1.0)
         raise web.HTTPUnauthorized(text="bad worker secret")
+    if hub.cloud and (request.headers.get("X-Forwarded-For") or request.remote not in ("127.0.0.1", "::1")):
+        # cloud mode: only the in-process launcher may hold the worker slot (avoids two engines fighting)
+        raise web.HTTPConflict(text="backend runs the cloud engine (ENGINE_MODE=cloud); remote launchers are disabled")
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=4 * 1024 * 1024)
     await ws.prepare(request)
     old = hub.worker_ws
@@ -390,9 +401,22 @@ async def bootstrap_zip(request: web.Request) -> web.Response:
     return web.Response(body=hub.worker_zip, content_type="application/zip")
 
 
-def make_app(ui_password: str, worker_secret: str, wake_url: str = "") -> web.Application:
+def make_app(ui_password: str, worker_secret: str, wake_url: str = "",
+             cloud: CloudEngine | None = None) -> web.Application:
     app = web.Application(middlewares=[security_headers], client_max_size=64 * 1024)
-    app[HUB] = Hub(ui_password, worker_secret, wake_url)
+    hub = Hub(ui_password, worker_secret, "" if cloud else wake_url)
+    app[HUB] = hub
+    if cloud:
+        hub.cloud = cloud
+        cloud.snapshot_fn = lambda: hub.snapshot
+
+        async def _cloud_start(_app):
+            await cloud.start()
+
+        async def _cloud_stop(_app):
+            await cloud.stop()
+        app.on_startup.append(_cloud_start)
+        app.on_cleanup.append(_cloud_stop)
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/api/login", login)
@@ -414,8 +438,15 @@ def main() -> None:
     if len(ui_pw) < 10 or len(secret) < 24:
         raise SystemExit("UI_PASSWORD (>=10 chars) and WORKER_SECRET (>=24 chars) are too short")
     wake = os.environ.get("WAKE_URL", "https://ntfy.sh").strip()
-    web.run_app(make_app(ui_pw, secret, "" if wake.lower() == "off" else wake), host="0.0.0.0",
-                port=int(os.environ.get("PORT", "10000")))
+    port = int(os.environ.get("PORT", "10000"))
+    cloud = None
+    if cloud_mode_from_env():
+        cloud = CloudEngine(port, secret, public_url=os.environ.get("RENDER_EXTERNAL_URL", "").strip(),
+                            ping_interval=float(os.environ.get("RB_KEEPALIVE_SECONDS", "240")))
+        log.info("cloud engine mode (TickerAll); TICKERALL_API_KEY %s",
+                 "set" if os.environ.get("TICKERALL_API_KEY", "").strip() else "NOT set")
+    web.run_app(make_app(ui_pw, secret, "" if wake.lower() == "off" else wake, cloud=cloud), host="0.0.0.0",
+                port=port)
 
 
 if __name__ == "__main__":

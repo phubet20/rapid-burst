@@ -357,7 +357,8 @@ class Trader:
             checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
         avail, why = self.broker.available()
-        add("MetaTrader5 package", avail, why if not avail else "official package loaded")
+        add(getattr(self.broker, "avail_label", "MetaTrader5 package"), avail,
+            why if (not avail or self.broker.name != "mt5") else "official package loaded")
         connected = self.conn_state == "CONNECTED" and self.broker.is_connected()
         add("Terminal connected to broker", connected, self.conn_msg)
         acct = self.account
@@ -369,7 +370,8 @@ class Trader:
             term = self.terminal
             algo = bool(term.get("trade_allowed")) and not bool(term.get("tradeapi_disabled"))
             add("Algo trading enabled in terminal", algo,
-                "ok" if algo else "enable 'Algo Trading' in the MT5 terminal")
+                "ok" if algo else ("read-only (investor) login - use the trading password"
+                                   if self.broker.name == "tickerall" else "enable 'Algo Trading' in the MT5 terminal"))
             acc_ok = bool(acct.get("trade_allowed")) and bool(acct.get("trade_expert"))
             add("Account allows expert trading", acc_ok, "ok" if acc_ok else "broker disallows automated trading")
             good = []
@@ -709,7 +711,8 @@ class Trader:
             "conn": {"state": self.conn_state, "msg": self.conn_msg,
                      "terminal_connected": bool(self.terminal.get("connected")) if self.conn_state == "CONNECTED" else False,
                      "algo_trading": bool(self.terminal.get("trade_allowed")) if self.conn_state == "CONNECTED" else False,
-                     "ping_ms": round(self.terminal.get("ping_last", 0) / 1000.0, 1) if self.conn_state == "CONNECTED" else None},
+                     "ping_ms": (round(self.terminal["ping_last"] / 1000.0, 1)
+                                 if self.conn_state == "CONNECTED" and self.terminal.get("ping_last") is not None else None)},
             "account": ({"login": acct.get("login"), "server": acct.get("server"), "name": acct.get("name"),
                          "company": acct.get("company"), "currency": acct.get("currency"),
                          "leverage": acct.get("leverage"), "mode": mode,

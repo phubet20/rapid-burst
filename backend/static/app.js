@@ -58,7 +58,9 @@
     const online = !!S.worker_online;
     const L = s.launcher || {};
     const lc = L.last_connect || null;
-    badge($("bWorker"), online ? "LAUNCHER ON" : "LAUNCHER WAKING…", online ? "ok" : "warn");
+    const cloud = S.mode === "cloud";
+    badge($("bWorker"), cloud ? (online ? "CLOUD ENGINE ON" : "CLOUD ENGINE STARTING…") : (online ? "LAUNCHER ON" : "LAUNCHER WAKING…"),
+      online ? "ok" : "warn");
     const st = online ? (conn.state || "—") : "UNKNOWN";
     badge($("bMt5"), st === "IDLE" ? "MT5 OFF (idle)" : "MT5 " + st,
       st === "CONNECTED" ? "ok" : (st === "CONNECTING" || st === "IDLE") ? "warn" : "bad");
@@ -68,11 +70,13 @@
     const engTxt = !online ? "ENGINE —" : eng.halted ? "HALTED" : phase === "IDLE" ? "ENGINE OFF" : phase;
     badge($("bEngine"), engTxt, eng.halted ? "bad" : phase === "RUNNING" ? "ok" : "warn");
 
-    $("connLine").textContent = !online
-      ? "Waking the Windows launcher… (if this stays, the PC/VPS launcher is off or offline)"
+    const ka = (S.cloud || {}).keepalive || {};
+    const cloudNote = cloud ? ` · cloud (TickerAll)${(S.cloud || {}).api_key_set ? "" : " · TICKERALL_API_KEY NOT SET"}${ka.active ? ` · keep-awake ON (${ka.pings_ok || 0} pings)` : ""}` : "";
+    $("connLine").textContent = (!online
+      ? (cloud ? "Cloud engine starting on the server…" : "Waking the Windows launcher… (if this stays, the PC/VPS launcher is off or offline)")
       : st === "IDLE"
       ? `Engine off - nothing running. ${lc ? `Last check ${new Date(lc.ts * 1000).toLocaleString("en-GB")}: ${lc.validation_ok ? "validated ✓" : "not validated ✗ " + (lc.failed_checks || []).join(", ")}` : "Use CONNECT MT5 first."}`
-      : `${conn.msg || ""}${conn.ping_ms != null ? ` · ping ${conn.ping_ms} ms` : ""}${conn.state === "CONNECTED" ? ` · algo trading ${conn.algo_trading ? "ON" : "OFF"}` : ""}`;
+      : `${conn.msg || ""}${conn.ping_ms != null ? ` · ping ${conn.ping_ms} ms` : ""}${conn.state === "CONNECTED" ? ` · algo trading ${conn.algo_trading ? "ON" : "OFF"}` : ""}`) + cloudNote;
     $("acctLine").textContent = acct ? `#${acct.login} · ${acct.server} · ${acct.company || ""} · ${acct.currency} · 1:${acct.leverage}`
       : (lc && lc.account ? `last: #${lc.account.login} · ${lc.account.server} · ${lc.account.mode}` : "");
 
@@ -127,7 +131,7 @@
     ws.onopen = () => { wsRetry = 1000; };
     ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data);
-      if (m.type === "state") { S.worker_online = m.worker_online; S.snapshot = m.snapshot || {}; if (m.logs) { logs = []; lastSeq = 0; addLogs(m.logs); } render(); }
+      if (m.type === "state") { S.worker_online = m.worker_online; S.snapshot = m.snapshot || {}; S.mode = m.mode; S.cloud = m.cloud; if (m.logs) { logs = []; lastSeq = 0; addLogs(m.logs); } render(); }
       else if (m.type === "logs") addLogs(m.logs);
       else if (m.type === "worker") { S.worker_online = m.worker_online; render(); }
     };
@@ -187,7 +191,7 @@
   async function boot() {
     try {
       const st = await api("/api/state");
-      S.worker_online = st.worker_online; S.snapshot = st.snapshot || {};
+      S.worker_online = st.worker_online; S.snapshot = st.snapshot || {}; S.mode = st.mode; S.cloud = st.cloud;
       logs = []; lastSeq = 0; addLogs(st.logs); render(); hideLogin(); connectWs();
     } catch { /* login */ }
   }

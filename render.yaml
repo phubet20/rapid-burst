@@ -1,4 +1,5 @@
-# Render Blueprint - backend + iPhone UI (relay only; trading runs on the Windows launcher/engine). Free plan sleeps when unused.
+# Render Blueprint - backend + iPhone UI. ENGINE_MODE=cloud runs the launcher+engine beside the backend
+# (MT5 via TickerAll, demo only); ENGINE_MODE=launcher relays to a Windows launcher. Free plan sleeps when unused.
 services:
   - type: web
     name: rapid-burst
@@ -17,3 +18,7 @@ services:
         sync: false
       - key: WAKE_URL
         value: https://ntfy.sh
+      - key: ENGINE_MODE
+        value: cloud
+      - key: TICKERALL_API_KEY
+        sync: false

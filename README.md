@@ -96,6 +96,50 @@ python -m pytest -q tests
 python -m tests.replay --seeds 1 2 3 --hours 2     # SYNTHETIC replay, not market evidence
 ```
 
+## No-computer mode: cloud engine on Render + TickerAll (free, DEMO only)
+
+If you have no Windows PC/VPS, the same launcher + engine run **beside the backend on
+Render** and reach MetaTrader 5 through [TickerAll](https://tickerall.com) (a hosted MT5
+API; free plan = demo accounts only, no card). Nothing in the engine, risk rules,
+DEMO gate or START/STOP lifecycle changes - only the broker adapter
+(`worker/rapidburst/broker_tickerall.py`) is different.
+
+Setup (phone only):
+1. Open a free MT5 **demo** account with your broker (or use an existing demo login).
+2. Sign up at tickerall.com (Free plan) and create an API key (`cf_api_...`).
+3. In Render -> rapid-burst -> Environment add `TICKERALL_API_KEY` = that key
+   (`ENGINE_MODE=cloud` is already set). Save; Render redeploys.
+4. Open the app, CONNECT MT5 (login / password / server), then START.
+
+How it behaves:
+* CONNECT/START: the engine opens a TickerAll session (`POST /v1/sessions`), re-reads
+  account/positions/orders, subscribes to the tick WebSocket (which also keeps the
+  TickerAll account from cooling) and warms up on fresh ticks only.
+* STOP: entries blocked, bot pending orders cancelled, bot positions closed and verified,
+  then the engine exits and the TickerAll session is released (`DELETE /v1/sessions/{id}`).
+* Bot trades are identified by the comment prefix `RBurst` (TickerAll cannot set an MT5
+  magic number) plus a ticket registry; manual trades and other EAs are never touched.
+* Keep-awake: while STARTED (or holding bot positions) the server requests its own
+  `/healthz` every 4 minutes so Render's free instance does not sleep; after STOP it
+  stops and Render sleeps after ~15 idle minutes.
+* Live accounts are refused (TickerAll free: `FREE_TIER_LIVE_REJECTED`; engine: DEMO gate).
+
+Limits to know (honest):
+* Render free = 750 instance-hours per month per workspace, shared by all free services
+  (e.g. `grokbot-trader`). Running 24h/day uses ~720 h/month on its own; if the total
+  runs out, Render suspends free services until the next month.
+* Render restarts (deploys, crashes, maintenance) wipe memory: the MT5 password is kept
+  in memory only, so press CONNECT MT5 again after a restart (or set `MT5_LOGIN`,
+  `MT5_PASSWORD`, `MT5_SERVER` on Render for automatic reconnects). Bot positions keep
+  their broker-side SL/TP meanwhile. The daily-P/L history of trades closed before a
+  restart is recovered only for positions whose tickets the adapter saw.
+* TickerAll holds the MT5 password in its memory only; after its weekly maintenance
+  (Sunday 06:00-10:00 UTC) the adapter re-opens the session with the in-memory password.
+* Execution goes phone -> Render (Singapore) -> TickerAll -> broker, so latency is higher
+  than a local terminal. Margin is an estimate (contract x lots / leverage) and only when
+  the symbol's margin/profit currency is the account currency; otherwise no entry.
+* Windows launcher mode still works: unset `TICKERALL_API_KEY` and set `ENGINE_MODE=launcher`.
+
 ## Install the launcher (your Windows PC or a Windows VPS, elevated PowerShell)
 ```
 & ([scriptblock]::Create((irm https://<backend>/bootstrap/install.ps1)))

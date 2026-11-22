@@ -59,7 +59,7 @@
       <div class="row"><input id="cPass" type="password" placeholder="MT5 password" required autocomplete="new-password"></div>
       <div class="row"><input id="cServer" placeholder="Broker server, e.g. Exness-MT5Trial" required></div>
       <div class="row"><button class="btn primary" type="submit">Encrypt &amp; connect</button></div>
-      <div class="tiny muted">Encrypted on this phone with the worker's public key (RSA-OAEP). The server only relays ciphertext; the password is stored only on the worker (Windows DPAPI).</div>
+      <div class="tiny muted">Encrypted on this phone with the engine's public key (RSA-OAEP). Windows mode: stored only on your PC (DPAPI). Cloud mode: decrypted only inside the engine on the server, kept in memory (not on disk) and sent to TickerAll to open the MT5 demo session.</div>
     </form>
   </section>
 
