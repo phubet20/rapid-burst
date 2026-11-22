@@ -346,7 +346,9 @@ class Launcher:
             v = r.get("validation") or {}
             self.last_connect = {"ok": bool(r.get("ok")), "validation_ok": bool(v.get("ok")), "ts": time.time(),
                                  "msg": r.get("msg"), "account": r.get("account"),
-                                 "failed_checks": [c["name"] for c in v.get("checks", []) if not c.get("ok")]}
+                                 "failed_checks": [c["name"] for c in v.get("checks", []) if not c.get("ok")],
+                                 "failed_details": [f'{c["name"]}: {c.get("detail", "")}' for c in v.get("checks", [])
+                                                    if not c.get("ok")]}
             self._save()
             return {"ok": bool(r.get("ok")), "msg": r.get("msg"), "validation": v}
 
@@ -359,10 +361,21 @@ class Launcher:
                 v = r.get("validation") or {}
                 self.last_connect = {"ok": bool(r.get("ok")), "validation_ok": bool(v.get("ok")), "ts": time.time(),
                                      "msg": r.get("msg"), "account": r.get("account"),
-                                     "failed_checks": [c["name"] for c in v.get("checks", []) if not c.get("ok")]}
+                                     "failed_checks": [c["name"] for c in v.get("checks", []) if not c.get("ok")],
+                                 "failed_details": [f'{c["name"]}: {c.get("detail", "")}' for c in v.get("checks", [])
+                                                    if not c.get("ok")]}
                 self._save()
                 return {"ok": bool(r.get("ok")), "msg": r.get("msg"), "validation": v}
-            return await self.engine.request(cmd, args, timeout=60)
+            r = await self.engine.request(cmd, args, timeout=60)
+            if cmd == "select" and r.get("ok") and r.get("validation"):
+                v = r["validation"]       # keep the stored 'validated' flag in step with the new symbol choice
+                self.last_connect = {"ok": True, "validation_ok": bool(v.get("ok")), "ts": time.time(),
+                                     "msg": "symbols changed", "account": r.get("account"),
+                                     "failed_checks": [c["name"] for c in v.get("checks", []) if not c.get("ok")],
+                                     "failed_details": [f'{c["name"]}: {c.get("detail", "")}' for c in v.get("checks", [])
+                                                        if not c.get("ok")]}
+                self._save()
+            return r
 
         if cmd == "start":
             if self.desired == "RUNNING" and self.engine and self.engine.alive() and \

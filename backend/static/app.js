@@ -92,6 +92,28 @@
     const canStart = online && (liveOk || storedOk) && !eng.running && !eng.halted && !eng.blocked &&
       !["STARTING", "RUNNING", "STOPPING"].includes(phase);
     $("btnStart").disabled = !canStart;
+    const why = [];
+    if (!online) why.push(cloud ? "The cloud engine is still starting on the server - wait a few seconds." : "The Windows launcher is not connected.");
+    else {
+      if (cloud && !(S.cloud || {}).api_key_set) why.push("TICKERALL_API_KEY is not set on Render (Render -> rapid-burst -> Environment).");
+      if (eng.running || ["STARTING", "RUNNING"].includes(phase)) why.push("The engine is already running (use STOP first).");
+      if (phase === "STOPPING") why.push("STOP is still in progress.");
+      if (eng.halted) why.push("Risk halt for today: " + (eng.halt_reason || "limit reached") + ".");
+      if (eng.blocked) why.push("Blocked: " + eng.blocked);
+      if (!liveOk && !storedOk && !eng.running) {
+        if (!L.has_credentials && st !== "CONNECTED") why.push("CONNECT MT5 has not been done yet - press CONNECT MT5 and enter the demo login, password and server.");
+        else {
+          const det = (conn.state === "CONNECTED" ? (val.checks || []).filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`) : (lc && !lc.validation_ok ? (lc.failed_details || lc.failed_checks || []) : []));
+          if (det.length) det.forEach((d) => why.push("Check failed - " + d));
+          else if (lc && !lc.ok) why.push("Last CONNECT failed: " + (lc.msg || "unknown error"));
+          else if (conn.state && !["CONNECTED", "IDLE"].includes(conn.state)) why.push(`MT5 is ${conn.state}: ${conn.msg || ""}`);
+          else why.push("The account has not been validated yet - press REFRESH or CONNECT MT5.");
+        }
+      }
+    }
+    const w = $("startWhy");
+    w.classList.toggle("hidden", !why.length || canStart);
+    w.innerHTML = (why.length && !canStart) ? "<b>START is disabled because:</b><br>" + why.map((x) => "• " + esc(x)).join("<br>") : "";
     $("btnStop").disabled = false;
     $("btnConnect").textContent = conn.state === "CONNECTED" ? "RECONNECT MT5" : "CONNECT MT5";
 

@@ -270,7 +270,7 @@ class Trader:
         self._prepare_symbols()
         self._validate()
         self.add_log("INFO", f"Symbols selected: {', '.join(syms)}")
-        return {"ok": True, "selected": syms}
+        return {"ok": True, "selected": syms, "validation": self.validation, "account": self._account_brief()}
 
     def cmd_refresh(self) -> dict:
         if self.conn_state != "CONNECTED":
@@ -379,8 +379,22 @@ class Trader:
                 info = self.sym_info.get(s) or {}
                 if info and int(info.get("trade_mode", 0)) == SYMBOL_TRADE_MODE_FULL:
                     good.append(s)
-            add("Tradable symbol selected", bool(good),
-                ", ".join(good) if good else f"none of {self.selected} fully tradable")
+            detail = ", ".join(good)
+            if not good:
+                detail = f"none of {self.selected} is tradable on this account"
+                try:
+                    similar = []
+                    for s in self.selected:
+                        base = "".join(ch for ch in s if ch.isalnum())[:6]
+                        similar += [x["name"] for x in self.broker.search_symbols(base, 8)]
+                    if similar:
+                        detail += f" - this broker offers: {', '.join(dict.fromkeys(similar))[:120]}; " \
+                                  "open Symbols, pick one and press APPLY"
+                    else:
+                        detail += " - open Symbols, search and APPLY a symbol this broker offers"
+                except Exception:  # noqa: BLE001
+                    pass
+            add("Tradable symbol selected", bool(good), detail)
             hedging = int(acct.get("margin_mode", 0)) == MARGIN_HEDGING
             add("Account margin mode", True, "hedging" if hedging else "netting (1 position per symbol)")
         self.validation = {"ok": all(c["ok"] for c in checks) and connected, "checks": checks,

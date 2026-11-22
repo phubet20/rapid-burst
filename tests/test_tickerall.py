@@ -231,3 +231,16 @@ def test_trader_enters_with_sl_on_streamed_burst(fake, tmp_path):
     assert fp["comment"].startswith("RBurst-") and fp["stopLoss"] > 0 and fp["side"] == "BUY"
     assert tr.cmd_stop()["ok"] and not [x for x in fake.positions.values() if x["comment"].startswith("RBurst")]
     tr.cmd_shutdown()
+
+
+def test_untradable_symbol_explains_why_and_select_revalidates(fake, tmp_path):
+    b = mk(fake, tmp_path)
+    tr = Trader(b, MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
+    tr.selected = ["BTCUSD"]                    # mocked spec has no price geometry -> not tradable
+    tr.step(time.time())
+    chk = {c["name"]: c for c in tr.validation["checks"]}["Tradable symbol selected"]
+    assert not chk["ok"] and "BTCUSD" in chk["detail"] and "APPLY" in chk["detail"]
+    assert not tr.cmd_start()["ok"]
+    r = tr.cmd_select(["XAUUSD"])
+    assert r["ok"] and r["validation"]["ok"] and r["account"]["mode"] == "DEMO"
+    tr.cmd_shutdown()

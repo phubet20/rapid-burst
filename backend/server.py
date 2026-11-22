@@ -308,8 +308,9 @@ async def api_cmd(request: web.Request) -> web.Response:
         live_ok = (snap.get("conn") or {}).get("state") == "CONNECTED" and (snap.get("validation") or {}).get("ok")
         stored_ok = (snap.get("launcher") or {}).get("has_credentials") and lc.get("validation_ok")
         if not (live_ok or stored_ok):
-            return web.json_response({"ok": False, "msg": "START refused: MT5 connection/validation not confirmed - "
-                                                          "use CONNECT MT5 first"})
+            det = "; ".join(lc.get("failed_details") or lc.get("failed_checks") or [])
+            return web.json_response({"ok": False, "msg": "START refused: MT5 connection/validation not confirmed"
+                                                          + (f" ({det})" if det else " - use CONNECT MT5 first")})
     log.info("ui command %s from %s", cmd, client_ip(request))  # never log args (may hold ciphertext)
     result = await hub.send_cmd(cmd, args)
     return web.json_response(result)
