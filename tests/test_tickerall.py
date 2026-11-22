@@ -281,7 +281,46 @@ def test_sl_modify_moves_stop_and_keeps_tp(fake, tmp_path):
     r = b.market_order("XAUUSD", "BUY", 0.05, 2390.0, 2420.0, 20, MAGIC, "RBurst-trail")
     assert r["ok"], r
     t = r["ticket"]
-    assert b.modify_sl(t, 2401.5, 0.0)["ok"]                       # BE+/trail move, TP omitted
-    assert fake.positions[t]["stopLoss"] == 2401.5 and fake.positions[t]["takeProfit"] == 2420.0
-    assert b.modify_sl(t, 2403.25, 2420.0)["ok"] and fake.positions[t]["stopLoss"] == 2403.25
+    assert b.modify_sl(t, 2398.5, 0.0)["ok"]                       # BE+/trail move (below the bid), TP omitted
+    assert fake.positions[t]["stopLoss"] == 2398.5 and fake.positions[t]["takeProfit"] == 2420.0
+    assert b.modify_sl(t, 2399.25, 2420.0)["ok"] and fake.positions[t]["stopLoss"] == 2399.25
+    b.shutdown()
+
+
+def test_modify_sl_is_clamped_to_broker_bid_ask_stops_level_and_tick(fake, tmp_path):
+    b = mk(fake, tmp_path)
+    assert b.connect(DEMO["login"], DEMO["password"], DEMO["server"])[0]
+    assert b.select_symbol("XAUUSD")
+    bid, ask = fake.quotes["XAUUSD"]
+    info = dict(b.symbol_info("XAUUSD"), trade_stops_level=100, trade_tick_size=0.05, point=0.01, digits=2)
+    b.symbol_info = lambda s: info
+    # BUY: asking for an SL ABOVE the bid (would be INVALID_STOPS) is pulled back below bid - stops - buffer
+    t = fake.add_position("XAUUSD", "BUY", 0.05, "x", sl=bid - 50.0)
+    r = b.modify_sl(t, bid + 5.0, 0.0)
+    assert r["ok"], r
+    sent = fake.positions[t]["stopLoss"]
+    assert sent <= bid - 100 * 0.01 and sent > bid - 50.0 and abs(sent / 0.05 - round(sent / 0.05)) < 1e-6, sent
+    # SELL: SL must end above ask + stops, rounded up to the tick
+    t2 = fake.add_position("XAUUSD", "SELL", 0.05, "x", sl=ask + 50.0)
+    r = b.modify_sl(t2, ask - 5.0, 0.0)
+    assert r["ok"], r
+    sent2 = fake.positions[t2]["stopLoss"]
+    assert sent2 >= ask + 100 * 0.01 and sent2 < ask + 50.0, sent2
+    b.shutdown()
+
+
+def test_modify_sl_soft_skip_closed_position_and_retcode_logged(fake, tmp_path):
+    b = mk(fake, tmp_path)
+    assert b.connect(DEMO["login"], DEMO["password"], DEMO["server"])[0]
+    assert b.select_symbol("XAUUSD")
+    bid, ask = fake.quotes["XAUUSD"]
+    t = fake.add_position("XAUUSD", "BUY", 0.05, "x", sl=bid - 5.0)
+    n0 = len(getattr(fake, "modify_calls", []))
+    r = b.modify_sl(t, bid - 20.0, 0.0)                    # not better than the current SL -> nothing sent
+    assert not r["ok"] and r.get("soft") and len(getattr(fake, "modify_calls", [])) == n0
+    r = b.modify_sl(999999, bid - 1.0, 0.0)                # already closed
+    assert not r["ok"] and r.get("closed")
+    fake.modify_error = "Broker rejected the modify: INVALID_STOPS (retcode 10016)"
+    r = b.modify_sl(t, bid - 1.0, 0.0)
+    assert not r["ok"] and r["retcode"] == 10016 and r["code"] == "BROKER_REJECTED" and "sent SL" in r["msg"]
     b.shutdown()

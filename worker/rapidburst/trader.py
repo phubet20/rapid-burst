@@ -89,6 +89,10 @@ class Trader:
         self.learner = Learner(os.path.join(data_dir, "learning.json"), min_samples=self.cfg.learn_min_samples,
                                half_life_h=self.cfg.learn_half_life_hours, max_mult=self.cfg.learn_max_mult)
         self.learn_view: dict[str, str] = {}
+        self._xq: dict[str, tuple] = {}              # per-loop executable quote cache
+        self._rest_mode: dict[str, float] = {}       # symbol -> use REST quote until this time
+        self._rest_check: dict[str, float] = {}
+        self._lag_log: dict[str, float] = {}
         # "why no trade" visibility
         self.skip_counts: dict[str, Counter] = {}
         self.skip_window: dict[str, Counter] = {}
@@ -750,14 +754,65 @@ class Trader:
         vu = eng.last.vol_unit if eng and eng.last.vol_unit else 0.0
         return (4.0 * vu, "est") if vu else (0.0, "none")
 
-    @staticmethod
-    def _exec_px(ps, p: dict, f) -> Optional[float]:
-        """Worst (most conservative) executable price we know: bid for BUY, ask for SELL."""
+    def _exec_quote(self, s: str, now_wall: float) -> Optional[tuple]:
+        """(bid, ask, source) used for EXITS and TRAILING. The WS tick is used normally; the broker's REST
+        quote replaces it when the WS tick is stale (> 2 s) or disagrees with the broker's own position price
+        by more than 2x spread (checked every 5 s too, to catch a lagging stream); REST then stays in use for
+        10 s. Only polled while a bot position is open."""
+        c = self._xq.get(s)
+        if c and c[0] == now_wall:
+            return c[1]
+        eng = self.engines.get(s)
+        ws = None
+        if eng is not None and eng.buf.ticks:
+            tk = eng.buf.ticks[-1]
+            ws = (tk.bid, tk.ask, tk.spread)
+        res = (ws[0], ws[1], "ws") if ws else None
+        mine = [p for p in self.own_positions if p["symbol"] == s]
+        qfn = getattr(self.broker, "quote", None)
+        if mine and qfn is not None:
+            age = now_wall - self.last_receipt[s] if s in self.last_receipt else None
+            info = self.sym_info.get(s) or {}
+            spread = max(ws[2] if ws else 0.0, 2 * float(info.get("point", 0) or 0))
+            dev = False
+            if ws:
+                for p in mine:
+                    cur = float(p.get("price_current") or 0.0)
+                    wx = ws[0] if self._side(p) == "BUY" else ws[1]
+                    if cur and abs(wx - cur) > 2 * spread:
+                        dev = True
+            check = (ws is None or age is None or age > 2.0 or dev or self._rest_mode.get(s, 0.0) > now_wall
+                     or now_wall - self._rest_check.get(s, 0.0) > 5.0)
+            if check:
+                self._rest_check[s] = now_wall
+                q = qfn(s)
+                if q:
+                    if ws:
+                        lag = abs((q["bid"] + q["ask"]) / 2 - (ws[0] + ws[1]) / 2)
+                        if dev or lag > 2 * spread:
+                            self._rest_mode[s] = now_wall + 10.0
+                            if now_wall - self._lag_log.get(s, 0.0) > 15.0:
+                                self._lag_log[s] = now_wall
+                                self.add_log("WARNING", f"FEED LAG {s}: WS tick mid {(ws[0] + ws[1]) / 2:.2f} vs broker "
+                                                        f"quote {(q['bid'] + q['ask']) / 2:.2f} (diff {lag:.2f} = "
+                                                        f"{lag / spread:.1f}x spread, WS age "
+                                                        f"{(age if age is not None else -1):.1f}s) - exits use the broker price")
+                    if self._rest_mode.get(s, 0.0) > now_wall or ws is None or (age is not None and age > 2.0):
+                        res = (q["bid"], q["ask"], "rest")
+        self._xq[s] = (now_wall, res)
+        return res
+
+    def _exec_px(self, ps, p: dict, f, now_wall: Optional[float] = None) -> Optional[float]:
+        """Worst (most conservative) executable price we know: bid for BUY, ask for SELL, from the broker's
+        position price and the executable quote (WS tick or REST quote, see _exec_quote)."""
         d = 1 if ps.side == "BUY" else -1
         prices = []
         if p.get("price_current"):
             prices.append(float(p["price_current"]))
-        if f is not None and f.bid and f.ask:
+        xq = self._exec_quote(ps.symbol, now_wall if now_wall is not None else getattr(self, "now_wall", 0.0))
+        if xq:
+            prices.append(float(xq[0] if d > 0 else xq[1]))
+        elif f is not None and f.bid and f.ask:
             prices.append(float(f.bid if d > 0 else f.ask))
         if not prices:
             return None
@@ -774,7 +829,7 @@ class Trader:
                 continue
             eng = self.engines.get(ps.symbol)
             f = eng.features(self._server_now(ps.symbol, now_wall)) if eng is not None else None
-            px = self._exec_px(ps, p, f)
+            px = self._exec_px(ps, p, f, now_wall)
             if px is None:
                 continue
             d = 1 if ps.side == "BUY" else -1
@@ -809,12 +864,18 @@ class Trader:
             ps.last_mod = now_wall
             r = self.broker.modify_sl(t, new, float(p.get("tp", 0.0)) or ps.tp)
             if r.get("ok"):
-                ps.sl = new
-                self.add_log("INFO", f"SL #{t} {ps.side} {ps.symbol} -> {new:.{digits}f} ({state}, "
-                                     f"P/L {pl:+.{digits}f} px, trail {trail:.{digits}f})")
+                sent = float(r.get("sl") or new)
+                ps.sl = sent
+                self.add_log("INFO", f"SL #{t} {ps.side} {ps.symbol} -> {sent:.{digits}f} ({state}, wanted "
+                                     f"{new:.{digits}f}, P/L {pl:+.{digits}f} px, trail {trail:.{digits}f})")
+            elif r.get("closed"):
+                self.add_log("INFO", f"SL #{t}: position already closed - modify skipped")
+            elif r.get("soft"):
+                log.debug("SL #%s not placeable yet: %s", t, r.get("msg"))   # software stop still enforced
             else:
-                self.add_log("WARNING", f"SL modify #{t} refused ({r.get('msg')}) - software {state} stop "
-                                        f"{new:.{digits}f} enforced by the engine")
+                self.add_log("WARNING", f"SL modify #{t} refused (retcode {r.get('retcode')}, {r.get('code')}: "
+                                        f"{r.get('msg')}) - software {state} stop {new:.{digits}f} enforced by the "
+                                        f"engine on the BROKER price")
 
     def _hard_close(self, legs: list, live: dict, f) -> Optional[str]:
         """Engine-side stops (backup to the broker SL): software mirror of the BE+/trailing level,
@@ -862,8 +923,10 @@ class Trader:
         eng = self.engines[legs[0].symbol]
         locked = any(p.sl_state != "initial" for p in legs)
         d = 1 if agg.side == "BUY" else -1
-        if f is not None and f.bid and f.ask:
-            exit_px = f.bid if d > 0 else f.ask              # executable price: spread already paid
+        livemap = {int(p["ticket"]): p for p in self.own_positions}
+        pxs = [x for x in (self._exec_px(ps, livemap.get(ps.ticket, {}), f, now_wall) for ps in legs) if x]
+        if pxs and f is not None and f.spread:
+            exit_px = min(pxs) if d > 0 else max(pxs)        # broker executable price (not just the WS tick)
             pl = (exit_px - agg.open_price) * d
             held = now_wall - max(p.open_time for p in legs)
             atr, src = self._atr(agg.symbol)

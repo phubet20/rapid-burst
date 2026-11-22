@@ -307,6 +307,9 @@ class FakeTickerAll:
         if not p:
             return self.err(404, "TICKET_NOT_FOUND")
         b = await request.json()
+        self.modify_calls = getattr(self, "modify_calls", []) + [(t, dict(b))]
+        if getattr(self, "modify_error", None):
+            return self.err(422, "BROKER_REJECTED", self.modify_error)
         if "stopLoss" in b:
             p["stopLoss"] = b["stopLoss"]
         if "takeProfit" in b:

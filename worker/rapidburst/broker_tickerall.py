@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -112,6 +114,7 @@ class TickerAllBroker:
         self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws_stop = threading.Event()
         self._ws_ok = False
+        self._rq: dict[str, dict] = {}          # REST quote cache (bid/ask/recv)
         self._ws_send_q: Optional[asyncio.Queue] = None
         self.stream_events = deque(maxlen=50)
 
@@ -714,22 +717,75 @@ class TickerAllBroker:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "msg": str(exc)}
 
+    def quote(self, symbol: str, max_age: float = 0.4) -> dict:
+        """Fresh REST bid/ask (GET .../symbols/{symbol}/quote), stamped with our receive time.
+        {} when the symbol is not quoted. Cached `max_age` s so a busy loop cannot hammer the API."""
+        c = self._rq.get(symbol)
+        if c and time.time() - c["recv"] <= max_age:
+            return dict(c)
+        if not self.account_id:
+            return {}
+        try:
+            q = self._req("GET", f"/v1/accounts/{self.account_id}/symbols/{urllib.parse.quote(symbol)}/quote",
+                          timeout=8)
+        except Exception:  # noqa: BLE001
+            return {}
+        bid, ask = _f((q or {}).get("bid")), _f((q or {}).get("ask"))
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return {}
+        c = {"bid": bid, "ask": ask, "recv": time.time()}
+        self._rq[symbol] = c
+        return dict(c)
+
     def modify_sl(self, ticket: int, sl: float, tp: float) -> dict:
+        """PATCH /v1/accounts/{id}/positions/{ticket} {stopLoss[, takeProfit]} (Idempotency-Key set by _req).
+        The SL is first pulled back to a placeable level from the broker's CURRENT bid/ask:
+        BUY  SL <= bid - (max(stopLevel, freezeLevel) + buffer)
+        SELL SL >= ask + (max(stopLevel, freezeLevel) + buffer), rounded to the tick size (never toward the
+        market). If the best placeable SL is not better than the current one nothing is sent (soft).
+        Result keys: ok, sl (level actually sent), closed, soft, code, retcode, status, msg."""
         if not self.account_id:
             return {"ok": False, "msg": "TickerAll not connected"}
         pos = self.position(ticket)
         if pos is None:
-            return {"ok": False, "msg": "no position"}
-        digits = int((self.symbol_info(pos["symbol"]) or {}).get("digits", 8))
+            return {"ok": False, "closed": True, "msg": "position already closed"}
+        info = self.symbol_info(pos["symbol"]) or {}
+        digits = int(info.get("digits", 8))
+        point = float(info.get("point") or 0) or 10.0 ** -digits
+        tick = float(info.get("trade_tick_size") or 0) or point
+        buy = int(pos.get("type", 0)) == 0
+        cur = float(pos.get("sl") or 0.0)
+        sl = float(sl)
+        q = self.quote(pos["symbol"], max_age=0.3)
+        note = ""
+        if q:
+            level = max(int(info.get("trade_stops_level", 0)), int(info.get("trade_freeze_level", 0)))
+            gap = (level + 3) * point + 0.5 * (q["ask"] - q["bid"])
+            if buy:
+                sl = min(sl, q["bid"] - gap)
+            else:
+                sl = max(sl, q["ask"] + gap)
+            note = f"bid {q['bid']:.{digits}f} ask {q['ask']:.{digits}f} min dist {gap:.{digits}f}"
+        r = sl / tick
+        sl = (math.floor(r + 1e-9) if buy else math.ceil(r - 1e-9)) * tick      # round away from the market
+        sl = round(sl, digits)
+        if cur and ((buy and sl <= cur) or ((not buy) and sl >= cur)):
+            return {"ok": False, "soft": True, "sl": sl,
+                    "msg": f"no placeable SL better than current {cur:.{digits}f} ({note or 'no quote'})"}
         try:
-            body = {"stopLoss": round(float(sl), digits)}
+            body = {"stopLoss": sl}
             if tp:                                   # omit = leave the TP unchanged (0 would remove it)
                 body["takeProfit"] = round(float(tp), digits)
             self._req("PATCH", f"/v1/accounts/{self.account_id}/positions/{int(ticket)}", body)
             self._acct_ts = 0.0
-            return {"ok": True, "msg": "modified"}
+            return {"ok": True, "msg": "modified", "sl": sl, "note": note}
         except TickerAllError as e:
-            return {"ok": False, "msg": f"{e.code} {e.message}".strip()}
+            if e.status == 404 or e.code == "TICKET_NOT_FOUND":
+                return {"ok": False, "closed": True, "msg": "position already closed"}
+            rc = re.search(r"retcode\D{0,3}(\d+)", f"{e.message} {e.details}")
+            return {"ok": False, "code": e.code, "status": e.status, "sl": sl,
+                    "retcode": int(rc.group(1)) if rc else None,
+                    "msg": f"HTTP {e.status} {e.code} {e.message} (sent SL {sl:.{digits}f}; {note or 'no quote'})".strip()}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "msg": str(exc)}
 
