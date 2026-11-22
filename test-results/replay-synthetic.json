@@ -1,0 +1,135 @@
+{
+  "sessions": [
+    {
+      "scenario": "bursts",
+      "seed": 1,
+      "hours": 2.0,
+      "ticks": 19183,
+      "entries": 4,
+      "closed": 4,
+      "wins": 3,
+      "win_rate": 0.75,
+      "net_pnl": 73.94,
+      "max_drawdown": 9.6,
+      "max_open_positions": 1,
+      "orders_without_sl": 0,
+      "adds_into_loser": 0,
+      "halted": null,
+      "exit_reasons": {
+        "exhaustion take-profit": 3,
+        "profit lock": 1
+      }
+    },
+    {
+      "scenario": "bursts",
+      "seed": 2,
+      "hours": 2.0,
+      "ticks": 19215,
+      "entries": 12,
+      "closed": 12,
+      "wins": 11,
+      "win_rate": 0.917,
+      "net_pnl": 242.17,
+      "max_drawdown": 31.04,
+      "max_open_positions": 2,
+      "orders_without_sl": 0,
+      "adds_into_loser": 0,
+      "halted": null,
+      "exit_reasons": {
+        "exhaustion take-profit": 6,
+        "momentum weakening": 3,
+        "profit lock": 1
+      }
+    },
+    {
+      "scenario": "bursts",
+      "seed": 3,
+      "hours": 2.0,
+      "ticks": 19222,
+      "entries": 6,
+      "closed": 6,
+      "wins": 5,
+      "win_rate": 0.833,
+      "net_pnl": 82.68,
+      "max_drawdown": 31.08,
+      "max_open_positions": 1,
+      "orders_without_sl": 0,
+      "adds_into_loser": 0,
+      "halted": null,
+      "exit_reasons": {
+        "exhaustion take-profit": 5
+      }
+    },
+    {
+      "scenario": "noise-only",
+      "seed": 1,
+      "hours": 2.0,
+      "ticks": 19179,
+      "entries": 3,
+      "closed": 3,
+      "wins": 2,
+      "win_rate": 0.667,
+      "net_pnl": -10.12,
+      "max_drawdown": 23.0,
+      "max_open_positions": 2,
+      "orders_without_sl": 0,
+      "adds_into_loser": 0,
+      "halted": null,
+      "exit_reasons": {
+        "profit lock": 2,
+        "reversal": 1
+      }
+    },
+    {
+      "scenario": "noise-only",
+      "seed": 2,
+      "hours": 2.0,
+      "ticks": 19219,
+      "entries": 3,
+      "closed": 3,
+      "wins": 2,
+      "win_rate": 0.667,
+      "net_pnl": -6.9,
+      "max_drawdown": 31.74,
+      "max_open_positions": 2,
+      "orders_without_sl": 0,
+      "adds_into_loser": 0,
+      "halted": null,
+      "exit_reasons": {
+        "momentum weakening": 1,
+        "profit lock": 1,
+        "setup invalid": 1
+      }
+    },
+    {
+      "scenario": "noise-only",
+      "seed": 3,
+      "hours": 2.0,
+      "ticks": 19184,
+      "entries": 2,
+      "closed": 2,
+      "wins": 1,
+      "win_rate": 0.5,
+      "net_pnl": -21.62,
+      "max_drawdown": 28.98,
+      "max_open_positions": 1,
+      "orders_without_sl": 0,
+      "adds_into_loser": 0,
+      "halted": null,
+      "exit_reasons": {
+        "profit lock": 1,
+        "reversal": 1
+      }
+    }
+  ],
+  "total": {
+    "label": "SYNTHETIC replay - not market data",
+    "sessions": 6,
+    "net_pnl_bursts": 398.79,
+    "net_pnl_noise_only": -38.64,
+    "entries": 30,
+    "net_pnl": 360.15,
+    "orders_without_sl": 0,
+    "adds_into_loser": 0
+  }
+}

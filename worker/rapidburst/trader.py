@@ -81,6 +81,7 @@ class Trader:
         self.batch: dict = st.get("batch", {})
         self.server_offset: float = float(st.get("server_offset", 0.0))
         self.saved_pos_meta: dict = st.get("positions", {})
+        self._validate()
         if self.running:
             self.add_log("INFO", "Worker restarted while running - will resume after MT5 reconnect and validation")
 
