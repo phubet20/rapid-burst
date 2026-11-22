@@ -158,19 +158,29 @@ Limits to know (honest):
 
 ## Burst batches, small accounts and the trend filter
 
-**No broker-side stop-loss (default, `Broker SL: OFF`).** Orders are sent without SL
-(`RB_BROKER_SL` unset/0). The engine protects every position itself, checked every 0.15 s from
-live prices: (1) fast exits on momentum fade / reversal / adverse fade; (2) per-order hard close
-when the adverse move reaches the engine hard-close distance (`max(sl_vol_units x vol unit, 3 x
-spread, stop level)`); (3) whole-batch hard close when its floating loss reaches
-`batch_max_loss_pct` (5%) of equity; (4) daily-loss (20%) and equity-drawdown (30%) kill-switch
-that flattens immediately; (5) on reconnect/restart any bot position without a working broker SL
-is flattened at once if the engine is not running, and re-managed (hard close needs no warm-up)
-if it is. Lot sizing, the 5% per-order cap and the 15% open-risk cap use the hard-close distance
-as the risk distance. Honest limits: a software stop cannot act while the connection, TickerAll,
-or the Render service is down, and in a price gap it fills at the market, not at the level. The
-optional `RB_EMERGENCY_SL=1` adds only a far disaster SL (`emergency_sl_units` vol units, default
-off); `RB_BROKER_SL=1` sends a normal SL as before. The total-exposure cap is 500x equity.
+**M1 impulse entries.** Every loop (0.15 s) the engine checks whether the current M1 bar is starting
+to surge, from real tick order flow: 3 s velocity vs the M1 ATR (from broker M1 bars), up-ticks vs
+down-ticks over 5 s, the bar's expansion vs ATR, the move vs the spread, not decelerating and not
+already exhausted. On an impulse it enters at once in the surge direction (1 order; 2 on a very
+strong impulse when the equity tier allows). The main trend is a bias only: a counter-trend impulse
+needs strength >= 0.70 and opens a single order. The older momentum score remains as a fallback.
+
+**Broker SL on every order (default, `RB_BROKER_SL=1`).** Initial SL = max(broker stop level,
+2 x spread, 0.5 x M1 ATR). When the trade runs in our favour the SL is moved to breakeven+
+(open + 0.3 x spread) and then trailed (max(0.25 x ATR, 1 x spread)) on the broker via TickerAll
+`PATCH /positions/{ticket}` (at most once per second per position; never backwards). A software
+mirror of every level is kept, so if the broker refuses a modify the engine still closes at that
+level. Wrong way: no follow-through within 6 s, or 0.6 x SL against with momentum against -> cut
+at once. Right way: the trailing SL governs (early profit exits are suppressed once the SL is
+locked); a short take-profit at 0.6 x ATR closes the burst, and the next impulse re-opens.
+Pyramiding adds one order at a time only while every open order's SL is locked in profit, never
+against the trend, at most N adds per burst (N = equity tier) and within the notional cap.
+No martingale: after a losing burst the lot can never be larger until a winning burst.
+Software backup stop at 1.3 x the SL distance and the per-burst loss cap stay active.
+
+**Daily-loss / drawdown halts: OFF by default (user choice).** Re-enable with
+`RB_DAILY_LOSS_PCT=20` / `RB_MAX_DD_PCT=30` on the server. Margin check, notional cap,
+per-order SL and per-burst loss caps always stay on.
 
 **Burst batch.** On a strong momentum score the engine opens 2-5 same-direction market
 orders that share a batch id (count scales with |score| from `entry_threshold` to
@@ -207,6 +217,26 @@ shown in the Engine card together with the recent decisions and the active limit
 **Changing limits server-side.** Set `RB_CONFIG_JSON` on the Render service (or a JSON file via
 `RB_CONFIG_FILE`), e.g. `{"small_account_max_loss_pct": 3, "batch_max": 3, "daily_loss_limit_pct": 10}`.
 The UI cannot change risk limits.
+
+## Adaptive learning from real closed trades (learner.py)
+
+* Every fully closed bot burst is written to a journal (`learning.json` in the engine data dir):
+  symbol, side, signal type (impulse / momentum), component scores (score, impulse strength, tick
+  pressure, velocity, breakout, trend), trend relation, spread/ATR regime (tight / mid / wide), UTC
+  hour, hold time, exit reason, P/L and P/L in R (realised P/L / risk at open).
+* Bucket = signal type x trend relation x spread/ATR regime. Stats are time-decayed (half-life
+  `learn_half_life_hours`, 36 h) and shrunk toward a slightly negative prior, outliers clipped to +/-3R.
+* Cold start (fewer than `learn_min_samples`, 8, trades in a bucket): MIN LOT only and a 40% faster
+  wrong-way cut. Losing buckets (shrunk expectancy < -0.15R) are skipped via a Thompson-style gate and
+  come back to exploration as old results decay. Only buckets whose expectancy is positive beyond one
+  standard error get normal risk sizing x a multiplier (1..`learn_max_mult`, 2). The no-martingale
+  cap still applies after a losing burst.
+* UI: "Learning" panel with trades learned, best/worst buckets (n, win rate, expectancy) and the
+  current gate / size multiplier per symbol. `RB_LEARNING_ENABLED=false` turns it off.
+* Persistence limit: Render free has no persistent disk and TickerAll history carries no order
+  comment / magic, so the journal survives STOP/START and engine restarts but is reset by a redeploy
+  or a Render instance restart (it then starts cold again at min lot). No guarantee of profit or of a
+  smooth equity curve: the learner only re-weights what real trades have shown so far.
 
 ## Path to a LIVE account (not enabled)
 

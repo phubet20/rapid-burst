@@ -117,7 +117,7 @@ class RiskGuard:
             self.halted, self.halt_reason = True, f"daily loss limit hit ({bot_daily_pnl:.2f} <= -{lim:.2f})"
             return self.halt_reason
         dd_floor = self.day_peak_equity * (1 - self.cfg.equity_drawdown_pct / 100.0)
-        if acct.equity < dd_floor:
+        if self.cfg.equity_drawdown_pct > 0 and acct.equity < dd_floor:
             self.halted, self.halt_reason = True, (
                 f"equity drawdown stop ({acct.equity:.2f} < {dd_floor:.2f}, peak {self.day_peak_equity:.2f})")
             return self.halt_reason

@@ -394,4 +394,8 @@ class PositionState:
     reason: str = ""
     closing_attempts: int = 0
     batch_id: str = ""
-    hard_dist: float = 0.0       # engine hard-close distance (price units); used instead of a broker SL
+    hard_dist: float = 0.0       # engine hard-close distance (price units); software backup stop
+    sl_state: str = "initial"    # initial -> BE+ -> trail
+    vsl: float = 0.0             # software mirror of the protective level (used if a broker modify fails)
+    last_mod: float = 0.0
+    peak_pl: float = -1e18       # best executable P/L in price units since open

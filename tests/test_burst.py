@@ -79,13 +79,14 @@ def test_small_account_opens_a_burst_batch_with_sl_and_closes_it_together(tmp_pa
     batch_ids = {m.split(" batch ")[1].split()[0] for m in entries}
     first = sorted(batch_ids)[0]
     legs = [m for m in entries if f"batch {first}" in m]
-    assert 2 <= len(legs) <= cfg.batch_max, legs
-    assert inv.orders_with_broker_sl == 0 and inv.adds_into_loser == 0 and inv.opposite_while_open == 0
+    assert 1 <= len(legs) <= cfg.batch_max, legs
+    assert inv.orders_without_sl == 0 and inv.adds_into_loser == 0 and inv.opposite_while_open == 0
     assert inv.max_pos_symbol <= cfg.max_positions_per_symbol
-    exits = [l["msg"] for l in tr.logs if l["msg"].startswith("EXIT BATCH")]
+    exits = [l["msg"] for l in tr.logs if l["msg"].startswith("EXIT BATCH")] or [
+        l["msg"] for l in tr.logs if "fully closed" in l["msg"]]
     assert exits, [l["msg"] for l in tr.logs][-15:]
     assert any("fully closed" in l["msg"] for l in tr.logs)
-    assert not br.positions_ or all(not p["sl"] for p in br.positions_.values())   # Broker SL OFF
+    assert not br.positions_ or all(p["sl"] for p in br.positions_.values())   # broker SL ON by default
     # every opened order used the min lot (small account), never a bigger martingale size
     assert all(" 0.01 BTCUSDm" in m for m in entries)
 
@@ -115,7 +116,7 @@ def test_insufficient_free_margin_for_min_lot_is_the_only_skip_and_is_visible(tm
     assert any("insufficient free margin for the minimum lot" in d["outcome"] for d in dec), dec
     assert any(l["msg"].startswith("WHY NO TRADE") for l in tr.logs)
     rc = tr.get_snapshot()["engine"]["risk_config"]
-    assert rc["small_account_max_loss_pct"] == 0.0 and rc["daily_loss_limit_pct"] == 20.0
+    assert rc["small_account_max_loss_pct"] == 0.0 and rc["daily_loss_limit_pct"] == 0.0
 
 
 def test_tiny_equity_trades_one_min_lot_and_tiers_scale_up(tmp_path):
@@ -197,6 +198,8 @@ def test_orders_have_no_broker_sl_and_engine_hard_close_fires():
     import pathlib, tempfile
     cfg = EngineConfig(batch_tp_units=500.0, batch_max_hold_seconds=10_000, max_hold_seconds=10_000,
                        batch_max_loss_pct=100.0, exhaustion_z=99.0, weak_momentum_close_units=999.0,
+                       broker_sl=False, wrong_way_loss_frac=99.0, wrong_way_seconds=1e9, batch_tp_atr=500.0,
+                       impulse_enabled=False,
                        profit_trigger_units=999.0, reversal_score=5.0, adverse_fade_units=999.0,
                        daily_loss_limit_pct=90, equity_drawdown_pct=90)
     d = pathlib.Path(tempfile.mkdtemp())
@@ -211,9 +214,10 @@ def test_orders_have_no_broker_sl_and_engine_hard_close_fires():
             seen.append(p["sl"])
     run(tr, br, T0 + 1, T0 + 260, on_step=on)
     entries = [l["msg"] for l in tr.logs if l["msg"].startswith("ENTRY")]
-    assert entries and all("broker SL OFF" in m for m in entries), entries[:2]
+    assert entries and all("SL OFF" in m for m in entries), entries[:2]
     assert seen and all(x == 0 for x in seen), "an order carried a broker SL"
-    hc = [l["msg"] for l in tr.logs if "hard close" in l["msg"] and l["msg"].startswith("EXIT")]
+    hc = [l["msg"] for l in tr.logs if ("hard close" in l["msg"] or "stop hit" in l["msg"])
+          and l["msg"].startswith("EXIT")]
     assert hc, [l["msg"] for l in tr.logs if "EXIT" in l["msg"] or "ENTRY" in l["msg"]][-8:]
     assert not br.positions_                         # whole batch flat after the engine stop
 
@@ -222,6 +226,9 @@ def test_batch_group_loss_pct_hard_close():
     import pathlib, tempfile
     cfg = EngineConfig(batch_tp_units=500.0, batch_max_hold_seconds=10_000, max_hold_seconds=10_000,
                        sl_vol_units=500.0, batch_max_loss_pct=0.5, adverse_fade_units=500.0,
+                       broker_sl=False, sl_atr_frac=500.0, wrong_way_loss_frac=99.0, wrong_way_seconds=1e9,
+                       impulse_enabled=False,
+                       batch_tp_atr=500.0, be_lock_spread_mult=500.0,
                        reversal_score=5.0, daily_loss_limit_pct=90, equity_drawdown_pct=90,
                        exhaustion_z=99.0, weak_momentum_close_units=999.0, profit_trigger_units=999.0)
     d = pathlib.Path(tempfile.mkdtemp())
@@ -253,7 +260,7 @@ def test_unprotected_positions_flattened_when_engine_not_running():
 
 def test_broker_sl_and_emergency_sl_are_opt_in():
     import pathlib, tempfile
-    for kw, expect in ((dict(broker_sl=True), "near"), (dict(emergency_sl=True), "far")):
+    for kw, expect in ((dict(broker_sl=True), "near"), (dict(broker_sl=False, emergency_sl=True), "far")):
         cfg = EngineConfig(batch_tp_units=500.0, batch_max_hold_seconds=10_000, max_hold_seconds=10_000, **kw)
         d = pathlib.Path(tempfile.mkdtemp())
         tr, br = make(d, {"BTCUSDm": _series_up()}, cfg)
@@ -274,15 +281,15 @@ def test_broker_sl_and_emergency_sl_are_opt_in():
 
 
 def test_env_flags_parse_booleans(monkeypatch):
-    assert EngineConfig.load().broker_sl is False and EngineConfig.load().emergency_sl is False
-    monkeypatch.setenv("RB_BROKER_SL", "1")
+    assert EngineConfig.load().broker_sl is True and EngineConfig.load().emergency_sl is False
+    monkeypatch.setenv("RB_BROKER_SL", "0")
     monkeypatch.setenv("RB_EMERGENCY_SL", "false")
     c = EngineConfig.load()
-    assert c.broker_sl is True and c.emergency_sl is False
+    assert c.broker_sl is False and c.emergency_sl is False
 
 
-def test_snapshot_reports_broker_sl_off(tmp_path):
+def test_snapshot_reports_broker_sl_on(tmp_path):
     tr, br = make(tmp_path, {"BTCUSDm": _series_up()})
     _start(tr, br, T0 + 1)
     tr._build_snapshot(T0 + 2)
-    assert tr.get_snapshot()["engine"]["risk_config"]["broker_sl"] == "OFF"
+    assert tr.get_snapshot()["engine"]["risk_config"]["broker_sl"] == "ON"

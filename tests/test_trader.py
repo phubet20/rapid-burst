@@ -55,7 +55,7 @@ def test_autonomous_session_respects_invariants(tmp_path):
     assert connect_and_start(tr, br, T0 + 1)["ok"]
     run(tr, br, T0 + 1, T0 + 3600)
     assert inv.entries >= 5, inv.entries
-    assert inv.orders_with_broker_sl == 0       # default: NO broker-side SL (engine hard-close protects)
+    assert inv.orders_without_sl == 0            # default: real broker SL on every order at open
     assert inv.adds_into_loser == 0
     assert inv.opposite_while_open == 0
     assert inv.max_pos <= cfg.max_positions_total
@@ -116,12 +116,12 @@ def test_restart_recovery_readopts_positions(tmp_path):
     assert any("Re-adopted" in l["msg"] for l in tr2.logs)
     # idempotent: a second START does not open a new batch
     assert tr2.cmd_start()["msg"] == "already running"
-    # warm-up on fresh ticks only -> no entries in the first 60 s
-    run(tr2, br, t, t + 55)
+    # warm-up on fresh ticks only -> no entries during the warm-up (20 s)
+    run(tr2, br, t, t + cfg.warmup_seconds - 3)
     assert br.sent_orders == sent, "entered on stale state before fresh warm-up"
     eng = tr2.engines["XAUUSD"]
     assert eng.buf.ticks and eng.buf.ticks[0].t > t - 0.5, "engine used ticks from before START"
-    run(tr2, br, t + 55, t + 400)
+    run(tr2, br, t + cfg.warmup_seconds - 3, t + 400)
     # adopted positions are managed (exited) by the new process
     assert not (tickets & {int(p["ticket"]) for p in br.positions_.values()})
 

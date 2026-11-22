@@ -722,8 +722,10 @@ class TickerAllBroker:
             return {"ok": False, "msg": "no position"}
         digits = int((self.symbol_info(pos["symbol"]) or {}).get("digits", 8))
         try:
-            self._req("PATCH", f"/v1/accounts/{self.account_id}/positions/{int(ticket)}",
-                      {"stopLoss": round(float(sl), digits), "takeProfit": round(float(tp or 0.0), digits)})
+            body = {"stopLoss": round(float(sl), digits)}
+            if tp:                                   # omit = leave the TP unchanged (0 would remove it)
+                body["takeProfit"] = round(float(tp), digits)
+            self._req("PATCH", f"/v1/accounts/{self.account_id}/positions/{int(ticket)}", body)
             self._acct_ts = 0.0
             return {"ok": True, "msg": "modified"}
         except TickerAllError as e:

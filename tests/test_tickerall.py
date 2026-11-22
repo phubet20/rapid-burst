@@ -230,7 +230,7 @@ def test_trader_enters_with_sl_on_streamed_burst(fake, tmp_path):
     assert entered, [l["msg"] for l in tr.logs][-8:]
     p = tr.own_positions[0]
     fp = fake.positions[p["ticket"]]
-    assert fp["comment"].startswith("RBurst-") and not fp["stopLoss"] and fp["side"] == "BUY"   # Broker SL OFF
+    assert fp["comment"].startswith("RBurst-") and fp["stopLoss"] > 0 and fp["side"] == "BUY"   # broker SL at open
     assert tr.cmd_stop()["ok"] and not [x for x in fake.positions.values() if x["comment"].startswith("RBurst")]
     tr.cmd_shutdown()
 
@@ -271,4 +271,17 @@ def test_order_without_sl_sends_no_stoploss_field(fake, tmp_path):
     r = b.market_order("XAUUSD", "BUY", 0.05, 0.0, 0.0, 20, MAGIC, "RBurst-nosl")
     assert r["ok"], r
     assert not fake.positions[r["ticket"]]["stopLoss"]
+    b.shutdown()
+
+
+def test_sl_modify_moves_stop_and_keeps_tp(fake, tmp_path):
+    b = mk(fake, tmp_path)
+    assert b.connect(DEMO["login"], DEMO["password"], DEMO["server"])[0]
+    assert b.select_symbol("XAUUSD")
+    r = b.market_order("XAUUSD", "BUY", 0.05, 2390.0, 2420.0, 20, MAGIC, "RBurst-trail")
+    assert r["ok"], r
+    t = r["ticket"]
+    assert b.modify_sl(t, 2401.5, 0.0)["ok"]                       # BE+/trail move, TP omitted
+    assert fake.positions[t]["stopLoss"] == 2401.5 and fake.positions[t]["takeProfit"] == 2420.0
+    assert b.modify_sl(t, 2403.25, 2420.0)["ok"] and fake.positions[t]["stopLoss"] == 2403.25
     b.shutdown()

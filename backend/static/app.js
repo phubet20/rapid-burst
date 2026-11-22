@@ -134,8 +134,8 @@
       (s.foreign_positions ? `${s.foreign_positions} manual/other (untouched)` : "");
     $("posBody").innerHTML = pos.length ? pos.map((x) =>
       `<tr><td>${esc(x.symbol)}</td><td class="${x.side === "BUY" ? "pos-v" : "neg-v"}">${x.side}</td><td>${fmt(x.volume, 2)}</td>` +
-      `<td>${esc(x.price_open)}${x.batch ? `<div class="tiny muted">batch ${esc(x.batch)}</div>` : ""}</td><td class="${x.profit >= 0 ? "pos-v" : "neg-v"}">${x.profit > 0 ? "+" : ""}${fmt(x.profit)}</td><td>${x.age_s ?? "—"}s</td></tr>`).join("")
-      : `<tr><td colspan="6" class="muted">No bot positions</td></tr>`;
+      `<td>${esc(x.price_open)}${x.batch ? `<div class="tiny muted">batch ${esc(x.batch)}</div>` : ""}</td><td>${x.sl ? esc(x.sl) : "—"}<div class="tiny ${x.sl_state === "trail" || x.sl_state === "BE+" ? "pos-v" : "muted"}">${esc(x.sl_state === "trail" ? "trailing" : x.sl_state === "BE+" ? "breakeven+" : x.sl_state || "")}</div></td><td class="${x.profit >= 0 ? "pos-v" : "neg-v"}">${x.profit > 0 ? "+" : ""}${fmt(x.profit)}</td><td>${x.age_s ?? "—"}s</td></tr>`).join("")
+      : `<tr><td colspan="7" class="muted">No bot positions</td></tr>`;
 
     const syms = eng.symbols || {};
     const bsl = (eng.risk_config || {}).broker_sl;
@@ -148,11 +148,23 @@
       const trHtml = tr ? (tr.known ? ` <span class="tiny ${tr.dir > 0 ? "pos-v" : tr.dir < 0 ? "neg-v" : "muted"}">trend ${tr.dir > 0 ? "▲" : tr.dir < 0 ? "▼" : "▬"} ${esc(tr.label)}</span>`
                                     : ` <span class="tiny muted">trend ?</span>`) : "";
       const sk = v.skips && Object.keys(v.skips).length ? `<div class="tiny muted">why no trade (count): ${Object.entries(v.skips).map(([a, b]) => esc(a) + " " + b).join(" · ")}</div>` : "";
-      return `<div class="eng"><b>${esc(k)}</b>${mk}${trHtml} <span class="sig ${cls}">${esc(v.signal)}</span> score ${fmt(v.score, 2)} · <b>${v.signal === "HOLD" ? "waiting for: " : ""}</b>${esc(v.reason)}` + sk +
+      const im = v.impulse;
+      const imHtml = im ? `<div class="tiny ${im.dir && im.strength ? (im.dir > 0 ? "pos-v" : "neg-v") : "muted"}">⚡ ${esc(im.reason)} · bar ${im.bar_range_atr ?? "—"} ATR range, ${im.bar_move_atr ?? "—"} move, flow ${im.pressure ?? "—"} (${im.ticks_w ?? 0} ticks/${im.atr_src || ""} ATR ${im.atr ?? "—"})</div>` : "";
+      return `<div class="eng"><b>${esc(k)}</b>${mk}${trHtml} <span class="sig ${cls}">${esc(v.signal)}</span> score ${fmt(v.score, 2)} · <b>${v.signal === "HOLD" ? "waiting for: " : ""}</b>${esc(v.reason)}` + imHtml + sk +
         `<div class="tiny muted">vel ${f.vel ?? "—"} acc ${f.acc ?? "—"} press ${f.press ?? "—"} brk ${f.brk ?? "—"} exp ${f.exp ?? "—"} z ${f.z ?? "—"} · spread ${v.spread_pts ?? "—"}pt · ${f.tps ?? "—"} t/s · tick ${v.tick_age ?? "—"}s ago</div></div>`;
     }).join("") : `<div class="muted small">${eng.halted ? esc(eng.halt_reason) : "Engine idle"}</div>`;
     const rc = eng.risk_config;
-    if (rc) $("engine").insertAdjacentHTML("beforeend", `<div class="tiny muted rc">Active limits: broker SL ${rc.broker_sl} (engine hard-close ${rc.sl_vol_units} vu per order, batch loss ≤ ${rc.batch_max_loss_pct}% equity) · exposure ≤ ${rc.max_total_notional_x}× equity · risk/trade ${rc.risk_per_trade_pct}% · min-lot floor (no minimum balance; max orders now ${rc.tier_legs_now}, tiers ${rc.batch_tiers}) · open risk ≤ ${rc.max_total_risk_pct}% · daily loss ${rc.daily_loss_limit_pct}% · drawdown ${rc.equity_drawdown_pct}% · batch ${rc.batch} orders, TP ${rc.batch_tp_units} vu, max hold ${rc.batch_max_hold_s}s, cooldown ${rc.batch_cooldown_s}s · entry |score| ≥ ${rc.entry_threshold} (counter-trend ≥ ${rc.countertrend_min_score}) · ≥ ${rc.min_tick_rate} ticks/s · spread ≤ ${rc.max_spread_bps} bp</div>`);
+    if (rc) $("engine").insertAdjacentHTML("beforeend", `<div class="tiny muted rc">Active limits: broker SL ${rc.broker_sl} (${esc(rc.sl_rule || "")}) · exposure ≤ ${rc.max_total_notional_x}× equity · risk/trade ${rc.risk_per_trade_pct}% · min-lot floor (no minimum balance; max orders now ${rc.tier_legs_now}, tiers ${rc.batch_tiers}) · open risk ≤ ${rc.max_total_risk_pct}% · daily loss ${rc.daily_loss_limit_pct ? rc.daily_loss_limit_pct + "%" : "OFF"} · drawdown stop ${rc.equity_drawdown_pct ? rc.equity_drawdown_pct + "%" : "OFF"} · batch loss cap ${rc.batch_max_loss_pct}% · batch ${rc.batch} orders, TP ${rc.batch_tp_units} vu, max hold ${rc.batch_max_hold_s}s, cooldown ${rc.batch_cooldown_s}s · entry |score| ≥ ${rc.entry_threshold} (counter-trend ≥ ${rc.countertrend_min_score}) · ≥ ${rc.min_tick_rate} ticks/s · spread ≤ ${rc.max_spread_bps} bp</div>`);
+    const lr = eng.learning;
+    if (lr) {
+      const row = (r) => `<div class="tiny">${esc(r.bucket)} · n ${r.n} · win ${Math.round(r.win * 100)}% · exp ${r.exp_r >= 0 ? "+" : ""}${r.exp_r}R · <b>${esc(r.state)}</b></div>`;
+      const last = Object.entries(lr.last || {}).map(([k, v]) => `<div class="tiny">${esc(k)}: ${esc(v)}</div>`).join("");
+      $("engine").insertAdjacentHTML("beforeend", `<details class="small" open><summary>🧠 Learning: ${lr.trades} closed burst(s) learned · ${lr.buckets} bucket(s) (cold until ${lr.min_samples} trades: min lot + fast cut)</summary>` +
+        (last ? `<div class="tiny muted">current size multiplier / gate:</div>${last}` : `<div class="tiny muted">no entry decided yet</div>`) +
+        (lr.top && lr.top.length ? `<div class="tiny muted">best buckets</div>${lr.top.map(row).join("")}` : "") +
+        (lr.bottom && lr.bottom.length ? `<div class="tiny muted">worst buckets</div>${lr.bottom.map(row).join("")}` : "") +
+        `<div class="tiny muted">Re-weights from real closed trades only; no guarantee of profit.</div></details>`);
+    }
     const dec = eng.decisions || [];
     if (dec.length) $("engine").insertAdjacentHTML("beforeend", `<details class="small"><summary>Recent decisions (${dec.length})</summary>` +
       dec.slice().reverse().map((d) => `<div class="tiny">${new Date(d.ts * 1000).toLocaleTimeString("en-GB")} ${esc(d.symbol)} ${esc(d.side)} ${d.score ?? ""} · trend ${esc(d.trend)} → ${esc(d.outcome)}</div>`).join("") + `</details>`);

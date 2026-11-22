@@ -67,15 +67,43 @@ class EngineConfig:
     max_total_risk_pct: float = 15.0  # sum of open SL risk across bot positions (% equity)
     small_account_max_loss_pct: float = 0.0  # 0 = NO minimum-balance rule: min lot always allowed (free margin permitting); >0 = optional cap
     batch_tiers: str = "5:1,20:2,50:3,200:4"  # equity below X -> at most N orders per batch (above last: batch_max)
-    daily_loss_limit_pct: float = 20.0  # bot daily P/L <= -x% of day-start balance => halt
-    equity_drawdown_pct: float = 30.0   # equity below day peak by x% => halt
+    daily_loss_limit_pct: float = 0.0   # 0 = OFF (user choice). RB_DAILY_LOSS_PCT=x re-enables: daily P/L <= -x% => halt
+    equity_drawdown_pct: float = 0.0    # 0 = OFF (user choice). RB_MAX_DD_PCT=x re-enables: equity x% below day peak => halt
 
     # --- protection WITHOUT a broker-side stop-loss (default): the engine closes positions itself ---
-    broker_sl: bool = False          # RB_BROKER_SL=1: also send a normal SL with every order
+    broker_sl: bool = True           # real broker SL on every order at open (RB_BROKER_SL=0 to disable)
     emergency_sl: bool = False       # RB_EMERGENCY_SL=1: far disaster SL (emergency_sl_units vol units) only
     emergency_sl_units: float = 40.0
     batch_max_loss_pct: float = 5.0  # whole batch floating loss >= x% of equity => hard close all legs
-    adverse_fade_units: float = 1.0  # losing >= x vu AND short-term momentum against => fast exit
+    adverse_fade_units: float = 99.0  # (disabled) old early adverse-fade exit; wrong-way cut + broker SL govern
+
+    # --- M1 impulse detector (per-second order flow) ---
+    impulse_enabled: bool = True
+    impulse_flow_seconds: float = 5.0   # order-flow window (up vs down ticks)
+    impulse_vel_atr: float = 0.10       # 3 s move >= x * M1 ATR
+    impulse_min_pressure: float = 0.35  # (up - down) / (up + down) in the surge direction
+    impulse_bar_atr: float = 0.20       # bar (or flow-window) move >= x * M1 ATR
+    impulse_min_spread_mult: float = 1.0  # ... and >= x * spread
+    impulse_max_bar_atr: float = 1.6    # do not chase a bar already this extended
+    impulse_min_accel: float = 0.8      # last 3 s move >= 0.8 x previous 3 s (not decelerating)
+    impulse_counter_min: float = 0.70   # counter-trend impulse needs this strength (single order)
+    # Adaptive learning from real closed bursts (see learner.py)
+    learning_enabled: bool = True
+    learn_min_samples: int = 8          # trades per bucket before it can be disabled or sized up
+    learn_half_life_hours: float = 36.0 # decay -> old results fade and losing buckets get re-explored
+    learn_max_mult: float = 2.0         # max size multiplier for proven positive-expectancy buckets
+    # --- broker SL management: tight initial SL -> breakeven+ -> trailing ---
+    sl_spread_mult: float = 2.0         # initial SL >= x * spread
+    sl_atr_frac: float = 0.5            # initial SL >= x * M1 ATR (micro-ATR)
+    hard_close_mult: float = 1.3        # software backup stop at x * broker SL distance
+    be_lock_spread_mult: float = 0.3    # BE+ lock = open + x * spread (small profit)
+    trail_atr_frac: float = 0.25        # trailing distance >= x * M1 ATR
+    trail_spread_mult: float = 1.0      # trailing distance >= x * spread
+    sl_modify_min_interval: float = 1.0 # seconds between SL modifications of one position
+    wrong_way_seconds: float = 6.0      # no follow-through within x s => cut
+    wrong_way_follow_spread: float = 0.5  # 'follow-through' = executable P/L recovered to >= -x * spread
+    wrong_way_loss_frac: float = 0.6    # unlocked and losing >= x * SL distance with momentum against => cut
+    batch_tp_atr: float = 0.6           # short take-profit for the whole burst: x * M1 ATR (when ATR known)
 
     # --- burst batches (2-5 same-direction orders on strong momentum; never martingale/grid) ---
     batch_min: int = 2
@@ -113,7 +141,9 @@ class EngineConfig:
                 data.update(json.loads(raw))
             except ValueError:
                 pass
-        for env, key in (("RB_BROKER_SL", "broker_sl"), ("RB_EMERGENCY_SL", "emergency_sl")):
+        for env, key in (("RB_BROKER_SL", "broker_sl"), ("RB_EMERGENCY_SL", "emergency_sl"),
+                         ("RB_DAILY_LOSS_PCT", "daily_loss_limit_pct"), ("RB_MAX_DD_PCT", "equity_drawdown_pct"),
+                         ("RB_LEARNING_ENABLED", "learning_enabled")):
             if os.environ.get(env, "").strip():
                 data[key] = os.environ[env]
         names = {f.name for f in fields(cls)}
