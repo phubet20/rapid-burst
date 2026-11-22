@@ -71,8 +71,8 @@ def test_sizing_refuses_when_tick_value_unknown_or_min_lot_too_risky():
     cfg = EngineConfig()
     r = size_position(EQUITY, cfg, 100.0, 0.01, 0.0, 0.01, 20, 0.01)
     assert r.volume == 0 and "invalid" in r.note
-    r = size_position(EQUITY, cfg, 5_000.0, 0.01, 0.01, 1.0, 20, 1.0)   # min lot 1.0 BTC would risk far more
-    assert r.volume == 0 and "min lot SL loss" in r.note
+    r = size_position(EQUITY, cfg, 5_000.0, 0.01, 0.01, 2.0, 20, 2.0)   # broker min lot above max_lot_per_order
+    assert r.volume == 0 and "max_lot_per_order" in r.note
 
 
 def test_total_exposure_cap_is_notional_based_across_assets():

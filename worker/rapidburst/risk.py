@@ -55,14 +55,17 @@ def size_position(equity: float, cfg: EngineConfig, sl_distance: float, tick_siz
     raw = budget / lpl
     vol = normalize_volume(min(raw, cfg.max_lot_per_order), vmin, vmax, vstep)
     if vol == 0.0:
-        # risk-based lot is below the broker minimum (small account): trade the minimum lot only if
-        # its stop-loss loss stays within the small-account cap (and never above max_lot_per_order)
-        cap = max(budget * 1.5, equity * cfg.small_account_max_loss_pct / 100.0)
-        if vmin * lpl <= cap and vmin <= cfg.max_lot_per_order:
-            return SizeResult(vmin, vmin * lpl, f"min lot (small account: SL loss {vmin * lpl:.2f} "
-                                                f"<= cap {cap:.2f})")
-        return SizeResult(0.0, vmin * lpl, f"min lot SL loss {vmin * lpl:.2f} > small-account cap {cap:.2f} "
-                                           f"({cfg.small_account_max_loss_pct:g}% equity)")
+        # risk-based lot is below the broker minimum (tiny account): NO minimum-balance rule - trade the
+        # broker minimum lot (free margin permitting, checked later). An optional cap can be configured.
+        if vmin > cfg.max_lot_per_order:
+            return SizeResult(0.0, vmin * lpl, f"min lot {vmin:g} exceeds max_lot_per_order {cfg.max_lot_per_order:g}")
+        if cfg.small_account_max_loss_pct > 0:
+            cap = max(budget * 1.5, equity * cfg.small_account_max_loss_pct / 100.0)
+            if vmin * lpl > cap:
+                return SizeResult(0.0, vmin * lpl, f"min lot SL loss {vmin * lpl:.2f} > small-account cap {cap:.2f} "
+                                                   f"({cfg.small_account_max_loss_pct:g}% equity)")
+        return SizeResult(vmin, vmin * lpl, f"min lot floor (risk {vmin * lpl:.2f} = "
+                                            f"{vmin * lpl / equity * 100:.1f}% of equity)")
     return SizeResult(vol, vol * lpl, "ok")
 
 
@@ -122,7 +125,8 @@ class RiskGuard:
 
     def check_entry(self, symbol: str, side: str, positions: Iterable[OpenPos], acct: AccountView,
                     new_volume: float, new_risk: float, new_margin: float, add_score_ok: bool,
-                    new_notional: float = 0.0, batch_leg: bool = False) -> tuple[bool, str]:
+                    new_notional: float = 0.0, batch_leg: bool = False,
+                    floor_mode: bool = False) -> tuple[bool, str]:
         cfg = self.cfg
         if self.halted:
             return False, f"halted: {self.halt_reason}"
@@ -147,6 +151,13 @@ class RiskGuard:
             cap_n = acct.equity * cfg.max_total_notional_x
             if sum(p.notional for p in pos) + new_notional > cap_n + 1e-9:
                 return False, f"max total exposure {cfg.max_total_notional_x:.0f}x equity would be exceeded"
+        if floor_mode:
+            # broker-minimum lot on a tiny account: risk %/margin-use rules cannot apply (the lot cannot be
+            # smaller); only real free margin matters - the broker would reject the order otherwise
+            if new_margin > acct.margin_free + 1e-9:
+                return False, (f"insufficient free margin for the minimum lot: needs {new_margin:.2f}, "
+                               f"free {acct.margin_free:.2f}")
+            return True, "ok (min-lot floor)"
         risk_cap = acct.equity * cfg.max_total_risk_pct / 100.0
         if sum(p.risk_money for p in pos) + new_risk > risk_cap + 1e-9:
             return False, f"max open risk {risk_cap:.2f} would be exceeded"

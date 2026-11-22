@@ -724,8 +724,15 @@ class Trader:
                 return (f"hard close: #{ps.ticket} adverse {adverse / vu:.1f}vu >= {hd / vu:.1f}vu "
                         f"(engine stop, broker SL {'on' if cfg.broker_sl else 'OFF'})")
         eq = float(self.account.get("equity", 0.0))
-        if eq > 0 and total <= -eq * cfg.batch_max_loss_pct / 100.0:
-            return f"hard close: group loss {total:+.2f} <= -{cfg.batch_max_loss_pct:g}% of equity {eq:.2f}"
+        limit = eq * cfg.batch_max_loss_pct / 100.0
+        if f is not None and f.spread and legs:
+            info = self.sym_info.get(legs[0].symbol) or {}
+            ts = float(info.get("trade_tick_size", 0))
+            tv = float(info.get("trade_tick_value_loss", 0) or info.get("trade_tick_value", 0))
+            if ts and tv:       # never let the % cap sit inside the round-trip spread cost (tiny accounts)
+                limit = max(limit, 4.0 * f.spread / ts * tv * sum(p.volume for p in legs))
+        if eq > 0 and total <= -limit:
+            return f"hard close: group loss {total:+.2f} <= -{limit:.2f} ({cfg.batch_max_loss_pct:g}% of equity {eq:.2f})"
         return None
 
     def _group_exit(self, key: str, legs: list, f, now_wall: float) -> Optional[str]:
@@ -806,6 +813,12 @@ class Trader:
                     self._skip(s, status, f"{sig.action} skipped: batch open, adding only when trend aligned "
                                           f"(trend {tr.label if tr else 'unknown'})", now_wall, sig)
                     continue
+                tier = self._tier_legs(acct.equity)
+                if len(mine) >= min(cfg.max_positions_per_symbol, tier + 1):
+                    self._skip(s, status, f"{sig.action} skipped: equity {acct.equity:.2f} tier allows "
+                                          f"{min(cfg.max_positions_per_symbol, tier + 1)} order(s) on {s}",
+                               now_wall, sig)
+                    continue
                 n, batch_id, mode = 1, mine[0].batch_id or batch_id, "pyramid"
             elif rel == "counter":
                 if abs(sig.score) < cfg.countertrend_min_score:
@@ -814,8 +827,19 @@ class Trader:
                     continue
                 n, risk_mult, mode = 1, 0.5, "counter-trend"
             else:
-                n = self._batch_size(abs(sig.score))
+                n = min(self._batch_size(abs(sig.score)), self._tier_legs(acct.equity))
             self._enter_batch(s, sig, info, acct, open_pos, now_wall, status, n, risk_mult, batch_id, mode)
+
+    def _tier_legs(self, equity: float) -> int:
+        """Max orders per batch for this equity (tiny accounts: 1; grows automatically with equity)."""
+        for part in str(self.cfg.batch_tiers).split(","):
+            try:
+                lim, legs = part.split(":")
+                if equity < float(lim):
+                    return max(1, int(legs))
+            except ValueError:
+                continue
+        return max(1, self.cfg.batch_max)
 
     def _batch_size(self, score: float) -> int:
         c = self.cfg
@@ -833,7 +857,7 @@ class Trader:
                  ("spread", "spread filter"), ("no momentum", "no momentum edge"), ("extended", "move extended"),
                  ("batch cooldown", "batch cooldown"), ("cooldown", "cooldown"), ("per minute", "entry rate cap"),
                  ("/min", "entry rate cap"), ("counter-trend", "counter-trend filter"),
-                 ("trend aligned", "batch open (no add)"), ("min lot", "sizing refused"),
+                 ("trend aligned", "batch open (no add)"), ("tier allows", "equity tier cap"), ("min lot", "sizing refused"),
                  ("averaging", "no adding to losers"), ("add requires", "add needs stronger score"),
                  ("margin", "margin"), ("risk", "risk cap"), ("max ", "risk cap"), ("opposite", "no hedge vs open"),
                  ("slippage", "execution quality"), ("halt", "risk halt"), ("netting", "netting position"),
@@ -845,10 +869,10 @@ class Trader:
 
     def _skip(self, s: str, status: dict, reason: str, now_wall: float, sig=None) -> None:
         status["reason"] = reason
-        if now_wall - self.skip_last.get(s, 0.0) < 1.0:      # sample at most once per second per symbol
-            return
-        self.skip_last[s] = now_wall
         cat = self._category(reason)
+        if now_wall - self.skip_last.get((s, cat), 0.0) < 1.0:   # sample each reason at most 1/s per symbol
+            return
+        self.skip_last[(s, cat)] = now_wall
         self.skip_counts.setdefault(s, Counter())[cat] += 1
         self.skip_window.setdefault(s, Counter())[cat] += 1
         if sig is not None and sig.action != "HOLD":
@@ -925,7 +949,6 @@ class Trader:
         d = 1 if sig.action == "BUY" else -1
         add_ok = abs(sig.score) >= cfg.add_threshold
         placed, why_stop = [], ""
-        self.pacer.on_entry(s, now_wall)          # one batch = one entry for the rate limiter
         for i in range(max(1, n)):
             f = self.engines[s].features(self._server_now(s, now_wall)) if i else f
             price = f.ask if sig.action == "BUY" else f.bid
@@ -935,7 +958,8 @@ class Trader:
                 break
             notional = self._notional(s, size.volume, price)
             ok, why = self.risk.check_entry(s, sig.action, open_pos, acct, size.volume, size.risk_money, margin,
-                                            add_ok, notional, batch_leg=bool(placed))
+                                            add_ok, notional, batch_leg=bool(placed),
+                                            floor_mode=size.note.startswith("min lot floor"))
             if not ok:
                 why_stop = why
                 break
@@ -970,6 +994,8 @@ class Trader:
                                                    open_price=fill, open_time=now_wall, sl=sl, tp=tp,
                                                    entry_vu=f.vol_unit, reason=sig.reason, batch_id=batch_id,
                                                    hard_dist=sl_dist)
+            if not placed:
+                self.pacer.on_entry(s, now_wall)      # one batch = one entry for the rate limiter
             placed.append(ticket)
             self.add_log("INFO", f"ENTRY {sig.action} {r['volume']} {s} @ {fill} #{ticket} batch {batch_id} "
                                  f"leg {len(placed)}/{n} ({mode}) score {sig.score:+.2f} [{sig.reason}] "
@@ -992,6 +1018,7 @@ class Trader:
             status["reason"] = f"batch {batch_id}: {len(placed)} order(s) {sig.action} (trend {tr.label if tr else 'unknown'})"
             self._save_state()
         else:
+            self.pacer.on_entry(s, now_wall)          # failed attempt: retry only after the normal cooldown
             self._skip(s, status, f"{sig.action} blocked: {why_stop}", now_wall, sig)
 
     # ----------------------------------------------------------------- loop
@@ -1079,7 +1106,9 @@ class Trader:
                 "max_spread_bps": c.max_spread_bps, "max_positions_total": c.max_positions_total,
                 "max_positions_per_symbol": c.max_positions_per_symbol, "sl_vol_units": c.sl_vol_units,
                 "broker_sl": "ON" if c.broker_sl else ("EMERGENCY ONLY" if c.emergency_sl else "OFF"),
-                "batch_max_loss_pct": c.batch_max_loss_pct, "max_total_notional_x": c.max_total_notional_x}
+                "batch_max_loss_pct": c.batch_max_loss_pct, "max_total_notional_x": c.max_total_notional_x,
+                "tier_legs_now": self._tier_legs(float(self.account.get("equity", 0) or 0)),
+                "batch_tiers": c.batch_tiers}
 
     def _build_snapshot(self, now_wall: float) -> None:
         acct = self.account if self.conn_state == "CONNECTED" else {}

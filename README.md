@@ -181,11 +181,15 @@ already paid), momentum fade, reversal, or time stop (`batch_max_hold_seconds`).
 flat there is a `batch_cooldown_seconds` pause. No martingale, no grid, never adds to a losing
 position, never opens against an open batch. Lots compound with equity through `risk_per_trade_pct`.
 
-**Small accounts.** When the risk-based lot is below the broker minimum, the minimum lot is used
-only if its SL loss is <= `small_account_max_loss_pct` of equity (default 5%) and total open SL
-risk stays <= `max_total_risk_pct` (15%); otherwise the signal is skipped with the reason
-logged. Defaults: daily loss limit 20%, equity drawdown stop 30% (halts and flattens).
-Example (Exness BTCUSDm, $10): spread ~$6.4, SL ~$20-30 -> 0.01 lot risks $0.20-0.30 (2-3%).
+**Any equity, no minimum balance.** When the risk-based lot is below the broker minimum the bot
+trades the broker minimum lot instead of skipping on risk % (the engine hard-close, batch loss cap
+and the 20% daily-loss / 30% drawdown kill-switch still bound the loss; optional
+`small_account_max_loss_pct` > 0 re-adds a per-order cap). The only skip is **insufficient free
+margin for the minimum lot** (the broker would reject it) - shown clearly in the app. Orders per
+batch scale with equity (`batch_tiers`, default below $5: 1, $5-20: 2, $20-50: 3, $50-200: 4, above:
+`batch_max`; pyramiding may add one more into a winning, trend-aligned batch). Lots grow
+automatically with equity through `risk_per_trade_pct`.
+Example (Exness BTCUSDm, $10): spread ~$6.4, hard-close ~$20-30 -> 0.01 lot risks $0.20-0.30 (2-3%).
 
 **Trend filter.** Every 60 s the engine fetches real M1 (45 min) and M5 (90 min) bars from the
 broker (TickerAll `GET /v1/accounts/{id}/candles`, or MT5 `copy_rates_from_pos`) and computes

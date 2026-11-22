@@ -65,7 +65,8 @@ class EngineConfig:
     max_total_lots: float = 2.0
     max_total_notional_x: float = 500.0  # sum of open notional <= x * equity (BTC min lot on $10 = ~90x; SL caps the loss)
     max_total_risk_pct: float = 15.0  # sum of open SL risk across bot positions (% equity)
-    small_account_max_loss_pct: float = 5.0  # min lot allowed when its SL loss <= x% equity (small accounts)
+    small_account_max_loss_pct: float = 0.0  # 0 = NO minimum-balance rule: min lot always allowed (free margin permitting); >0 = optional cap
+    batch_tiers: str = "5:1,20:2,50:3,200:4"  # equity below X -> at most N orders per batch (above last: batch_max)
     daily_loss_limit_pct: float = 20.0  # bot daily P/L <= -x% of day-start balance => halt
     equity_drawdown_pct: float = 30.0   # equity below day peak by x% => halt
 

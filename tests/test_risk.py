@@ -23,21 +23,38 @@ def test_size_xauusd():
 
 def test_size_min_lot_too_risky_is_rejected():
     cfg = EngineConfig(risk_per_trade_pct=0.25)
-    r = size_position(200, cfg, 15.0, 0.01, 1.0, 0.01, 100, 0.01)  # min lot risk $15 > 5% of $200
-    assert r.volume == 0.0 and "small-account cap" in r.note
+    r = size_position(200, cfg, 15.0, 0.01, 1.0, 0.01, 100, 0.01)  # min lot risk $15 = 7.5% of $200
+    assert r.volume == 0.01 and "min lot floor" in r.note           # no minimum-balance rule
+    r = size_position(200, EngineConfig(small_account_max_loss_pct=5), 15.0, 0.01, 1.0, 0.01, 100, 0.01)
+    assert r.volume == 0.0 and "small-account cap" in r.note        # optional cap still available
 
 
 def test_size_small_account_min_lot_fallback():
     # $10 Exness demo, BTCUSDm: tick 0.01, $0.01/tick/lot, SL $25 -> min lot 0.01 loses $0.25 (2.5%)
     cfg = EngineConfig()
     r = size_position(10.0, cfg, 25.0, 0.01, 0.01, 0.01, 200, 0.01)
-    assert r.volume == 0.01 and abs(r.risk_money - 0.25) < 1e-9 and "small account" in r.note
-    # SL $60 -> $0.60 = 6% > 5% cap -> refused with a reason
-    r = size_position(10.0, cfg, 60.0, 0.01, 0.01, 0.01, 200, 0.01)
+    assert r.volume == 0.01 and abs(r.risk_money - 0.25) < 1e-9 and "min lot floor" in r.note
+    # SL $60 -> $0.60 = 6% of $10: still trades (no minimum balance); $2 account too
+    assert size_position(10.0, cfg, 60.0, 0.01, 0.01, 0.01, 200, 0.01).volume == 0.01
+    assert size_position(2.0, cfg, 25.0, 0.01, 0.01, 0.01, 200, 0.01).volume == 0.01
+    # optional configurable cap
+    capped = EngineConfig(small_account_max_loss_pct=5)
+    r = size_position(10.0, capped, 60.0, 0.01, 0.01, 0.01, 200, 0.01)
     assert r.volume == 0.0 and "0.60" in r.note
-    # configurable cap
-    r = size_position(10.0, EngineConfig(small_account_max_loss_pct=10), 60.0, 0.01, 0.01, 0.01, 200, 0.01)
-    assert r.volume == 0.01
+    assert size_position(10.0, EngineConfig(small_account_max_loss_pct=10), 60.0, 0.01, 0.01, 0.01, 200, 0.01).volume == 0.01
+    # lots scale up automatically as equity grows
+    assert size_position(10_000.0, cfg, 25.0, 0.01, 0.01, 0.01, 200, 0.01).volume > 0.01
+
+
+def test_floor_mode_only_requires_free_margin():
+    from rapidburst.risk import AccountView, RiskGuard
+    g = RiskGuard(EngineConfig())
+    ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 2.0, 0.0), 0.01, 0.4, 0.45, True, 900.0,
+                            floor_mode=True)
+    assert ok, why      # risk 13% of equity and margin use 22% would fail the normal rules
+    ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 0.3, 0.0), 0.01, 0.4, 0.45, True, 900.0,
+                            floor_mode=True)
+    assert not ok and "insufficient free margin for the minimum lot" in why
 
 
 def test_size_capped_by_max_lot():

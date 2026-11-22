@@ -101,22 +101,40 @@ def test_batch_cooldown_and_stop_flattens(tmp_path):
         assert r["ok"] and not br.positions_
 
 
-def test_sizing_refusal_is_logged_with_reason(tmp_path):
+def test_insufficient_free_margin_for_min_lot_is_the_only_skip_and_is_visible(tmp_path):
     cfg = EngineConfig()
     tr, br = make(tmp_path, {"BTCUSDm": _series_up()}, cfg)
-    br.spec = dict(br.spec, trade_tick_value=5.0, trade_tick_value_loss=5.0)     # min lot would risk >> 5%
-    _small_account(br)
+    _small_account(br, balance=0.30, margin_per_lot=45.0)      # $0.30: min lot needs 0.45 margin
     _start(tr, br, T0 + 1)
     run(tr, br, T0 + 1, T0 + 240)
     assert not [l for l in tr.logs if l["msg"].startswith("ENTRY")]
     tr._build_snapshot(T0 + 240)
     skips = tr.get_snapshot()["engine"]["symbols"]["BTCUSDm"]["skips"]
-    assert skips.get("sizing refused", 0) >= 1, skips
+    assert skips.get("margin", 0) >= 1, skips
     dec = tr.get_snapshot()["engine"]["decisions"]
-    assert any("small-account cap" in d["outcome"] for d in dec), dec
+    assert any("insufficient free margin for the minimum lot" in d["outcome"] for d in dec), dec
     assert any(l["msg"].startswith("WHY NO TRADE") for l in tr.logs)
     rc = tr.get_snapshot()["engine"]["risk_config"]
-    assert rc["small_account_max_loss_pct"] == 5.0 and rc["daily_loss_limit_pct"] == 20.0
+    assert rc["small_account_max_loss_pct"] == 0.0 and rc["daily_loss_limit_pct"] == 20.0
+
+
+def test_tiny_equity_trades_one_min_lot_and_tiers_scale_up(tmp_path):
+    for equity, legs_max in ((3.0, 1), (12.0, 2), (30.0, 3), (1000.0, 5)):
+        import pathlib, tempfile
+        cfg = EngineConfig()
+        tr, br = make(pathlib.Path(tempfile.mkdtemp()), {"BTCUSDm": _series_up()}, cfg)
+        br.spec = dict(br.spec, trade_tick_value=0.05, trade_tick_value_loss=0.05)
+        _small_account(br, balance=equity)
+        _start(tr, br, T0 + 1)
+        run(tr, br, T0 + 1, T0 + 200)
+        entries = [l["msg"] for l in tr.logs if l["msg"].startswith("ENTRY")]
+        assert entries, (equity, [l["msg"] for l in tr.logs][-5:])
+        first = entries[0].split(" batch ")[1].split()[0]
+        n = len([m for m in entries if f"batch {first}" in m])
+        assert 1 <= n <= legs_max, (equity, n)
+        if equity == 3.0:
+            assert n == 1 and " 0.01 BTCUSDm" in entries[0]
+    assert tr._tier_legs(3) == 1 and tr._tier_legs(10) == 2 and tr._tier_legs(60) == 4 and tr._tier_legs(5000) == 5
 
 
 # --------------------------------------------------------------- trend gate
