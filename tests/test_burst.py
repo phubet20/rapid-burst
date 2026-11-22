@@ -120,7 +120,7 @@ def test_insufficient_free_margin_for_min_lot_is_the_only_skip_and_is_visible(tm
 
 
 def test_tiny_equity_trades_one_min_lot_and_tiers_scale_up(tmp_path):
-    for equity, legs_max in ((3.0, 1), (12.0, 2), (30.0, 3), (1000.0, 5)):
+    for equity, legs_max in ((3.0, 2), (12.0, 3), (30.0, 4), (1000.0, 10)):   # first batch + tier-capped adds
         import pathlib, tempfile
         cfg = EngineConfig()
         tr, br = make(pathlib.Path(tempfile.mkdtemp()), {"BTCUSDm": _series_up()}, cfg)
@@ -134,7 +134,7 @@ def test_tiny_equity_trades_one_min_lot_and_tiers_scale_up(tmp_path):
         n = len([m for m in entries if f"batch {first}" in m])
         assert 1 <= n <= legs_max, (equity, n)
         if equity == 3.0:
-            assert n == 1 and " 0.01 BTCUSDm" in entries[0]
+            assert " 0.01 BTCUSDm" in entries[0] and "leg 1/1" in entries[0]      # one min-lot order to open
     assert tr._tier_legs(3) == 1 and tr._tier_legs(10) == 2 and tr._tier_legs(60) == 4 and tr._tier_legs(5000) == 5
 
 

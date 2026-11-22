@@ -112,7 +112,7 @@ def test_start_stop_lifecycle(tmp_path):
             # 7. START after STOP: fresh engine, re-reads state, no duplicate/stale orders
             r = await cmd(s, base, H, "start")
             assert r["ok"], r
-            await asyncio.sleep(8)
+            await asyncio.sleep(1.0)      # warm-up is ~2.5 s now: nothing may be sent from stale state first
             assert sim(sim_state)["sent_orders"] == 0, "orders sent from stale state"
             assert len(engines()) == 1
             r = await cmd(s, base, H, "stop")

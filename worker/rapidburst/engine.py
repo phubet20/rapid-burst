@@ -151,6 +151,7 @@ class MomentumEngine:
         self.buf = TickBuffer(horizon=cfg.vol_window + 30.0)
         self.spreads: deque[float] = deque(maxlen=400)
         self.last: Features = Features()
+        self.seed_vu = 0.0      # 3 s move scale seeded from broker M1 candles (used while ticks are few)
 
     # ------------------------------------------------------------------ ticks
     def on_tick(self, t: float, bid: float, ask: float) -> bool:
@@ -174,6 +175,9 @@ class MomentumEngine:
         k = max(1, int(round(cfg.fast_window)))
         diffs = [abs(grid[i] - grid[i - k]) for i in range(k, len(grid))]
         vu = sum(diffs) / len(diffs) if diffs else 0.0
+        if self.seed_vu > 0:
+            w = min(1.0, max(0.0, (now - self.buf.ticks[0].t) / 30.0))   # blend candle seed -> live ticks
+            vu = w * vu + (1.0 - w) * self.seed_vu if diffs else self.seed_vu
         return max(vu, 2.0 * self.point)
 
     def features(self, now: Optional[float] = None) -> Features:
@@ -197,7 +201,7 @@ class MomentumEngine:
             self.last = f
             return f
         recent = self.buf.window(last.t - 30.0, last.t)
-        f.tick_rate = len(recent) / 30.0
+        f.tick_rate = len(recent) / max(2.0, min(30.0, last.t - self.buf.ticks[0].t))   # span-aware: no 30 s wait
         vu = self._vol_unit(last.t)
         f.vol_unit = vu
         p_fast = self.buf.at(last.t - cfg.fast_window) or self.buf.ticks[0]

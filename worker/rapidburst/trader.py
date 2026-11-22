@@ -228,6 +228,7 @@ class Trader:
             if not info:
                 continue
             self.engines[s] = MomentumEngine(s, float(info.get("point", 0.0)), self.cfg)
+            self.engines[s].seed_vu = 0.15 * self.atr_m1.get(s, 0.0)
             lt = self.broker.last_tick(s) or {}
             msc = int(lt.get("time_msc") or 0)
             self.last_msc[s] = msc if msc > 0 else int((time.time() + self.server_offset) * 1000)
@@ -636,6 +637,25 @@ class Trader:
         return {"ok": ok, "msg": msg}
 
     # --------------------------------------------------------------- ticks
+    def _check_price_sync(self, live: dict, now_wall: float) -> None:
+        """Diagnostic only: log when the engine's tick price disagrees with the broker's own current
+        price on an open position (stale/lagging stream). Rate-limited, never changes behaviour."""
+        last = getattr(self, "_sync_log", {})
+        self._sync_log = last
+        for p in live.values():
+            s = p["symbol"]
+            eng = self.engines.get(s)
+            cur = float(p.get("price_current") or 0.0)
+            if eng is None or not eng.buf.ticks or cur <= 0 or now_wall - last.get(s, 0.0) < 15.0:
+                continue
+            tk = eng.buf.ticks[-1]
+            gap = abs(tk.mid - cur)
+            if gap > max(4.0 * tk.spread, 1e-9):
+                last[s] = now_wall
+                self.add_log("WARNING", f"PRICE MISMATCH {s}: engine tick mid {tk.mid:.2f} vs broker position price "
+                                        f"{cur:.2f} (diff {gap:.2f} = {gap / max(tk.spread, 1e-9):.0f}x spread, "
+                                        f"tick age {now_wall - self.last_receipt.get(s, now_wall):.1f}s) - feed may lag")
+
     def _pull_ticks(self, now_wall: float) -> None:
         for s, eng in self.engines.items():
             ticks = self.broker.ticks_since(s, self.last_msc.get(s, 0))
@@ -687,6 +707,7 @@ class Trader:
                                         f"not running - flattening immediately")
                 self._flatten("UNPROTECTED (no SL, engine not running)")
             return            # exits are managed only while STARTed (broker SL/TP protect otherwise)
+        self._check_price_sync(live, now_wall)
         self._manage_stops(live, now_wall)
         groups: dict[str, list[PositionState]] = {}
         for t, ps in self.pos_state.items():
@@ -904,8 +925,8 @@ class Trader:
             if not ok:
                 self._skip(s, status, f"{sig.action} blocked: {why}", now_wall, sig)
                 continue
-            sl_hist = self.slippage.get(s)
-            if sl_hist and len(sl_hist) >= 3 and sum(sl_hist) / len(sl_hist) > cfg.max_avg_slippage_vu:
+            sl_hist = [v for (ts_, v) in self.slippage.get(s, ()) if now_wall - ts_ <= cfg.slippage_window_s]
+            if len(sl_hist) >= 3 and sum(sl_hist) / len(sl_hist) > cfg.max_avg_slippage_vu:
                 self._skip(s, status, "paused: poor execution quality (slippage)", now_wall, sig)
                 continue
             cd = self.burst_cooldown.get(s, 0.0) - now_wall
@@ -956,13 +977,13 @@ class Trader:
             else:
                 n = min(self._batch_size(abs(sig.score)), self._tier_legs(acct.equity), 2)
             learn = None
-            if mode != "pyramid" and cfg.learning_enabled:
+            if cfg.learning_enabled:
                 atr, _ = self._atr(s)
                 bucket = self.learner.key("impulse" if is_imp else "momentum", rel, vol_regime(sig.features.spread, atr))
                 learn = self.learner.decide(bucket)
                 learn.bucket = bucket
                 self.learn_view[s] = learn.why
-                if not learn.allow:
+                if not learn.allow and mode != "pyramid":      # adds to an SL-locked winner are never gated
                     self._skip(s, status, learn.why, now_wall, sig)
                     continue
             self._enter_batch(s, sig, info, acct, open_pos, now_wall, status, n, risk_mult, batch_id, mode, learn)
@@ -1074,6 +1095,8 @@ class Trader:
             rngs = [b["high"] - b["low"] for b in m1[-15:-1] if b.get("high") is not None and b["high"] > b["low"]]
             if rngs:
                 self.atr_m1[s] = sum(rngs) / len(rngs)
+                if s in self.engines:
+                    self.engines[s].seed_vu = 0.15 * self.atr_m1[s]
             tr.detail["m1_bars"], tr.detail["m5_bars"] = float(len(m1)), float(len(m5))
             self.trends[s] = tr
             if prev is None or prev.label.split(" ")[0] != tr.label.split(" ")[0]:
@@ -1178,7 +1201,7 @@ class Trader:
                 break
             fill = float(r["price"])
             slip = (fill - float(r["req_price"])) * d / point
-            self.slippage.setdefault(s, deque(maxlen=10)).append(max(0.0, slip * point / max(f.vol_unit, point)))
+            self.slippage.setdefault(s, deque(maxlen=10)).append((now_wall, max(0.0, slip * point / max(f.vol_unit, point))))
             ticket = int(r["ticket"])
             self.pos_state[ticket] = PositionState(ticket=ticket, symbol=s, side=sig.action, volume=float(r["volume"]),
                                                    open_price=fill, open_time=now_wall, sl=sl, tp=tp,

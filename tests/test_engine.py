@@ -23,9 +23,21 @@ def first_signal(eng, ticks, after=0.0):
 
 def test_warmup_holds():
     eng = MomentumEngine("XAUUSD", 0.01, EngineConfig())
-    feed(eng, burst_series(T0, 1, pre_seconds=10, burst_seconds=0))
+    feed(eng, burst_series(T0, 1, pre_seconds=10, burst_seconds=0)[:3])      # < 4 ticks / 2.5 s
     s = eng.signal()
     assert s.action == "HOLD" and "warming" in s.reason
+
+
+def test_warmup_is_seconds_not_20s_and_candle_seed_is_used():
+    cfg = EngineConfig()
+    assert cfg.warmup_seconds <= 3.0 and cfg.min_ticks_warmup <= 5
+    eng = MomentumEngine("XAUUSD", 0.01, cfg)
+    ticks = burst_series(T0, 1, pre_seconds=10, burst_seconds=0)
+    eng.seed_vu = 0.5
+    feed(eng, [t for t in ticks if t[0] <= ticks[0][0] + 3.0])
+    f = eng.features()
+    assert f.ready and f.vol_unit >= 0.2                 # candle-seeded scale while ticks are few
+    assert f.tick_rate > 0.3                             # span-aware tick rate (not /30 s)
 
 
 def test_up_burst_gives_buy_quickly():

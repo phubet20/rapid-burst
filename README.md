@@ -25,7 +25,7 @@ operated from a single-screen iPhone web app. **DEMO only by default.**
 | Button | What happens |
 |---|---|
 | CONNECT MT5 | Launcher decrypts + stores creds (DPAPI), spawns the engine, which starts the bot's MT5 terminal, logs in and validates (DEMO, algo trading, symbol specs). If START doesn't follow within `RB_STANDBY_SECONDS` (600) the engine and terminal are shut down again. |
-| START | Spawns engine + terminal if needed, fresh login, re-reads account/positions/orders, re-adopts bot positions by magic, discards all old tick history and warms up on live ticks only (20 s / 15 ticks) before the first entry. Idempotent (second START = "already running"). Desired state is persisted so a crashed engine / rebooted PC resumes with a fresh START. |
+| START | Spawns engine + terminal if needed, fresh login, re-reads account/positions/orders, re-adopts bot positions by magic, discards all old tick history and warms up on live ticks only (about 2.5 s / 4 ticks, scale seeded from broker M1 candles) before the first entry. Idempotent (second START = "already running"). Desired state is persisted so a crashed engine / rebooted PC resumes with a fresh START. |
 | STOP | Blocks entries, cancels bot pendings, closes bot positions and verifies, then shuts the engine down and kills the bot's own `terminal64.exe` (matched by its exact path – your own MT5 is never touched). If closing can't be verified the engine stays alive and keeps retrying; if MT5 is unreachable it gives up after 5 min (positions keep server-side SL/TP). Manual/other-EA trades are never touched. |
 | (nothing pressed) | Only the launcher runs (measured on Linux: ~0.03% CPU, ~50 MB RSS, 0 child processes). |
 
@@ -237,6 +237,16 @@ The UI cannot change risk limits.
   comment / magic, so the journal survives STOP/START and engine restarts but is reset by a redeploy
   or a Render instance restart (it then starts cold again at min lot). No guarantee of profit or of a
   smooth equity curve: the learner only re-weights what real trades have shown so far.
+
+## Speed settings (second-by-second entries)
+
+Warm-up 2.5 s / 4 ticks (vol scale seeded from TickerAll M1 candles, tick rate measured over the real
+span), entry cooldown 1.5 s, after a loss 2 s, after a closed batch 2 s, up to 30 entries/minute,
+entry threshold 0.42, loop every 0.1 s. Entries are evaluated on every loop. The slippage pause only
+counts fills of the last 90 s (it used to stick until the next fill), and a losing streak pauses a
+symbol for 20 s (was 10 min). Kept: broker SL at open, BE+/trail, fast wrong-way cut, learner
+cold start at min lot, no martingale, idempotency. A PRICE MISMATCH warning is logged when the engine's
+tick price differs from the broker's own position price by more than 4x spread.
 
 ## Path to a LIVE account (not enabled)
 

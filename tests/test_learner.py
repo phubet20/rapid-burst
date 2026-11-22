@@ -69,6 +69,7 @@ def test_regime_buckets():
 
 def test_trader_cold_start_min_lot_journals_closed_bursts(tmp_path):
     cfg = EngineConfig()
+    cfg.learn_min_samples = 100                          # stay in cold start for this run
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=1.0)     # risk sizing alone would be ~1 lot
     _start(tr, br, T0 + 1)

@@ -116,12 +116,12 @@ def test_restart_recovery_readopts_positions(tmp_path):
     assert any("Re-adopted" in l["msg"] for l in tr2.logs)
     # idempotent: a second START does not open a new batch
     assert tr2.cmd_start()["msg"] == "already running"
-    # warm-up on fresh ticks only -> no entries during the warm-up (20 s)
-    run(tr2, br, t, t + cfg.warmup_seconds - 3)
+    # warm-up on fresh ticks only (~2.5 s now) -> no entries before it, and no pre-START ticks
+    run(tr2, br, t, t + 1.0)
     assert br.sent_orders == sent, "entered on stale state before fresh warm-up"
     eng = tr2.engines["XAUUSD"]
     assert eng.buf.ticks and eng.buf.ticks[0].t > t - 0.5, "engine used ticks from before START"
-    run(tr2, br, t + cfg.warmup_seconds - 3, t + 400)
+    run(tr2, br, t + 1.0, t + 400)
     # adopted positions are managed (exited) by the new process
     assert not (tickets & {int(p["ticket"]) for p in br.positions_.values()})
 

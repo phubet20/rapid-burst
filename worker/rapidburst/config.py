@@ -18,15 +18,15 @@ class EngineConfig:
     slow_window: float = 15.0         # short-term structure window
     vol_window: float = 120.0         # volatility normalisation window
     breakout_lookback: float = 20.0   # micro-structure range lookback
-    min_ticks_warmup: int = 15        # ticks required before any decision
-    warmup_seconds: float = 20.0      # seconds of tick history required before any decision
+    min_ticks_warmup: int = 4         # ticks required before any decision (seeded from M1 candles)
+    warmup_seconds: float = 2.5       # seconds of tick history required before any decision
     min_tick_rate: float = 0.3        # ticks/sec required (TickerAll BTCUSDm measured 0.7-1.2/s)
     max_tick_age: float = 10.0        # seconds; older last tick => market idle -> HOLD
 
     # --- entry scoring (no RSI, no fixed confirmation chain) ---
     min_impulse_units: float = 3.0  # fast displacement (vol units) that counts as a burst
     min_pressure: float = 0.35      # one-sided tick pressure that must accompany the impulse
-    entry_threshold: float = 0.50     # |score| needed to enter (score in [-1, 1])
+    entry_threshold: float = 0.42     # |score| needed to enter (score in [-1, 1])
     add_threshold: float = 0.70       # |score| needed to add a second/third order
     exhaustion_z: float = 3.2         # price z-score vs. 60s mean => extended, do not chase
     chase_disp_units: float = 4.0     # slow displacement (vol units) beyond which we refuse to chase
@@ -36,7 +36,8 @@ class EngineConfig:
     max_spread_points: float = 0.0    # optional extra absolute cap in points (0 = off; legacy / per-deployment)
     max_spread_vol_ratio: float = 3.0 # spread must be < ratio * volatility unit (3s typical move)
     spread_spike_ratio: float = 2.0   # spread > ratio * median spread => skip
-    max_avg_slippage_vu: float = 0.75 # recent fills avg slippage cap in volatility units -> pause entries
+    max_avg_slippage_vu: float = 1.5  # recent fills avg slippage cap in volatility units -> pause entries
+    slippage_window_s: float = 90.0   # only fills this recent count (the gate can no longer stick forever)
     deviation_points: int = 20        # minimum slippage accepted by the server; raised per symbol from spread/volatility
 
     # --- exits ---
@@ -51,11 +52,11 @@ class EngineConfig:
     stale_loss_units: float = 2.5     # after half hold time and still losing this much => close
 
     # --- entry pacing / duplicate prevention ---
-    cooldown_seconds: float = 5.0     # min time between entries on one symbol
-    loss_cooldown_seconds: float = 20.0
-    max_entries_per_minute: int = 6   # per symbol
+    cooldown_seconds: float = 1.5     # min time between entries on one symbol
+    loss_cooldown_seconds: float = 2.0
+    max_entries_per_minute: int = 30  # per symbol
     max_consecutive_losses: int = 4   # then pause symbol for loss_pause_seconds
-    loss_pause_seconds: float = 600.0
+    loss_pause_seconds: float = 20.0   # was 600: a losing streak no longer parks the bot for 10 min
 
     # --- risk ---
     risk_per_trade_pct: float = 0.25  # % of equity lost if the SL is hit
@@ -111,7 +112,7 @@ class EngineConfig:
     batch_full_score: float = 0.90   # |score| at which the batch reaches batch_max
     batch_tp_units: float = 1.0      # close the whole batch at +x vol units (executable price, after spread)
     batch_max_hold_seconds: float = 120.0
-    batch_cooldown_seconds: float = 10.0
+    batch_cooldown_seconds: float = 2.0
     # --- higher-timeframe trend filter (M1/M5 bars) ---
     trend_min_strength: float = 0.25   # below = flat
     countertrend_min_score: float = 0.80  # counter-trend entry needs this |score|, single order, half risk
@@ -120,7 +121,7 @@ class EngineConfig:
     margin_use_max_pct: float = 30.0  # new order margin must be < x% of free margin
 
     # --- loop ---
-    loop_interval: float = 0.15
+    loop_interval: float = 0.1
     snapshot_interval: float = 1.0
     magic: int = 26112201
     comment_prefix: str = "RBurst"
