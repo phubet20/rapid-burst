@@ -190,9 +190,14 @@ async def healthz(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "worker_online": hub.worker_online()})
 
 
-async def login(request: web.Request) -> web.Response:
+async def check_ui_password(request: web.Request, password: str) -> web.Response | None:
+    """Rate-limited UI-password check used by login and worker enroll.
+
+    Returns an error response, or None if the password is correct. Failures (not
+    successes) count toward the per-IP cap of 8 attempts / 15 minutes. Never logs
+    the password.
+    """
     hub: Hub = request.app[HUB]
-    require_csrf(request)
     ip = client_ip(request)
     q = hub.login_attempts.setdefault(ip, deque())
     now = time.time()
@@ -200,19 +205,49 @@ async def login(request: web.Request) -> web.Response:
         q.popleft()
     if len(q) >= 8:
         return web.json_response({"ok": False, "msg": "too many attempts, wait 15 minutes"}, status=429)
+    if not hmac.compare_digest(password.encode(), hub.ui_password.encode()):
+        q.append(now)
+        await asyncio.sleep(1.0)
+        return web.json_response({"ok": False, "msg": "wrong password"}, status=401)
+    return None
+
+
+async def login(request: web.Request) -> web.Response:
+    require_csrf(request)
+    hub: Hub = request.app[HUB]
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
-    pw = str(body.get("password", ""))
-    if not hmac.compare_digest(pw.encode(), hub.ui_password.encode()):
-        q.append(now)
-        await asyncio.sleep(1.0)
-        return web.json_response({"ok": False, "msg": "wrong password"}, status=401)
+    err = await check_ui_password(request, str(body.get("password", "")))
+    if err is not None:
+        return err
     resp = web.json_response({"ok": True})
     resp.set_cookie("rb_session", hub.make_session(), max_age=SESSION_TTL, httponly=True, secure=True,
                     samesite="Strict", path="/")
     return resp
+
+
+async def worker_enroll(request: web.Request) -> web.Response:
+    """Give a Windows installer the worker secret after proving the app password.
+
+    Used by bootstrap/install.ps1 so the user never has to paste WORKER_SECRET.
+    The body is {"password": "<UI password>"}; the secret is returned once and is
+    never written to logs.
+    """
+    require_csrf(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    err = await check_ui_password(request, str(body.get("password", "")))
+    if err is not None:
+        return err
+    hub: Hub = request.app[HUB]
+    log.info("worker enroll ok from %s", client_ip(request))
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    base = f"{proto}://{request.host}"
+    return web.json_response({"ok": True, "worker_secret": hub.worker_secret, "backend_url": base})
 
 
 async def logout(request: web.Request) -> web.Response:
@@ -361,6 +396,7 @@ def make_app(ui_password: str, worker_secret: str, wake_url: str = "") -> web.Ap
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/api/login", login)
+    app.router.add_post("/api/worker/enroll", worker_enroll)
     app.router.add_post("/api/logout", logout)
     app.router.add_get("/api/state", api_state)
     app.router.add_post("/api/cmd", api_cmd)

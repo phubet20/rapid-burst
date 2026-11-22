@@ -6,9 +6,13 @@
 
   Run in an elevated PowerShell on the Windows PC/VPS:
 
-    & ([scriptblock]::Create((irm __BACKEND_URL__/bootstrap/install.ps1))) -WorkerSecret '<WORKER_SECRET>'
+    & ([scriptblock]::Create((irm __BACKEND_URL__/bootstrap/install.ps1)))
+
+  The script prompts for the same password you use to unlock the iPhone app, then
+  enrolls this PC over HTTPS and writes the worker secret to worker.env itself.
 
   Optional:
+    -WorkerSecret '<secret>'                  skip the prompt if you already have WORKER_SECRET
     -AutoLogonPassword '<windows password>'   keep MT5 running after reboots (Sysinternals Autologon, LSA-encrypted)
     -Mt5SetupUrl '<broker mt5setup.exe url>'  use your broker's own MT5 installer instead of the MetaQuotes one
     -InstallDir 'C:\RapidBurst'
@@ -17,7 +21,7 @@
   Do not use the bot's own terminal (C:\RapidBurst\mt5) for manual trading; your normal MT5 is unaffected.
 #>
 param(
-  [Parameter(Mandatory = $true)][string]$WorkerSecret,
+  [string]$WorkerSecret = "",
   [string]$BackendUrl = "__BACKEND_URL__",
   [string]$InstallDir = "C:\RapidBurst",
   [string]$Mt5SetupUrl = "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe",
@@ -46,15 +50,42 @@ $Tmp = Join-Path $InstallDir "tmp"
 foreach ($d in @($InstallDir, $Py, $Mt5, $Wk, $Data, $Logs, $Tmp)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
 $User = "$env:USERDOMAIN\$env:USERNAME"
 
-# ---------------------------------------------------------------- 1. backend reachability + secret check
+# ---------------------------------------------------------------- 1. backend reachability + enroll
 Step "Checking backend $BackendUrl"
 $h = Invoke-RestMethod -Uri "$BackendUrl/healthz" -TimeoutSec 120
 if (-not $h.ok) { throw "Backend not healthy" }
+
+if ([string]::IsNullOrWhiteSpace($WorkerSecret)) {
+  Step "Enter the same password you use to unlock the app (it is not shown)"
+  $sec = Read-Host "App password" -AsSecureString
+  if (-not $sec -or $sec.Length -eq 0) { throw "App password is required (or pass -WorkerSecret)" }
+  $bstr = [IntPtr]::Zero
+  $appPw = $null
+  try {
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+    $appPw = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    $enroll = Invoke-RestMethod -Method Post -Uri "$BackendUrl/api/worker/enroll" -TimeoutSec 120 `
+      -Headers @{ "X-RB" = "1" } -ContentType "application/json" `
+      -Body (@{ password = $appPw } | ConvertTo-Json -Compress)
+  } catch {
+    throw "Enrollment failed (wrong app password, or backend unreachable): $($_.Exception.Message)"
+  } finally {
+    if ($bstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    $appPw = $null
+    $sec = $null
+  }
+  if (-not $enroll.ok -or [string]::IsNullOrWhiteSpace([string]$enroll.worker_secret)) {
+    throw "Enrollment did not return a worker secret"
+  }
+  $WorkerSecret = [string]$enroll.worker_secret
+  Ok "enrolled with the backend over TLS"
+}
+
 $zip = Join-Path $Tmp "worker.zip"
 try {
   Invoke-WebRequest -Uri "$BackendUrl/bootstrap/worker.zip" -Headers @{ "X-Worker-Secret" = $WorkerSecret } -OutFile $zip -UseBasicParsing
 } catch { throw "Backend rejected the worker secret (or is unreachable): $($_.Exception.Message)" }
-Ok "backend reachable, worker secret accepted"
+Ok "backend reachable, worker package downloaded"
 
 # ---------------------------------------------------------------- 2. Python
 $PyExe = Join-Path $Py "python.exe"

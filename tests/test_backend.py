@@ -56,7 +56,10 @@ def test_auth_and_static():
             names = z.namelist()
             assert "main.py" in names and "engine_main.py" in names and "rapidburst/launcher.py" in names
             ps1 = await (await s.get(base + "/bootstrap/install.ps1")).text()
-            assert base in ps1 and SECRET not in ps1
+            assert base in ps1 and SECRET not in ps1 and UI_PW not in ps1
+            assert "Read-Host" in ps1 and "AsSecureString" in ps1 and "/api/worker/enroll" in ps1
+            assert "Mandatory" not in ps1  # -WorkerSecret is optional
+            assert "-WorkerSecret '<WORKER_SECRET>'" not in ps1
             try:
                 await s.ws_connect(base.replace("http", "ws") + "/worker/ws", headers={"Authorization": "Bearer nope"})
                 assert False, "bad worker secret accepted"
@@ -101,4 +104,61 @@ def test_launcher_with_real_mt5_adapter_reports_unavailable_honestly(tmp_path):
             assert "never-log-me" not in blob
         task.cancel()
         await server.close()
+    run(go())
+
+
+def test_worker_enroll_with_password_returns_secret_and_rejects_wrong():
+    async def go():
+        import logging
+        records = []
+
+        class Cap(logging.Handler):
+            def emit(self, record):
+                records.append(self.format(record))
+
+        cap = Cap()
+        cap.setFormatter(logging.Formatter("%(name)s %(levelname)s %(message)s"))
+        for name in ("rb.backend", "aiohttp.access", "aiohttp.server", "aiohttp.web"):
+            logging.getLogger(name).addHandler(cap)
+        server, base = await start_backend()
+        async with aiohttp.ClientSession() as s:
+            # wrong password
+            r = await s.post(base + "/api/worker/enroll", json={"password": "wrong-password"},
+                             headers={"X-RB": "1"})
+            body = await r.json()
+            assert r.status == 401 and body.get("ok") is False
+            assert "worker_secret" not in body and SECRET not in json.dumps(body)
+
+            # missing CSRF
+            r = await s.post(base + "/api/worker/enroll", json={"password": UI_PW})
+            assert r.status == 403
+
+            # correct password returns the secret once
+            r = await s.post(base + "/api/worker/enroll", json={"password": UI_PW},
+                             headers={"X-RB": "1"})
+            body = await r.json()
+            assert r.status == 200 and body["ok"] is True
+            assert body["worker_secret"] == SECRET
+            assert body["backend_url"] == base
+
+            # returned secret actually unlocks the worker zip
+            z = await s.get(base + "/bootstrap/worker.zip",
+                            headers={"X-Worker-Secret": body["worker_secret"]})
+            assert z.status == 200
+
+            # enroll failures share the login rate limit (7 more wrongs + the 1 above = 8)
+            for _ in range(7):
+                assert (await s.post(base + "/api/worker/enroll", json={"password": "bad"},
+                                     headers={"X-RB": "1"})).status == 401
+            r = await s.post(base + "/api/worker/enroll", json={"password": UI_PW},
+                             headers={"X-RB": "1"})
+            assert r.status == 429
+            r = await s.post(base + "/api/login", json={"password": UI_PW}, headers={"X-RB": "1"})
+            assert r.status == 429
+        await server.close()
+        blob = "\n".join(records)
+        assert SECRET not in blob, "worker secret appeared in logs"
+        assert UI_PW not in blob, "UI password appeared in logs"
+        for name in ("rb.backend", "aiohttp.access", "aiohttp.server", "aiohttp.web"):
+            logging.getLogger(name).removeHandler(cap)
     run(go())

@@ -98,7 +98,10 @@ python -m tests.replay --seeds 1 2 3 --hours 2     # SYNTHETIC replay, not marke
 
 ## Install the launcher (your Windows PC or a Windows VPS, elevated PowerShell)
 ```
-& ([scriptblock]::Create((irm https://<backend>/bootstrap/install.ps1))) -WorkerSecret '<WORKER_SECRET>' [-AutoLogonPassword '<windows pw>']
+& ([scriptblock]::Create((irm https://<backend>/bootstrap/install.ps1)))
 ```
-Then open the backend URL on the iPhone → unlock → CONNECT MT5 (demo login/password/server) → select
-symbols → START. STOP closes bot positions and shuts the engine + bot terminal down.
+The script prompts for the same password you use to unlock the app, enrolls the PC over HTTPS
+(`/api/worker/enroll`, rate-limited like login) and writes WORKER_SECRET to `worker.env` itself.
+`-WorkerSecret` is still accepted if you already have it. Then open the backend URL on the iPhone
+→ unlock → CONNECT MT5 (demo login/password/server) → select symbols → START. STOP closes bot
+positions and shuts the engine + bot terminal down.
