@@ -173,6 +173,7 @@ def test_margin_estimate_only_when_currency_known(fake, tmp_path):
 
 def test_trader_stop_flattens_only_bot_trades_over_tickerall(fake, tmp_path):
     """Real Trader loop + TickerAll adapter + mocked API: STOP closes/cancels only bot trades, verified."""
+    fake.auto_ticks = True               # synthetic live quotes on subscribed symbols
     bot = fake.add_position(comment="RBurst-seed1", sl=2380.0)
     manual = fake.add_position(side="SELL", comment="manual")
     own_pend = fake.add_order(comment="RBurst-p")
@@ -206,8 +207,9 @@ def test_trader_enters_with_sl_on_streamed_burst(fake, tmp_path):
     tr = Trader(b, MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
     tr.selected = ["XAUUSD"]
     tr.step(time.time())
-    assert tr.cmd_start()["ok"]
     assert wait(lambda: any(c.get("kind") == "ticks" for c in fake.subscriptions))
+    fake.push_tick("XAUUSD", 2650.0, 2650.18)          # first live quote so the symbol counts as quoting
+    assert tr.cmd_start()["ok"]
     t0 = time.time()
     entered = False
     for i, (t, bid, ask) in enumerate(burst_series(t0, +1, pre_seconds=120, burst_seconds=8)):
@@ -234,6 +236,7 @@ def test_trader_enters_with_sl_on_streamed_burst(fake, tmp_path):
 
 
 def test_untradable_symbol_explains_why_and_select_revalidates(fake, tmp_path):
+    fake.auto_ticks = True
     b = mk(fake, tmp_path)
     tr = Trader(b, MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
     tr.selected = ["BTCUSD"]                    # mocked spec has no price geometry -> not tradable

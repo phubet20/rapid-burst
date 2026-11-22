@@ -99,6 +99,8 @@ class TickerAllBroker:
         self._srv_off = 0
         self._hot = False
         self._specs: dict[str, dict] = {}
+        self._spec_rows: Optional[dict] = None
+        self._live_at: dict[str, float] = {}
         self._symbols: Optional[list] = None
         self._watched: set[str] = set()
         self._ticks: dict[str, deque] = {}
@@ -352,11 +354,63 @@ class TickerAllBroker:
                 return []
         return self._symbols or []
 
+    CRYPTO = {"BTC", "ETH", "LTC", "XRP", "BCH", "ADA", "SOL", "DOGE", "DOT", "LNK", "LINK", "BNB", "XLM", "TRX",
+              "AVAX", "MATIC", "UNI", "ATOM", "SHIB", "TON", "NEAR", "APT", "ETC", "EOS", "DASH", "XMR", "ZEC"}
+    METALS = {"XAU", "XAG", "XPT", "XPD"}
+    FIAT = {"USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "SGD", "HKD", "CNH", "CNY", "MXN", "ZAR", "TRY",
+            "NOK", "SEK", "DKK", "PLN", "CZK", "HUF", "THB", "ILS", "RUB"}
+    ALIASES = {"gold": "xau", "silver": "xag", "platinum": "xpt", "palladium": "xpd", "bitcoin": "btc",
+               "ethereum": "eth", "litecoin": "ltc", "ripple": "xrp", "dogecoin": "doge", "solana": "sol",
+               "forex": "fx", "currency": "fx", "stock": "stocks", "index": "indices"}
+
+    def _all_specs(self) -> dict[str, dict]:
+        if self._spec_rows is None and self.account_id:
+            rows: dict[str, dict] = {}
+            try:
+                res = self._req("GET", f"/v1/accounts/{self.account_id}/symbol-specs", timeout=30)
+                for r in (res.get("specs") if isinstance(res, dict) else res) or []:
+                    if r.get("name"):
+                        rows[r["name"]] = r
+            except Exception as exc:  # noqa: BLE001
+                log.info("symbol-specs unavailable: %s", type(exc).__name__)
+            self._spec_rows = rows
+        return self._spec_rows or {}
+
+    def _classify(self, name: str, spec: dict) -> str:
+        base = str(spec.get("baseCurrency") or "").upper()
+        prof = str(spec.get("profitCurrency") or "").upper()
+        n = "".join(ch for ch in name.upper() if ch.isalpha())
+        head = base or n[:3]
+        if head in self.CRYPTO or any(n.startswith(c) for c in self.CRYPTO if len(c) >= 3):
+            return "crypto"
+        if head in self.METALS or n[:3] in self.METALS:
+            return "metal"
+        if any(k in n for k in ("OIL", "BRENT", "WTI", "NGAS", "NATGAS")):
+            return "energy"
+        if (base in self.FIAT and prof in self.FIAT) or (not base and n[:3] in self.FIAT and n[3:6] in self.FIAT):
+            return "fx"
+        return "indices/stocks/other"
+
+    def describe(self, name: str) -> tuple[str, str]:
+        spec = self._all_specs().get(name, {})
+        kind = self._classify(name, spec)
+        base, prof = spec.get("baseCurrency"), spec.get("profitCurrency")
+        pair = f"{base}/{prof}" if base and prof else (f"quoted in {prof}" if prof else "")
+        return (f"{kind} (derived){' ' + pair if pair else ''}".strip(), kind)
+
     def search_symbols(self, query: str, limit: int = 60) -> list[dict]:
-        q = (query or "").strip().lower()
-        out = [{"name": s, "desc": "", "path": "", "visible": s in self._watched, "trade_mode": None}
-               for s in self._symbol_list() if not q or q in s.lower()]
-        out.sort(key=lambda x: (not x["name"].lower().startswith(q), x["name"]))
+        """Full broker symbol catalogue; matches name, derived class and currency pair."""
+        q = " ".join(self.ALIASES.get(t, t) for t in (query or "").lower().split())
+        toks = q.split()
+        out = []
+        for s in self._symbol_list():
+            desc, kind = self.describe(s)
+            hay = f"{s} {desc} {kind}".lower()
+            if toks and not all(t in hay for t in toks):
+                continue
+            out.append({"name": s, "desc": desc, "path": kind, "visible": s in self._watched, "trade_mode": None})
+        key = toks[0] if toks else ""
+        out.sort(key=lambda x: (not x["name"].lower().startswith(key), x["path"], x["name"]))
         return out[:limit]
 
     def select_symbol(self, symbol: str) -> bool:
@@ -381,16 +435,31 @@ class TickerAllBroker:
         if spec.get("point") is None or spec.get("digits") is None:
             return {}                        # unknown geometry -> not tradable by the bot
         tva = spec.get("tickValueAccount")
+        tv_src = "broker (tickValueAccount)"
+        cs, ts = _f(spec.get("contractSize")), _f(spec.get("tickSize"), _f(spec["point"]))
+        if not tva:
+            # TickerAll did not give the account-currency tick value: derive it only when it is exact
+            cur = (self.account() or {}).get("currency")
+            prof, base = spec.get("profitCurrency"), spec.get("baseCurrency")
+            if cs and ts and cur and prof == cur:
+                tva, tv_src = cs * ts, "derived: contract x tick (quote currency = account currency)"
+            elif cs and ts and cur and base == cur:
+                px = _f(self.last_tick(symbol).get("bid"))
+                if px > 0:
+                    tva, tv_src = cs * ts / px, "derived: contract x tick / price (base currency = account currency)"
+            if not tva:
+                tva, tv_src = 0.0, "unknown (cannot be derived safely)"
         info = {
             "name": spec.get("name", symbol), "point": _f(spec["point"]), "digits": int(spec["digits"]),
             "volume_min": _f(spec.get("volumeMin")), "volume_max": _f(spec.get("volumeMax")),
             "volume_step": _f(spec.get("volumeStep")),
-            "trade_tick_size": _f(spec.get("tickSize"), _f(spec["point"])),
-            # risk is sized off the ACCOUNT-currency tick value; unknown -> 0 so sizing refuses the trade
-            "trade_tick_value": _f(tva), "trade_tick_value_loss": _f(tva),
-            "trade_contract_size": _f(spec.get("contractSize")),
+            "trade_tick_size": ts,
+            # risk is sized off the ACCOUNT-currency tick value; unknown -> 0 so the trader refuses the symbol
+            "trade_tick_value": _f(tva), "trade_tick_value_loss": _f(tva), "tick_value_source": tv_src,
+            "trade_contract_size": cs,
             "trade_stops_level": int(_f(spec.get("stopLevel"))), "trade_freeze_level": int(_f(spec.get("freezeLevel"))),
             "currency_margin": spec.get("marginCurrency"), "currency_profit": spec.get("profitCurrency"),
+            "currency_base": spec.get("baseCurrency"),
             # TickerAll does not publish the symbol trade mode; the broker validates every order
             # (MARKET_CLOSED / TRADE_DISABLED come back as rejections). 4 = "full" is therefore an
             # assumption that is labelled as such, not broker data.
@@ -406,6 +475,7 @@ class TickerAllBroker:
         bid, ask = _f(msg.get("bid")), _f(msg.get("ask"))
         if not s or bid <= 0 or ask <= 0 or msg.get("stale"):
             return
+        self._live_at[s] = time.time()
         t = _iso_to_epoch(msg.get("timestamp")) or time.time()
         msc = int(round((t + self._srv_off) * 1000))   # broker server time, like MT5 time_msc
         buf = self._ticks.setdefault(s, deque(maxlen=5000))
@@ -413,6 +483,22 @@ class TickerAllBroker:
             msc = buf[-1][3] + 1                         # keep strictly increasing for ticks_since
         buf.append((msc / 1000.0, bid, ask, msc))
         self._last_tick[s] = {"time": int(msc // 1000), "time_msc": msc, "bid": bid, "ask": ask}
+
+    def quote_state(self, symbol: str, fresh_s: float = 60.0) -> str:
+        """live = a non-stale tick arrived in the last fresh_s; closed = stream is up but no live ticks."""
+        if time.time() - self._live_at.get(symbol, 0.0) <= fresh_s:
+            return "live"
+        return "closed" if self._ws_ok else "no_stream"
+
+    def wait_quotes(self, symbols: list, timeout: float) -> None:
+        """Give freshly subscribed symbols a moment to deliver their first live tick."""
+        for s in symbols:
+            self.select_symbol(s)          # ensure subscribed (idempotent)
+        end = time.time() + timeout
+        while time.time() < end:
+            if all(self.quote_state(s) == "live" for s in symbols):
+                return
+            time.sleep(0.2)
 
     def last_tick(self, symbol: str) -> dict:
         lt = self._last_tick.get(symbol)

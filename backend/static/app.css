@@ -32,7 +32,7 @@ input{width:100%;background:#0e131a;border:1px solid var(--line);color:var(--txt
 .small{font-size:12px}.tiny{font-size:11px}.muted{color:var(--mut)}.center{text-align:center;min-height:16px;margin-top:4px}
 .checks{list-style:none;margin:0;padding:0;font-size:12px}
 .checks li{display:flex;gap:6px;padding:2px 0}.checks .d{color:var(--mut);margin-left:auto;text-align:right}
-.symlist{max-height:150px;overflow:auto;font-size:13px}
+.symlist{max-height:260px;overflow:auto;font-size:13px}
 .symlist div{padding:7px 4px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
 .symlist div.sel{color:#93c5fd}
 .chips{display:flex;gap:4px;flex-wrap:wrap;flex:1}

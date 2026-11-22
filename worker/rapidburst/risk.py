@@ -70,6 +70,7 @@ class OpenPos:
     volume: float
     profit: float
     risk_money: float
+    notional: float = 0.0     # account-currency notional (0 = not computable)
 
 
 @dataclass
@@ -117,7 +118,8 @@ class RiskGuard:
         return None
 
     def check_entry(self, symbol: str, side: str, positions: Iterable[OpenPos], acct: AccountView,
-                    new_volume: float, new_risk: float, new_margin: float, add_score_ok: bool) -> tuple[bool, str]:
+                    new_volume: float, new_risk: float, new_margin: float, add_score_ok: bool,
+                    new_notional: float = 0.0) -> tuple[bool, str]:
         cfg = self.cfg
         if self.halted:
             return False, f"halted: {self.halt_reason}"
@@ -137,6 +139,10 @@ class RiskGuard:
                 return False, "add requires stronger momentum"
         if sum(p.volume for p in pos) + new_volume > cfg.max_total_lots + 1e-9:
             return False, f"max total lots {cfg.max_total_lots} would be exceeded"
+        if new_notional > 0 and cfg.max_total_notional_x > 0:
+            cap_n = acct.equity * cfg.max_total_notional_x
+            if sum(p.notional for p in pos) + new_notional > cap_n + 1e-9:
+                return False, f"max total exposure {cfg.max_total_notional_x:.0f}x equity would be exceeded"
         risk_cap = acct.equity * cfg.max_total_risk_pct / 100.0
         if sum(p.risk_money for p in pos) + new_risk > risk_cap + 1e-9:
             return False, f"max open risk {risk_cap:.2f} would be exceeded"

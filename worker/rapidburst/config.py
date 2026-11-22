@@ -32,11 +32,12 @@ class EngineConfig:
     chase_disp_units: float = 4.0     # slow displacement (vol units) beyond which we refuse to chase
 
     # --- spread / execution quality ---
-    max_spread_points: float = 60.0   # absolute cap in points (XAUUSD ~ 10-35 on most demos)
+    max_spread_bps: float = 5.0       # spread cap relative to price (basis points of mid): symbol-agnostic
+    max_spread_points: float = 0.0    # optional extra absolute cap in points (0 = off; legacy / per-deployment)
     max_spread_vol_ratio: float = 3.0 # spread must be < ratio * volatility unit (3s typical move)
     spread_spike_ratio: float = 2.0   # spread > ratio * median spread => skip
-    max_avg_slippage_points: float = 30.0  # recent fills avg slippage cap -> pause entries
-    deviation_points: int = 20        # max slippage accepted by the server
+    max_avg_slippage_vu: float = 0.75 # recent fills avg slippage cap in volatility units -> pause entries
+    deviation_points: int = 20        # minimum slippage accepted by the server; raised per symbol from spread/volatility
 
     # --- exits ---
     sl_vol_units: float = 6.0         # protective stop = units * vol unit (>= stops level)
@@ -62,6 +63,7 @@ class EngineConfig:
     max_positions_total: int = 4
     max_positions_per_symbol: int = 2
     max_total_lots: float = 2.0
+    max_total_notional_x: float = 30.0  # sum of open notional (account ccy) <= x * equity, when computable
     max_total_risk_pct: float = 1.0   # sum of open SL risk across bot positions
     daily_loss_limit_pct: float = 3.0 # bot daily P/L <= -x% of day-start balance => halt
     equity_drawdown_pct: float = 5.0  # equity below day peak by x% => halt

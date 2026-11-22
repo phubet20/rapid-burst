@@ -247,9 +247,9 @@ class Launcher:
     def _selected(self) -> list:
         try:
             with open(os.path.join(self.data_dir, "state.json"), "r", encoding="utf-8") as fh:
-                return json.load(fh).get("selected", ["XAUUSD"])
+                return json.load(fh).get("selected", [])
         except Exception:  # noqa: BLE001
-            return ["XAUUSD"]
+            return []
 
     # ------------------------------------------------------------ engine
     async def ensure_engine(self) -> Optional[str]:

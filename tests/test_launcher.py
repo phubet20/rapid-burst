@@ -38,6 +38,9 @@ def make_launcher(tmp_path, base, wake_url="", **kw):
     env = {"RB_TEST_BROKER_FACTORY": "tests.sim_factory:make", "RB_SIM_STATE": sim_state,
            "RB_SIM_TERMINAL": term, "PYTHONPATH": ROOT + os.pathsep + os.path.join(ROOT, "worker")}
     data = os.path.join(str(tmp_path), "data")
+    os.makedirs(data, exist_ok=True)
+    with open(os.path.join(data, "state.json"), "w") as fh:     # no built-in default symbol any more: user chose one
+        json.dump({"selected": ["XAUUSD"]}, fh)
     L = Launcher(base, SECRET, data, mt5_path=term, wake_url=wake_url, engine_env=env, **kw)
     return L, sim_state, term
 

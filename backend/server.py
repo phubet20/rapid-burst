@@ -279,7 +279,13 @@ def _validate_cmd(cmd: str, args: dict) -> dict:
             raise web.HTTPBadRequest(text="encrypted credentials required")
         return {"enc": enc}
     if cmd == "search":
-        return {"q": str(args.get("q", ""))[:40]}
+        def _i(v, d, lo, hi):
+            try:
+                return max(lo, min(hi, int(v)))
+            except (TypeError, ValueError):
+                return d
+        return {"q": str(args.get("q", ""))[:40], "offset": _i(args.get("offset"), 0, 0, 100000),
+                "limit": _i(args.get("limit"), 50, 1, 200)}
     if cmd == "select":
         syms = args.get("symbols")
         if not isinstance(syms, list):

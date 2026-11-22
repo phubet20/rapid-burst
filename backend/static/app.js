@@ -89,7 +89,7 @@
 
     const liveOk = conn.state === "CONNECTED" && val.ok;
     const storedOk = L.has_credentials && lc && lc.validation_ok;
-    const canStart = online && (liveOk || storedOk) && !eng.running && !eng.halted && !eng.blocked &&
+    const canStart = online && (eng.selected || []).length > 0 && (liveOk || storedOk) && !eng.running && !eng.halted && !eng.blocked &&
       !["STARTING", "RUNNING", "STOPPING"].includes(phase);
     $("btnStart").disabled = !canStart;
     const why = [];
@@ -100,6 +100,7 @@
       if (phase === "STOPPING") why.push("STOP is still in progress.");
       if (eng.halted) why.push("Risk halt for today: " + (eng.halt_reason || "limit reached") + ".");
       if (eng.blocked) why.push("Blocked: " + eng.blocked);
+      if (!(eng.selected || []).length && !eng.running) why.push("No symbol selected - CONNECT MT5, then search in Symbols, tick the assets you want (up to 6) and press APPLY.");
       if (!liveOk && !storedOk && !eng.running) {
         if (!L.has_credentials && st !== "CONNECTED") why.push("CONNECT MT5 has not been done yet - press CONNECT MT5 and enter the demo login, password and server.");
         else {
@@ -118,7 +119,7 @@
     $("btnConnect").textContent = conn.state === "CONNECTED" ? "RECONNECT MT5" : "CONNECT MT5";
 
     $("checks").innerHTML = (val.checks || []).map((c) =>
-      `<li><span>${c.ok ? "✅" : "❌"}</span><span>${esc(c.name)}</span><span class="d">${esc(c.detail)}</span></li>`).join("")
+      `<li><span>${c.ok ? "✅" : c.soft ? "⚠️" : "❌"}</span><span>${esc(c.name)}</span><span class="d">${esc(c.detail)}</span></li>`).join("")
       || `<li class="muted">${!online ? "Launcher not connected" : st === "IDLE" ? "Engine off - checks run on CONNECT MT5 / START" : "Waiting for MT5 connection"}</li>`;
 
     const sel = eng.selected || [];
@@ -141,7 +142,8 @@
     $("engine").innerHTML = Object.keys(syms).length ? Object.entries(syms).map(([k, v]) => {
       const f = v.features || {};
       const cls = v.signal === "BUY" ? "pos-v" : v.signal === "SELL" ? "neg-v" : "muted";
-      return `<div class="eng"><b>${esc(k)}</b> <span class="sig ${cls}">${esc(v.signal)}</span> score ${fmt(v.score, 2)} · ${esc(v.reason)}` +
+      const mk = v.market === "live" ? ' <span class="pos-v tiny">● quoting</span>' : v.market === "closed" ? ' <span class="neg-v tiny">● no quotes / market closed</span>' : v.market === "n/a" ? ' <span class="neg-v tiny">● not tradable</span>' : "";
+      return `<div class="eng"><b>${esc(k)}</b>${mk} <span class="sig ${cls}">${esc(v.signal)}</span> score ${fmt(v.score, 2)} · ${esc(v.reason)}` +
         `<div class="tiny muted">vel ${f.vel ?? "—"} acc ${f.acc ?? "—"} press ${f.press ?? "—"} brk ${f.brk ?? "—"} exp ${f.exp ?? "—"} z ${f.z ?? "—"} · spread ${v.spread_pts ?? "—"}pt · ${f.tps ?? "—"} t/s · tick ${v.tick_age ?? "—"}s ago</div></div>`;
     }).join("") : `<div class="muted small">${eng.halted ? esc(eng.halt_reason) : "Engine idle"}</div>`;
     if (eng.blocked) $("engine").insertAdjacentHTML("afterbegin", `<div class="neg-v small">${esc(eng.blocked)}</div>`);
@@ -187,17 +189,25 @@
   $("btnStop").addEventListener("click", () => act("Stopping (closing bot positions, then shutting engine + MT5 down)", () => cmd("stop")));
   $("btnRefresh").addEventListener("click", () => act("Refreshing", () => cmd("refresh")));
 
-  async function search() {
-    const r = await act("Searching", () => cmd("search", { q: $("symQ").value.trim() }));
-    const list = r.symbols || [];
+  let symOffset = 0, symQuery = "", symAll = [];
+  function drawSyms(more) {
     const cur = picked || ((S.snapshot.engine || {}).selected || []);
-    $("symList").innerHTML = list.map((x) => `<div data-s="${esc(x.name)}" class="${cur.includes(x.name) ? "sel" : ""}"><span><b>${esc(x.name)}</b> <span class="muted tiny">${esc(x.desc)}</span></span><span>${cur.includes(x.name) ? "✓" : "+"}</span></div>`).join("")
-      || `<div class="muted">${r.ok ? "No symbols found" : ""}</div>`;
-    if (r.ok) $("actMsg").textContent = `✔ ${list.length} symbol(s)`;
+    $("symList").innerHTML = symAll.map((x) => `<div data-s="${esc(x.name)}" class="${cur.includes(x.name) ? "sel" : ""}"><span><b>${esc(x.name)}</b> <span class="muted tiny">${esc(x.desc || "")}</span></span><span>${cur.includes(x.name) ? "✓" : "+"}</span></div>`).join("")
+      + (more ? `<div id="symMore" class="center muted">Load more…</div>` : "") || `<div class="muted">No symbols found</div>`;
   }
-  $("btnSearch").addEventListener("click", search);
-  $("symQ").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+  async function search(append) {
+    if (!append) { symOffset = 0; symQuery = $("symQ").value.trim(); symAll = []; }
+    const r = await act("Searching", () => cmd("search", { q: symQuery, offset: symOffset, limit: 50 }));
+    if (!r.ok) { $("symList").innerHTML = `<div class="muted">${esc(r.msg || "search failed - CONNECT MT5 first")}</div>`; return; }
+    symAll = symAll.concat(r.symbols || []);
+    symOffset += (r.symbols || []).length;
+    drawSyms(!!r.has_more);
+    $("actMsg").textContent = `✔ ${symAll.length} of ${r.total} symbol(s) - tap to tick, then APPLY`;
+  }
+  $("btnSearch").addEventListener("click", () => search(false));
+  $("symQ").addEventListener("keydown", (e) => { if (e.key === "Enter") search(false); });
   $("symList").addEventListener("click", (e) => {
+    if (e.target.closest("#symMore")) { search(true); return; }
     const row = e.target.closest("[data-s]"); if (!row) return;
     const s = row.dataset.s;
     const base = picked || [...((S.snapshot.engine || {}).selected || [])];

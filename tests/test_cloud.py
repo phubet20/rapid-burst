@@ -43,6 +43,7 @@ def test_cloud_engine_connect_start_stop(tmp_path, caplog):
     caplog.set_level(logging.INFO)
     fake = FakeTickerAll()
     fake.start()
+    fake.auto_ticks = True
     bot = fake.add_position(comment="RBurst-seed1", sl=2380.0)
     manual = fake.add_position(side="SELL", comment="manual")
     own_pend = fake.add_order(comment="RBurst-p")
@@ -78,9 +79,16 @@ def test_cloud_engine_connect_start_stop(tmp_path, caplog):
                 assert not r.get("ok") and "FREE_TIER_LIVE_REJECTED" in str(r), r
 
                 r = await cmd(s, base, H, "connect", {"enc": encrypt_creds(pk, str(DEMO["login"]), DEMO["password"], DEMO["server"])})
-                assert r.get("ok") and r["validation"]["ok"], r
+                assert r.get("ok"), r
+                assert [c["name"] for c in r["validation"]["checks"] if not c["ok"] and not c.get("soft")] == ["Tradable symbol selected"]
                 assert fake.session
 
+                r = await cmd(s, base, H, "start")
+                assert not r["ok"] and "no symbol selected" in r["msg"], r      # nothing selected yet: START refused
+                r = await cmd(s, base, H, "search", {"q": "gold"})
+                assert r["ok"] and [x["name"] for x in r["symbols"]] == ["XAUUSD"], r
+                r = await cmd(s, base, H, "select", {"symbols": ["XAUUSD"]})
+                assert r["ok"] and r["validation"]["ok"], r
                 r = await cmd(s, base, H, "start")
                 assert r["ok"] and r["msg"] == "running", r
                 snap = await wait_for(lambda: hub.snapshot if hub.snapshot.get("positions") else None, 20)

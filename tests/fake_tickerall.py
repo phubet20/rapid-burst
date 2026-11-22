@@ -38,7 +38,9 @@ class FakeTickerAll:
         self.deals: list[dict] = []
         self.idem: dict[str, tuple] = {}
         self.fail_next_post_after_place = 0
-        self.quotes = {"XAUUSD": (2400.00, 2400.20), "EURUSD": (1.10000, 1.10010)}
+        self.quotes = {"XAUUSD": (2400.00, 2400.20), "EURUSD": (1.10000, 1.10010), "BTCUSDm": (98000.00, 98018.00)}
+        self.auto_ticks = False           # when True, subscribed symbols tick twice a second (synthetic)
+        self.tick_tasks: list = []
         self.balance = 10000.0
         self.ws_clients: list = []
         self.subscriptions: list = []
@@ -61,6 +63,7 @@ class FakeTickerAll:
             r.add_get("/v1/accounts/{aid}", self.h_account)
             r.add_get("/v1/accounts/{aid}/symbols", self.h_symbols)
             r.add_get("/v1/accounts/{aid}/symbols/{sym}/spec", self.h_spec)
+            r.add_get("/v1/accounts/{aid}/symbol-specs", self.h_specs)
             r.add_get("/v1/accounts/{aid}/symbols/{sym}/quote", self.h_quote)
             r.add_get("/v1/accounts/{aid}/orders", self.h_orders)
             r.add_post("/v1/accounts/{aid}/orders", self.h_place)
@@ -184,25 +187,45 @@ class FakeTickerAll:
 
     async def h_symbols(self, request):
         g = self.guard(request)
-        return g or web.json_response({"symbols": list(self.quotes) + ["BTCUSD"], "watched": []})
+        return g or web.json_response({"symbols": list(self.quotes) + ["BTCUSD", "ETHUSDm", "US30m"], "watched": []})
+
+    @staticmethod
+    def spec_for(s):
+        if s == "BTCUSDm":     # crypto: large price, tickValueAccount NOT supplied -> adapter must derive it
+            return {"name": s, "volumeMin": 0.01, "volumeMax": 20, "volumeStep": 0.01, "digits": 2, "point": 0.01,
+                    "tickSize": 0.01, "contractSize": 1, "tickValue": 0.01, "stopLevel": 0, "freezeLevel": 0,
+                    "baseCurrency": "BTC", "profitCurrency": "USD", "marginCurrency": "USD"}
+        if s == "ETHUSDm":     # crypto where the tick value cannot be derived (profit ccy not account ccy)
+            return {"name": s, "volumeMin": 0.1, "volumeMax": 100, "volumeStep": 0.1, "digits": 2, "point": 0.01,
+                    "tickSize": 0.01, "contractSize": 1, "baseCurrency": "ETH", "profitCurrency": "EUR"}
+        if s == "US30m":
+            return {"name": s, "volumeMin": 0.1, "volumeMax": 100, "volumeStep": 0.1, "digits": 2, "point": 0.01,
+                    "tickSize": 0.01, "contractSize": 1, "tickValue": 0.01, "tickValueAccount": 0.01,
+                    "profitCurrency": "USD", "marginCurrency": "USD"}
+        if s == "XAUUSD":
+            return {"name": s, "volumeMin": 0.01, "volumeMax": 100, "volumeStep": 0.01, "specSource": "broker",
+                    "digits": 2, "point": 0.01, "tickSize": 0.01, "contractSize": 100, "tickValue": 1,
+                    "tickValueAccount": 1, "stopLevel": 0, "freezeLevel": 0, "baseCurrency": "XAU",
+                    "profitCurrency": "USD", "marginCurrency": "XAU"}
+        if s == "EURUSD":
+            return {"name": s, "volumeMin": 0.01, "volumeMax": 100, "volumeStep": 0.01, "digits": 5, "point": 1e-05,
+                    "tickSize": 1e-05, "contractSize": 100000, "tickValue": 1, "tickValueAccount": 1, "stopLevel": 0,
+                    "freezeLevel": 0, "baseCurrency": "EUR", "profitCurrency": "USD", "marginCurrency": "EUR"}
+        # unknown geometry (fields absent = unknown, per TickerAll docs)
+        return {"name": s, "volumeMin": 0.01, "volumeMax": 1, "volumeStep": 0.01}
+
+    async def h_specs(self, request):
+        g = self.guard(request)
+        if g:
+            return g
+        names = list(self.quotes) + ["BTCUSD", "ETHUSDm", "US30m"]
+        return web.json_response({"specs": [self.spec_for(n) for n in names]})
 
     async def h_spec(self, request):
         g = self.guard(request)
         if g:
             return g
-        s = request.match_info["sym"]
-        if s == "XAUUSD":
-            spec = {"name": s, "volumeMin": 0.01, "volumeMax": 100, "volumeStep": 0.01, "specSource": "broker",
-                    "digits": 2, "point": 0.01, "tickSize": 0.01, "contractSize": 100, "tickValue": 1,
-                    "tickValueAccount": 1, "stopLevel": 0, "freezeLevel": 0, "baseCurrency": "XAU",
-                    "profitCurrency": "USD", "marginCurrency": "XAU"}
-        elif s == "EURUSD":
-            spec = {"name": s, "volumeMin": 0.01, "volumeMax": 100, "volumeStep": 0.01, "digits": 5, "point": 1e-05,
-                    "tickSize": 1e-05, "contractSize": 100000, "tickValue": 1, "tickValueAccount": 1, "stopLevel": 0,
-                    "freezeLevel": 0, "profitCurrency": "USD", "marginCurrency": "EUR"}
-        else:   # unknown geometry (fields absent = unknown, per TickerAll docs)
-            spec = {"name": s, "volumeMin": 0.01, "volumeMax": 1, "volumeStep": 0.01}
-        return web.json_response({"spec": spec})
+        return web.json_response({"spec": self.spec_for(request.match_info["sym"])})
 
     async def h_quote(self, request):
         g = self.guard(request)
@@ -285,6 +308,20 @@ class FakeTickerAll:
         return g or web.json_response({"deals": list(self.deals), "count": len(self.deals), "hasMore": False,
                                        "nextCursor": None, "serverTimeOffsetSeconds": 7200})
 
+    async def _auto(self, ws, symbols):
+        import random
+        rnd = random.Random(5)
+        while not ws.closed:
+            for sym in symbols:
+                if sym in self.quotes:
+                    bid, ask = self.quotes[sym]
+                    sp = ask - bid
+                    bid = round(bid + rnd.gauss(0, sp * 0.05), 5)
+                    self.quotes[sym] = (bid, round(bid + sp, 5))
+                    await ws.send_json({"type": "tick", "accountId": "acc_FAKE1", "symbol": sym, "bid": bid,
+                                        "ask": round(bid + sp, 5), "timestamp": now_iso(), "stale": False})
+            await asyncio.sleep(0.5)
+
     async def h_ws(self, request):
         if request.headers.get("Authorization") != f"Bearer {API_KEY}":
             return self.err(401, "UNAUTHORIZED")
@@ -304,6 +341,8 @@ class FakeTickerAll:
                         else:
                             acc.append(c)
                             self.subscriptions.append(c)
+                            if c.get("kind") == "ticks" and self.auto_ticks:
+                                self.tick_tasks.append(asyncio.ensure_future(self._auto(ws, c.get("symbols") or [])))
                     await ws.send_json({"type": "subscribed", "channels": acc, "rejected": rej,
                                         "correlationId": data.get("correlationId")})
                 elif data.get("type") == "ping":

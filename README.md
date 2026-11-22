@@ -140,6 +140,22 @@ Limits to know (honest):
   the symbol's margin/profit currency is the account currency; otherwise no entry.
 * Windows launcher mode still works: unset `TICKERALL_API_KEY` and set `ENGINE_MODE=launcher`.
 
+## Trading any asset (BTC, gold, FX, indices ...)
+
+* No symbol is preselected. After CONNECT MT5, **Symbols** lists the broker's full catalogue
+  (search by name, class or alias: `btc`, `bitcoin`, `crypto`, `gold`, `fx`; empty search = all;
+  "Load more" pages through it). Tick up to 6 and press APPLY.
+* Per symbol the app shows: tradable (spec known, tick value known/derivable, volume limits) and
+  quoting (a fresh live tick in the last 60 s). A closed/not-quoting symbol is marked
+  "no quotes / market closed" and skipped; it resumes by itself when quotes arrive.
+  START needs at least one tradable symbol that is quoting now.
+* Parameters are symbol-agnostic: volatility unit from the symbol's own ticks, spread cap in basis
+  points of price (`max_spread_bps`), stop/take-profit from volatility, spread and stops level,
+  size from the account-currency tick value (`tickValueAccount`; derived from contract x tick only
+  when the quote or base currency is the account currency, otherwise the symbol is refused with
+  "tick value unknown"), volume min/step/max, slippage in volatility units, per-symbol position
+  limits and a total notional cap (`max_total_notional_x`).
+
 ## Install the launcher (your Windows PC or a Windows VPS, elevated PowerShell)
 ```
 & ([scriptblock]::Create((irm https://<backend>/bootstrap/install.ps1)))

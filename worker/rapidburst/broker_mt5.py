@@ -125,6 +125,11 @@ class MT5Broker:
             return {}
         return _d(mt5.symbol_info_tick(symbol))
 
+    def quote_state(self, symbol: str) -> str:
+        """MT5 gives server-time ticks only, so freshness cannot be proven here: 'unknown' when a
+        last tick exists (the engine's own tick-age checks then decide), 'closed' when there is none."""
+        return "unknown" if self.last_tick(symbol) else "closed"
+
     def ticks_since(self, symbol: str, last_msc: int, max_count: int = 2000) -> list[tuple[float, float, float, int]]:
         """New ticks (time_msc > last_msc) as (t_seconds, bid, ask, time_msc)."""
         if mt5 is None or not self.initialized:

@@ -305,8 +305,11 @@ class MomentumEngine:
     def spread_ok(self, f: Features) -> tuple[bool, str]:
         cfg = self.cfg
         sp_pts = f.spread / self.point
-        if sp_pts > cfg.max_spread_points:
+        if cfg.max_spread_points > 0 and sp_pts > cfg.max_spread_points:
             return False, f"spread {sp_pts:.0f}pt > cap {cfg.max_spread_points:.0f}pt"
+        bps = f.spread / f.mid * 1e4 if f.mid > 0 else 0.0
+        if cfg.max_spread_bps > 0 and bps > cfg.max_spread_bps:
+            return False, f"spread {bps:.1f}bp of price > cap {cfg.max_spread_bps:.1f}bp"
         if f.vol_unit > 0 and f.spread > cfg.max_spread_vol_ratio * f.vol_unit:
             return False, f"spread {sp_pts:.0f}pt too wide vs volatility"
         if len(self.spreads) > 30:

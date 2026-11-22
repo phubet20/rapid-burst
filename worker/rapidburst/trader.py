@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import socket
@@ -76,7 +77,7 @@ class Trader:
         if not avail:
             self.conn_state, self.conn_msg = "UNAVAILABLE", why
         st = self._load_state()
-        self.selected: list[str] = st.get("selected", ["XAUUSD"])
+        self.selected: list[str] = st.get("selected", [])
         # Never resume trading from persisted state: trading starts only on an explicit START.
         self.running: bool = False
         self.was_running_before_restart = bool(st.get("running", False))
@@ -164,7 +165,7 @@ class Trader:
         self._adopt_positions()
         own_orders = [o for o in self.broker.orders() if int(o.get("magic", 0)) == self.cfg.magic]
         self._prepare_symbols()
-        self._validate()
+        self._validate(wait_quotes=8.0)
         if not self.validation["ok"]:
             bad = [c["name"] for c in self.validation["checks"] if not c["ok"]]
             return {"ok": False, "msg": "validation failed: " + ", ".join(bad)}
@@ -249,11 +250,15 @@ class Trader:
         self.stopping = False
         return {"ok": result["ok"], "msg": result["msg"]}
 
-    def cmd_search(self, q: str = "") -> dict:
+    def cmd_search(self, q: str = "", offset: int = 0, limit: int = 50) -> dict:
+        """Full broker symbol list (name/description search), paged."""
         if self.conn_state != "CONNECTED":
             return {"ok": False, "msg": "MT5 not connected", "symbols": []}
-        res = self.broker.search_symbols(q)
-        return {"ok": True, "symbols": res}
+        allr = self.broker.search_symbols(q, 100000)
+        offset, limit = max(0, int(offset)), max(1, min(200, int(limit)))
+        page = allr[offset:offset + limit]
+        return {"ok": True, "symbols": page, "total": len(allr), "offset": offset,
+                "has_more": offset + limit < len(allr)}
 
     def cmd_select(self, symbols: list) -> dict:
         syms = [str(s).strip() for s in symbols if str(s).strip()][:6]
@@ -268,7 +273,7 @@ class Trader:
         self.selected = syms
         self._save_state()
         self._prepare_symbols()
-        self._validate()
+        self._validate(wait_quotes=6.0)
         self.add_log("INFO", f"Symbols selected: {', '.join(syms)}")
         return {"ok": True, "selected": syms, "validation": self.validation, "account": self._account_brief()}
 
@@ -280,7 +285,7 @@ class Trader:
                 return {"ok": ok, "msg": msg}
             return {"ok": False, "msg": self.conn_msg}
         self._prepare_symbols()
-        self._validate()
+        self._validate(wait_quotes=6.0)
         return {"ok": True, "validation": self.validation}
 
     def cmd_forget(self) -> dict:
@@ -315,7 +320,7 @@ class Trader:
         self._prepare_symbols()
         self._refresh_account()
         self._adopt_positions(initial=True)
-        self._validate()
+        self._validate(wait_quotes=6.0)
         return True, "connected"
 
     def _ensure_connection(self, now: float) -> None:
@@ -350,7 +355,55 @@ class Trader:
             if s not in self.selected and not any(p["symbol"] == s for p in self.own_positions):
                 del self.engines[s]
 
-    def _validate(self) -> None:
+    # ---------------------------------------------------- per-symbol facts
+    def _tradable(self, s: str) -> tuple[bool, str]:
+        """Can the bot trade this symbol safely? (reason is plain words)"""
+        info = self.sym_info.get(s) or {}
+        if not info:
+            return False, "not offered by this account (or no contract spec)"
+        if int(info.get("trade_mode", 0)) != SYMBOL_TRADE_MODE_FULL:
+            return False, "trading disabled for this symbol"
+        tv = float(info.get("trade_tick_value_loss", 0) or info.get("trade_tick_value", 0) or 0)
+        if tv <= 0 or float(info.get("trade_tick_size", 0) or 0) <= 0:
+            return False, "tick value unknown - cannot size risk safely"
+        if float(info.get("volume_step", 0) or 0) <= 0 or float(info.get("volume_max", 0) or 0) <= 0:
+            return False, "volume limits unknown"
+        return True, "ok"
+
+    def _quote_state(self, s: str) -> str:
+        """live | closed | no_stream | unknown (never guessed: 'live' means a fresh non-stale tick)."""
+        fn = getattr(self.broker, "quote_state", None)
+        if fn:
+            return fn(s)
+        return "live" if self.broker.last_tick(s) else "closed"
+
+    def _quoting(self, s: str) -> bool:
+        return self._quote_state(s) in ("live", "unknown")
+
+    def _notional(self, s: str, volume: float, price: float) -> float:
+        info = self.sym_info.get(s) or {}
+        cs = float(info.get("trade_contract_size", 0) or 0)
+        cur = self.account.get("currency")
+        if not cs or not cur:
+            return 0.0
+        if info.get("currency_profit") == cur:
+            return cs * volume * price
+        if info.get("currency_base") == cur:
+            return cs * volume
+        return 0.0
+
+    def _deviation(self, s: str, spread: float = 0.0, vol_unit: float = 0.0) -> int:
+        point = float((self.sym_info.get(s) or {}).get("point", 0) or 0)
+        if point <= 0:
+            return self.cfg.deviation_points
+        return int(max(self.cfg.deviation_points, math.ceil(1.5 * spread / point), math.ceil(0.5 * vol_unit / point)))
+
+    def _close_dev(self, symbol: str) -> int:
+        eng = self.engines.get(symbol)
+        f = eng.last if eng else None
+        return self._deviation(symbol, f.spread if f else 0.0, f.vol_unit if f else 0.0)
+
+    def _validate(self, wait_quotes: float = 0.0) -> None:
         checks = []
 
         def add(name, ok, detail=""):
@@ -374,30 +427,52 @@ class Trader:
                                    if self.broker.name == "tickerall" else "enable 'Algo Trading' in the MT5 terminal"))
             acc_ok = bool(acct.get("trade_allowed")) and bool(acct.get("trade_expert"))
             add("Account allows expert trading", acc_ok, "ok" if acc_ok else "broker disallows automated trading")
-            good = []
+            soft = []
+            if wait_quotes > 0 and self.selected and hasattr(self.broker, "wait_quotes"):
+                self.broker.wait_quotes(list(self.selected), wait_quotes)
+            good, quoting = [], []
             for s in self.selected:
-                info = self.sym_info.get(s) or {}
-                if info and int(info.get("trade_mode", 0)) == SYMBOL_TRADE_MODE_FULL:
-                    good.append(s)
-            detail = ", ".join(good)
-            if not good:
-                detail = f"none of {self.selected} is tradable on this account"
+                ok_t, why_t = self._tradable(s)
+                if not ok_t:
+                    soft.append({"name": f"Symbol {s}", "ok": False, "detail": why_t, "soft": True})
+                    continue
+                good.append(s)
+                qs = self._quote_state(s)
+                if qs in ("live", "unknown"):
+                    quoting.append(s)
+                    soft.append({"name": f"Symbol {s}", "ok": True, "soft": True,
+                                 "detail": "tradable, live quotes" if qs == "live" else "tradable, quote state unknown"})
+                else:
+                    why_q = ("price stream not connected" if qs == "no_stream"
+                             else "no live quotes - market closed or symbol not trading now; skipped until quotes arrive")
+                    soft.append({"name": f"Symbol {s}", "ok": False, "soft": True, "detail": "tradable, " + why_q})
+            if not self.selected:
+                detail = "no symbol selected - open Symbols, search, tick the assets you want (up to 6) and press APPLY"
+            elif good:
+                detail = ", ".join(good)
+            else:
+                detail = "; ".join(f"{s}: {self._tradable(s)[1]}" for s in self.selected)
                 try:
                     similar = []
                     for s in self.selected:
                         base = "".join(ch for ch in s if ch.isalnum())[:6]
                         similar += [x["name"] for x in self.broker.search_symbols(base, 8)]
                     if similar:
-                        detail += f" - this broker offers: {', '.join(dict.fromkeys(similar))[:120]}; " \
-                                  "open Symbols, pick one and press APPLY"
-                    else:
-                        detail += " - open Symbols, search and APPLY a symbol this broker offers"
+                        detail += (f" - this broker offers: {', '.join(dict.fromkeys(similar))[:120]}; "
+                                   "open Symbols, pick one and press APPLY")
                 except Exception:  # noqa: BLE001
                     pass
             add("Tradable symbol selected", bool(good), detail)
+            if good:
+                nq = ", ".join(quoting) if quoting else "none"
+                hard = not self.running      # once running, closed symbols are just skipped
+                add("A selected symbol is quoting now", bool(quoting) or not hard,
+                    f"quoting: {nq}" + ("" if quoting else " - every selected symbol is closed/not quoting; "
+                                                          "pick an open one (e.g. a crypto on weekends)"))
+            checks.extend(soft)
             hedging = int(acct.get("margin_mode", 0)) == MARGIN_HEDGING
             add("Account margin mode", True, "hedging" if hedging else "netting (1 position per symbol)")
-        self.validation = {"ok": all(c["ok"] for c in checks) and connected, "checks": checks,
+        self.validation = {"ok": all(c["ok"] for c in checks if not c.get("soft")) and connected, "checks": checks,
                            "ts": time.time()}
 
     # ----------------------------------------------------------- positions
@@ -489,7 +564,7 @@ class Trader:
             return {"ok": True, "msg": f"{cancelled} pending cancelled; positions left with SL"}
         failed = []
         for p in list(self.own_positions):
-            r = self.broker.close_position(int(p["ticket"]), self.cfg.deviation_points, self.cfg.magic)
+            r = self.broker.close_position(int(p["ticket"]), self._close_dev(p["symbol"]), self.cfg.magic)
             if r.get("verified") and r["ok"]:
                 self.add_log("INFO", f"{why}: closed #{p['ticket']} {self._side(p)} {p['volume']} {p['symbol']} (verified)")
             else:
@@ -541,7 +616,7 @@ class Trader:
                     sl = ps.open_price - d * self.cfg.sl_vol_units * vu
                     r = self.broker.modify_sl(t, sl, float(p.get("tp", 0.0)))
                     if not r["ok"]:
-                        cr = self.broker.close_position(t, self.cfg.deviation_points, self.cfg.magic)
+                        cr = self.broker.close_position(t, self._close_dev(ps.symbol), self.cfg.magic)
                         self.add_log("ERROR", f"#{t} had no SL and SL could not be set - closed: {cr['msg']}")
                         continue
                     self.add_log("WARNING", f"#{t} protective SL attached at {sl}")
@@ -555,7 +630,7 @@ class Trader:
             if reason is None and self.risk.halted:
                 reason = f"risk halt: {self.risk.halt_reason}"
             if reason:
-                r = self.broker.close_position(t, self.cfg.deviation_points, self.cfg.magic)
+                r = self.broker.close_position(t, self._close_dev(ps.symbol), self.cfg.magic)
                 ok = r["ok"] and r.get("verified")
                 self.add_log("INFO" if ok else "ERROR",
                              f"EXIT #{t} {ps.side} {ps.volume} {ps.symbol}: {reason} -> "
@@ -568,7 +643,9 @@ class Trader:
                            float(self.account.get("margin_free", 0)), float(self.account.get("margin_level", 0)))
         hedging = int(self.account.get("margin_mode", 0)) == MARGIN_HEDGING
         open_pos = [OpenPos(p["symbol"], self._side(p), float(p["volume"]), float(p["profit"]),
-                            self._pos_risk(p)) for p in self.own_positions]
+                            self._pos_risk(p), self._notional(p["symbol"], float(p["volume"]),
+                                                              float(p.get("price_current") or p["price_open"])))
+                    for p in self.own_positions]
         for s in self.selected:
             eng = self.engines.get(s)
             info = self.sym_info.get(s)
@@ -592,7 +669,7 @@ class Trader:
                 status["reason"] = f"{sig.action} blocked: {why}"
                 continue
             sl_hist = self.slippage.get(s)
-            if sl_hist and len(sl_hist) >= 3 and sum(sl_hist) / len(sl_hist) > cfg.max_avg_slippage_points:
+            if sl_hist and len(sl_hist) >= 3 and sum(sl_hist) / len(sl_hist) > cfg.max_avg_slippage_vu:
                 status["reason"] = "paused: poor execution quality (slippage)"
                 continue
             self._enter(s, sig, info, acct, open_pos, now_wall, status)
@@ -624,7 +701,9 @@ class Trader:
             status["reason"] = "margin calc unavailable"
             return
         add_ok = abs(sig.score) >= cfg.add_threshold
-        ok, why = self.risk.check_entry(s, sig.action, open_pos, acct, size.volume, size.risk_money, margin, add_ok)
+        notional = self._notional(s, size.volume, price)
+        ok, why = self.risk.check_entry(s, sig.action, open_pos, acct, size.volume, size.risk_money, margin, add_ok,
+                                        notional)
         if not ok:
             status["reason"] = f"{sig.action} blocked: {why}"
             return
@@ -635,7 +714,8 @@ class Trader:
         self.pacer.inflight.add(s)
         self.pacer.on_entry(s, now_wall)
         try:
-            r = self.broker.market_order(s, sig.action, size.volume, sl, tp, cfg.deviation_points, cfg.magic, comment)
+            r = self.broker.market_order(s, sig.action, size.volume, sl, tp, self._deviation(s, f.spread, f.vol_unit),
+                                         cfg.magic, comment)
         finally:
             self.pacer.inflight.discard(s)
         if not r.get("ok"):
@@ -647,7 +727,7 @@ class Trader:
             return
         fill = float(r["price"])
         slip = (fill - float(r["req_price"])) * d / point
-        self.slippage.setdefault(s, deque(maxlen=10)).append(max(0.0, slip))
+        self.slippage.setdefault(s, deque(maxlen=10)).append(max(0.0, slip * point / max(f.vol_unit, point)))
         ticket = int(r["ticket"])
         self.pos_state[ticket] = PositionState(ticket=ticket, symbol=s, side=sig.action, volume=float(r["volume"]),
                                                open_price=fill, open_time=now_wall, sl=sl, tp=tp,
@@ -657,7 +737,7 @@ class Trader:
                              f"[{sig.reason}] SL {sl:.{int(info['digits'])}f} slip {slip:+.0f}pt "
                              f"risk {size.risk_money:.2f} {r.get('latency', 0)*1000:.0f}ms")
         self._refresh_account()
-        open_pos.append(OpenPos(s, sig.action, float(r["volume"]), 0.0, size.risk_money))
+        open_pos.append(OpenPos(s, sig.action, float(r["volume"]), 0.0, size.risk_money, notional))
 
     # ----------------------------------------------------------------- loop
     def step(self, now_wall: Optional[float] = None) -> None:
@@ -705,6 +785,26 @@ class Trader:
             self.last_snapshot = now_wall
             self._build_snapshot(now_wall)
 
+    def _symbol_view(self) -> dict:
+        """Per selected symbol: tradable?, market state, and why it is (not) being traded - never blocks the others."""
+        out = {k: dict(v) for k, v in self.sym_status.items()}
+        if self.conn_state != "CONNECTED":
+            return out
+        for s in self.selected:
+            ok_t, why_t = self._tradable(s)
+            st = out.setdefault(s, {"signal": "HOLD", "score": 0.0, "reason": "", "features": {}})
+            st["tradable"] = ok_t
+            if not ok_t:
+                st["market"], st["signal"], st["reason"] = "n/a", "HOLD", f"not tradable: {why_t}"
+                continue
+            qs = self._quote_state(s)
+            st["market"] = qs
+            if qs in ("closed", "no_stream") and s not in self.last_receipt:
+                st["reason"] = ("no live quotes - market closed or not trading now; skipped, resumes automatically"
+                                if qs == "closed" else "price stream not connected - retrying")
+                st["signal"] = "HOLD"
+        return out
+
     def _build_snapshot(self, now_wall: float) -> None:
         acct = self.account if self.conn_state == "CONNECTED" else {}
         floating = sum(float(p.get("profit", 0)) + float(p.get("swap", 0)) for p in self.own_positions)
@@ -735,7 +835,7 @@ class Trader:
                          "profit": acct.get("profit")} if acct else None),
             "validation": self.validation,
             "engine": {"running": self.running, "start_wall": getattr(self, "start_wall", None), "halted": self.risk.halted, "halt_reason": self.risk.halt_reason,
-                       "blocked": self.unverified_entry, "batch": self.batch, "symbols": self.sym_status,
+                       "blocked": self.unverified_entry, "batch": self.batch, "symbols": self._symbol_view(),
                        "selected": self.selected, "live_allowed": self.allow_live},
             "pnl": ({"floating": round(floating, 2), "daily": round(self.daily_realized + floating, 2),
                      "daily_realized": round(self.daily_realized, 2),
