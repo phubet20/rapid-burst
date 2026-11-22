@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0e13">
+<title>Rapid Burst</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="login" class="overlay hidden">
+  <form id="loginForm" class="card loginCard">
+    <div class="brand">RAPID BURST</div>
+    <input id="pw" type="password" autocomplete="current-password" placeholder="Access password" required>
+    <button class="btn primary" type="submit">Unlock</button>
+    <div id="loginMsg" class="muted small"></div>
+  </form>
+</div>
+
+<main id="app">
+  <header class="top">
+    <div class="brand">RAPID BURST</div>
+    <div class="badges">
+      <span id="bWorker" class="badge">WORKER —</span>
+      <span id="bMt5" class="badge">MT5 —</span>
+      <span id="bMode" class="badge">—</span>
+      <span id="bEngine" class="badge">—</span>
+    </div>
+  </header>
+
+  <section class="card status">
+    <div id="connLine" class="small">Loading…</div>
+    <div id="acctLine" class="muted small"></div>
+  </section>
+
+  <section class="grid">
+    <div class="m"><label>Balance</label><b id="mBal">—</b></div>
+    <div class="m"><label>Equity</label><b id="mEq">—</b></div>
+    <div class="m"><label>Free Margin</label><b id="mFree">—</b></div>
+    <div class="m"><label>Floating P/L</label><b id="mFloat">—</b></div>
+    <div class="m"><label>Daily P/L</label><b id="mDaily">—</b></div>
+    <div class="m"><label>Batch P/L</label><b id="mBatch">—</b></div>
+  </section>
+
+  <section class="actions">
+    <button id="btnConnect" class="btn">CONNECT MT5</button>
+    <button id="btnStart" class="btn start" disabled>START</button>
+    <button id="btnStop" class="btn stop">STOP</button>
+  </section>
+  <div id="actMsg" class="small muted center"></div>
+
+  <section id="connectPanel" class="card hidden">
+    <form id="connectForm" autocomplete="off">
+      <div class="row"><input id="cLogin" inputmode="numeric" placeholder="MT5 login (number)" required></div>
+      <div class="row"><input id="cPass" type="password" placeholder="MT5 password" required autocomplete="new-password"></div>
+      <div class="row"><input id="cServer" placeholder="Broker server, e.g. Exness-MT5Trial" required></div>
+      <div class="row"><button class="btn primary" type="submit">Encrypt &amp; connect</button></div>
+      <div class="tiny muted">Encrypted on this phone with the worker's public key (RSA-OAEP). The server only relays ciphertext; the password is stored only on the worker (Windows DPAPI).</div>
+    </form>
+  </section>
+
+  <section class="card">
+    <div class="head"><span>Validation</span></div>
+    <ul id="checks" class="checks"></ul>
+  </section>
+
+  <section class="card">
+    <div class="head"><span>Symbols</span><span id="selSyms" class="muted small"></span></div>
+    <div class="row gap">
+      <input id="symQ" placeholder="Search e.g. XAU" autocapitalize="characters">
+      <button id="btnSearch" class="btn sm">Search</button>
+      <button id="btnRefresh" class="btn sm" title="Refresh connection and validation">↻</button>
+    </div>
+    <div id="symList" class="symlist"></div>
+    <div class="row gap"><div id="symPicked" class="chips"></div><button id="btnApply" class="btn sm hidden">Apply</button></div>
+  </section>
+
+  <section class="card">
+    <div class="head"><span>Open positions</span><span id="posSum" class="muted small"></span></div>
+    <table class="pos"><thead><tr><th>Symbol</th><th>Side</th><th>Lots</th><th>Open</th><th>P/L</th><th>Age</th></tr></thead>
+      <tbody id="posBody"></tbody></table>
+  </section>
+
+  <section class="card">
+    <div class="head"><span>Engine</span><span id="engMeta" class="muted small"></span></div>
+    <div id="engine"></div>
+  </section>
+
+  <section class="card">
+    <div class="head"><span>Log</span><button id="btnLogout" class="link small">Lock</button></div>
+    <div id="logs" class="logs"></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

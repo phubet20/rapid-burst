@@ -1,0 +1,17 @@
+# Render Blueprint - backend + iPhone UI (relay only; trading runs on the Windows MT5 worker)
+services:
+  - type: web
+    name: rapid-burst
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python -m backend.server
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: UI_PASSWORD
+        sync: false
+      - key: WORKER_SECRET
+        sync: false

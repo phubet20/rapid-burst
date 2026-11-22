@@ -1,0 +1,89 @@
+"""Unit tests for sizing, exposure limits, halts and pacing."""
+from rapidburst.config import EngineConfig
+from rapidburst.risk import (AccountView, EntryPacer, OpenPos, RiskGuard, floor_to_step, normalize_volume,
+                             size_position)
+
+ACCT = AccountView(balance=10000, equity=10000, margin_free=9000, margin_level=0)
+
+
+def test_volume_normalisation():
+    assert floor_to_step(0.237, 0.01) == 0.23
+    assert normalize_volume(0.237, 0.01, 100, 0.01) == 0.23
+    assert normalize_volume(0.004, 0.01, 100, 0.01) == 0.0
+    assert normalize_volume(500, 0.01, 50, 0.01) == 50
+    assert normalize_volume(1.7, 0.1, 100, 0.1) == 1.7
+
+
+def test_size_xauusd():
+    cfg = EngineConfig(risk_per_trade_pct=0.25)
+    # SL 1.50 USD on XAUUSD: 150 ticks * $1 per tick per lot = $150/lot; budget $25 -> 0.16 lot
+    r = size_position(10000, cfg, 1.50, 0.01, 1.0, 0.01, 100, 0.01)
+    assert r.volume == 0.16 and abs(r.risk_money - 24.0) < 1e-6
+
+
+def test_size_min_lot_too_risky_is_rejected():
+    cfg = EngineConfig(risk_per_trade_pct=0.25)
+    r = size_position(200, cfg, 5.0, 0.01, 1.0, 0.01, 100, 0.01)   # min lot risk $5 vs budget $0.5
+    assert r.volume == 0.0
+
+
+def test_size_capped_by_max_lot():
+    cfg = EngineConfig(risk_per_trade_pct=5, max_lot_per_order=0.5)
+    r = size_position(1_000_000, cfg, 1.0, 0.01, 1.0, 0.01, 100, 0.01)
+    assert r.volume == 0.5
+
+
+def test_limits():
+    cfg = EngineConfig(max_positions_total=3, max_positions_per_symbol=2, max_total_lots=1.0)
+    g = RiskGuard(cfg)
+    win = OpenPos("XAUUSD", "BUY", 0.2, 5.0, 10)
+    lose = OpenPos("XAUUSD", "BUY", 0.2, -5.0, 10)
+    assert g.check_entry("XAUUSD", "BUY", [], ACCT, 0.2, 10, 100, False)[0]
+    ok, why = g.check_entry("XAUUSD", "BUY", [lose], ACCT, 0.2, 10, 100, True)
+    assert not ok and "averaging" in why
+    ok, why = g.check_entry("XAUUSD", "SELL", [win], ACCT, 0.2, 10, 100, True)
+    assert not ok and "opposite" in why
+    assert not g.check_entry("XAUUSD", "BUY", [win], ACCT, 0.2, 10, 100, False)[0]  # add needs strong score
+    assert g.check_entry("XAUUSD", "BUY", [win], ACCT, 0.2, 10, 100, True)[0]
+    ok, why = g.check_entry("XAUUSD", "BUY", [win, win], ACCT, 0.2, 10, 100, True)
+    assert not ok and "max 2" in why
+    ok, why = g.check_entry("EURUSD", "BUY", [win, win, win], ACCT, 0.2, 10, 100, True)
+    assert not ok and "max positions" in why
+    ok, why = g.check_entry("EURUSD", "BUY", [win], ACCT, 0.9, 10, 100, True)
+    assert not ok and "lots" in why
+    ok, why = g.check_entry("EURUSD", "BUY", [win], ACCT, 0.1, 95, 100, True)
+    assert not ok and "risk" in why
+    ok, why = g.check_entry("EURUSD", "BUY", [], ACCT, 0.1, 10, 5000, True)
+    assert not ok and "margin" in why
+
+
+def test_daily_loss_and_drawdown_halts():
+    cfg = EngineConfig(daily_loss_limit_pct=3, equity_drawdown_pct=5)
+    g = RiskGuard(cfg)
+    assert g.update("d1", ACCT, 0.0) is None
+    assert g.update("d1", ACCT, -299) is None
+    assert "daily loss" in g.update("d1", ACCT, -300)
+    assert not g.check_entry("XAUUSD", "BUY", [], ACCT, 0.1, 1, 1, False)[0]
+    # new day resets
+    assert g.update("d2", ACCT, 0.0) is None and not g.halted
+    g.update("d2", AccountView(10000, 10600, 9000, 0), 0)
+    assert "drawdown" in g.update("d2", AccountView(10000, 10060, 9000, 0), 0)
+
+
+def test_pacer():
+    cfg = EngineConfig(cooldown_seconds=8, max_entries_per_minute=3, loss_cooldown_seconds=45,
+                       max_consecutive_losses=2, loss_pause_seconds=600)
+    p = EntryPacer(cfg)
+    assert p.can_enter("X", 0)[0]
+    p.on_entry("X", 0)
+    assert not p.can_enter("X", 5)[0]
+    p.on_entry("X", 9); p.on_entry("X", 18)
+    ok, why = p.can_enter("X", 27)
+    assert not ok and "minute" in why
+    assert p.can_enter("X", 61)[0]
+    p.on_close("X", -10, 100)
+    assert "loss cooldown" in p.can_enter("X", 120)[1]
+    p.on_close("X", -10, 150)
+    assert not p.can_enter("X", 700)[0] and p.can_enter("X", 751)[0]
+    p.inflight.add("X")
+    assert "in flight" in p.can_enter("X", 9999)[1]
