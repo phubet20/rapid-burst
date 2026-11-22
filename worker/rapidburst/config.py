@@ -69,6 +69,13 @@ class EngineConfig:
     daily_loss_limit_pct: float = 20.0  # bot daily P/L <= -x% of day-start balance => halt
     equity_drawdown_pct: float = 30.0   # equity below day peak by x% => halt
 
+    # --- protection WITHOUT a broker-side stop-loss (default): the engine closes positions itself ---
+    broker_sl: bool = False          # RB_BROKER_SL=1: also send a normal SL with every order
+    emergency_sl: bool = False       # RB_EMERGENCY_SL=1: far disaster SL (emergency_sl_units vol units) only
+    emergency_sl_units: float = 40.0
+    batch_max_loss_pct: float = 5.0  # whole batch floating loss >= x% of equity => hard close all legs
+    adverse_fade_units: float = 1.0  # losing >= x vu AND short-term momentum against => fast exit
+
     # --- burst batches (2-5 same-direction orders on strong momentum; never martingale/grid) ---
     batch_min: int = 2
     batch_max: int = 5
@@ -105,10 +112,18 @@ class EngineConfig:
                 data.update(json.loads(raw))
             except ValueError:
                 pass
+        for env, key in (("RB_BROKER_SL", "broker_sl"), ("RB_EMERGENCY_SL", "emergency_sl")):
+            if os.environ.get(env, "").strip():
+                data[key] = os.environ[env]
         names = {f.name for f in fields(cls)}
         for k, v in data.items():
             if k in names:
-                setattr(cfg, k, type(getattr(cfg, k))(v))
+                cur = getattr(cfg, k)
+                if isinstance(cur, bool):
+                    v = v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
+                    setattr(cfg, k, v)
+                else:
+                    setattr(cfg, k, type(cur)(v))
         return cfg
 
     def public(self) -> dict:

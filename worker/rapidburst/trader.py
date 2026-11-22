@@ -118,7 +118,8 @@ class Trader:
             "selected": self.selected, "running": self.running, "batch": self.batch,
             "server_offset": self.server_offset,
             "positions": {str(k): {"entry_vu": v.entry_vu, "peak_units": v.peak_units, "open_time": v.open_time,
-                                   "reason": v.reason, "batch_id": v.batch_id} for k, v in self.pos_state.items()},
+                                   "reason": v.reason, "batch_id": v.batch_id,
+                                   "hard_dist": v.hard_dist} for k, v in self.pos_state.items()},
             "bursts": self.bursts,
             "skip_counts": {k: dict(v) for k, v in self.skip_counts.items()},
             "decisions": list(self.decisions),
@@ -523,7 +524,8 @@ class Trader:
                     open_price=float(p["price_open"]), open_time=float(meta.get("open_time", time.time())),
                     sl=float(p.get("sl", 0.0)), tp=float(p.get("tp", 0.0)), entry_vu=float(vu or 0.0),
                     peak_units=float(meta.get("peak_units", 0.0)), reason=meta.get("reason", "adopted"),
-                    batch_id=str(meta.get("batch_id", "")))
+                    batch_id=str(meta.get("batch_id", "")),
+                    hard_dist=float(meta.get("hard_dist") or (float(vu or 0.0) * self.cfg.sl_vol_units)))
                 self.add_log("INFO", f"Re-adopted bot position #{t} {self._side(p)} {p['volume']} {p['symbol']}")
                 if p["symbol"] not in self.engines:
                     info = self.broker.symbol_info(p["symbol"])
@@ -644,8 +646,8 @@ class Trader:
             p = live.get(t)
             if p is None:
                 continue
-            # mandatory protective stop
-            if not float(p.get("sl", 0.0)):
+            # optional broker-side protective stop (only when RB_BROKER_SL is on; default OFF)
+            if self.cfg.broker_sl and not float(p.get("sl", 0.0)):
                 eng = self.engines.get(ps.symbol)
                 vu = ps.entry_vu or (eng.last.vol_unit if eng else 0.0)
                 if vu:
@@ -658,7 +660,15 @@ class Trader:
                         continue
                     self.add_log("WARNING", f"#{t} protective SL attached at {sl}")
         if not self.running and not self.risk.halted:
-            return            # exits are managed only while STARTed (server-side SL/TP protect otherwise)
+            bare = [p for p in self.own_positions
+                    if not float(p.get("sl", 0.0)) or (self.cfg.emergency_sl and not self.cfg.broker_sl)]
+            if bare and not self.stopping:
+                # nothing manages these positions (restart / reconnect / not STARTed) and no working broker SL
+                # protects them: never leave them unprotected - flatten immediately
+                self.add_log("WARNING", f"{len(bare)} bot position(s) without a working broker SL and engine "
+                                        f"not running - flattening immediately")
+                self._flatten("UNPROTECTED (no SL, engine not running)")
+            return            # exits are managed only while STARTed (broker SL/TP protect otherwise)
         groups: dict[str, list[PositionState]] = {}
         for t, ps in self.pos_state.items():
             if t in live:
@@ -666,14 +676,14 @@ class Trader:
         for key, legs in groups.items():
             sym = legs[0].symbol
             eng = self.engines.get(sym)
-            if eng is None:
-                continue
-            f = eng.features(self._server_now(sym, now_wall))
+            f = eng.features(self._server_now(sym, now_wall)) if eng is not None else None
             reason = None
             if self.risk.halted:
                 reason = f"risk halt: {self.risk.halt_reason}"
-            elif self.running:
-                reason = self._group_exit(key, legs, f, now_wall)
+            else:
+                reason = self._hard_close(legs, live, f)          # software stop: needs no warm-up
+                if not reason and self.running and eng is not None:
+                    reason = self._group_exit(key, legs, f, now_wall)
             if not reason:
                 continue
             closed = []
@@ -688,6 +698,35 @@ class Trader:
                          f"EXIT {label} {legs[0].side} {sum(p.volume for p in legs):g} {sym}: {reason} -> "
                          + ", ".join(closed))
             self._refresh_account()
+
+    def _hard_close(self, legs: list, live: dict, f) -> Optional[str]:
+        """Engine-side stop (replaces the broker SL): per-leg adverse excursion in vol units and the
+        whole group's floating loss in % of equity. Uses the worse of broker and engine prices."""
+        cfg = self.cfg
+        total = 0.0
+        for ps in legs:
+            p = live.get(ps.ticket) or {}
+            total += float(p.get("profit", 0.0)) + float(p.get("swap", 0.0))
+            hd = ps.hard_dist or (ps.entry_vu * cfg.sl_vol_units)
+            if hd <= 0:
+                return f"hard close: #{ps.ticket} has no known risk distance (unprotected)"
+            d = 1 if ps.side == "BUY" else -1
+            prices = []
+            if p.get("price_current"):
+                prices.append(float(p["price_current"]))
+            if f is not None and f.bid and f.ask:
+                prices.append(float(f.bid if d > 0 else f.ask))
+            if not prices:
+                continue
+            adverse = max((ps.open_price - px) * d for px in prices)
+            if adverse >= hd:
+                vu = ps.entry_vu or hd
+                return (f"hard close: #{ps.ticket} adverse {adverse / vu:.1f}vu >= {hd / vu:.1f}vu "
+                        f"(engine stop, broker SL {'on' if cfg.broker_sl else 'OFF'})")
+        eq = float(self.account.get("equity", 0.0))
+        if eq > 0 and total <= -eq * cfg.batch_max_loss_pct / 100.0:
+            return f"hard close: group loss {total:+.2f} <= -{cfg.batch_max_loss_pct:g}% of equity {eq:.2f}"
+        return None
 
     def _group_exit(self, key: str, legs: list, f, now_wall: float) -> Optional[str]:
         """Exit decision for a burst batch (all legs together) or a single position."""
@@ -860,10 +899,12 @@ class Trader:
     def _pos_risk(self, p: dict) -> float:
         info = self.sym_info.get(p["symbol"]) or {}
         sl = float(p.get("sl", 0.0))
+        ps = self.pos_state.get(int(p["ticket"]))
+        dist = ps.hard_dist if ps and ps.hard_dist else (abs(float(p["price_open"]) - sl) if sl else 0.0)
         ts, tv = float(info.get("trade_tick_size", 0)), float(info.get("trade_tick_value_loss", 0) or info.get("trade_tick_value", 0))
-        if not sl or not ts or not tv:
+        if not dist or not ts or not tv:
             return float(self.account.get("equity", 0)) * self.cfg.risk_per_trade_pct / 100.0
-        return max(0.0, abs(float(p["price_open"]) - sl) / ts * tv * float(p["volume"]))
+        return max(0.0, dist / ts * tv * float(p["volume"]))
 
     def _enter_batch(self, s, sig, info, acct, open_pos, now_wall, status, n, risk_mult, batch_id, mode) -> None:
         """Open up to n same-direction market orders sharing batch_id. Each leg carries its own SL;
@@ -898,7 +939,13 @@ class Trader:
             if not ok:
                 why_stop = why
                 break
-            sl = price - d * sl_dist
+            sl_virtual = price - d * sl_dist            # engine hard-close level (also the sizing risk distance)
+            if cfg.broker_sl:
+                sl = sl_virtual
+            elif cfg.emergency_sl:
+                sl = price - d * max(cfg.emergency_sl_units * f.vol_unit, 3 * sl_dist)   # far disaster stop only
+            else:
+                sl = 0.0                                 # NO broker-side SL (default)
             tp = price + d * tp_dist
             comment = f"{cfg.comment_prefix}-{batch_id}-{uuid.uuid4().hex[:4]}"[:31]   # unique per leg
             self.pacer.inflight.add(s)
@@ -921,11 +968,14 @@ class Trader:
             ticket = int(r["ticket"])
             self.pos_state[ticket] = PositionState(ticket=ticket, symbol=s, side=sig.action, volume=float(r["volume"]),
                                                    open_price=fill, open_time=now_wall, sl=sl, tp=tp,
-                                                   entry_vu=f.vol_unit, reason=sig.reason, batch_id=batch_id)
+                                                   entry_vu=f.vol_unit, reason=sig.reason, batch_id=batch_id,
+                                                   hard_dist=sl_dist)
             placed.append(ticket)
             self.add_log("INFO", f"ENTRY {sig.action} {r['volume']} {s} @ {fill} #{ticket} batch {batch_id} "
                                  f"leg {len(placed)}/{n} ({mode}) score {sig.score:+.2f} [{sig.reason}] "
-                                 f"SL {sl:.{int(info['digits'])}f} slip {slip:+.0f}pt risk {size.risk_money:.2f} "
+                                 f"hard-close {sl_virtual:.{int(info['digits'])}f} (broker SL "
+                                 f"{format(sl, '.%df' % int(info['digits'])) if sl else 'OFF'}) "
+                                 f"slip {slip:+.0f}pt risk {size.risk_money:.2f} "
                                  f"{r.get('latency', 0)*1000:.0f}ms")
             open_pos.append(OpenPos(s, sig.action, float(r["volume"]), 0.0, size.risk_money, notional))
             self._refresh_account()
@@ -1027,7 +1077,9 @@ class Trader:
                 "batch_cooldown_s": c.batch_cooldown_seconds, "entry_threshold": c.entry_threshold,
                 "countertrend_min_score": c.countertrend_min_score, "min_tick_rate": c.min_tick_rate,
                 "max_spread_bps": c.max_spread_bps, "max_positions_total": c.max_positions_total,
-                "max_positions_per_symbol": c.max_positions_per_symbol, "sl_vol_units": c.sl_vol_units}
+                "max_positions_per_symbol": c.max_positions_per_symbol, "sl_vol_units": c.sl_vol_units,
+                "broker_sl": "ON" if c.broker_sl else ("EMERGENCY ONLY" if c.emergency_sl else "OFF"),
+                "batch_max_loss_pct": c.batch_max_loss_pct, "max_total_notional_x": c.max_total_notional_x}
 
     def _build_snapshot(self, now_wall: float) -> None:
         acct = self.account if self.conn_state == "CONNECTED" else {}

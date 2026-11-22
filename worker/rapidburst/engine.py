@@ -367,6 +367,8 @@ class MomentumEngine:
             return f"exhaustion take-profit (+{profit_u:.1f}u)"
         if d * f.score <= -cfg.reversal_score:
             return f"reversal (score {f.score:+.2f})"
+        if profit_u <= -cfg.adverse_fade_units and d * f.d_fast < 0 and d * f.pressure < 0:
+            return f"adverse fade ({profit_u:+.1f}u, momentum against)"
         if held >= cfg.max_hold_seconds:
             return f"time stop {held:.0f}s ({profit_u:+.1f}u)"
         if held >= cfg.max_hold_seconds / 2 and profit_u <= -cfg.stale_loss_units:
@@ -389,3 +391,4 @@ class PositionState:
     reason: str = ""
     closing_attempts: int = 0
     batch_id: str = ""
+    hard_dist: float = 0.0       # engine hard-close distance (price units); used instead of a broker SL

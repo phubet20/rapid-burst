@@ -636,8 +636,9 @@ class TickerAllBroker:
         lt = self.last_tick(symbol)
         req_price = _f(lt.get("ask") if side == "BUY" else lt.get("bid"))
         comment = comment[:31]
-        body = {"type": "market", "symbol": symbol, "side": side, "volume": float(volume),
-                "stopLoss": round(sl, digits), "comment": comment}
+        body = {"type": "market", "symbol": symbol, "side": side, "volume": float(volume), "comment": comment}
+        if sl:                       # no broker-side SL by default (software protection in the engine)
+            body["stopLoss"] = round(sl, digits)
         if tp:
             body["takeProfit"] = round(tp, digits)
         idem = uuid.uuid4().hex

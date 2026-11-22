@@ -158,6 +158,20 @@ Limits to know (honest):
 
 ## Burst batches, small accounts and the trend filter
 
+**No broker-side stop-loss (default, `Broker SL: OFF`).** Orders are sent without SL
+(`RB_BROKER_SL` unset/0). The engine protects every position itself, checked every 0.15 s from
+live prices: (1) fast exits on momentum fade / reversal / adverse fade; (2) per-order hard close
+when the adverse move reaches the engine hard-close distance (`max(sl_vol_units x vol unit, 3 x
+spread, stop level)`); (3) whole-batch hard close when its floating loss reaches
+`batch_max_loss_pct` (5%) of equity; (4) daily-loss (20%) and equity-drawdown (30%) kill-switch
+that flattens immediately; (5) on reconnect/restart any bot position without a working broker SL
+is flattened at once if the engine is not running, and re-managed (hard close needs no warm-up)
+if it is. Lot sizing, the 5% per-order cap and the 15% open-risk cap use the hard-close distance
+as the risk distance. Honest limits: a software stop cannot act while the connection, TickerAll,
+or the Render service is down, and in a price gap it fills at the market, not at the level. The
+optional `RB_EMERGENCY_SL=1` adds only a far disaster SL (`emergency_sl_units` vol units, default
+off); `RB_BROKER_SL=1` sends a normal SL as before. The total-exposure cap is 500x equity.
+
 **Burst batch.** On a strong momentum score the engine opens 2-5 same-direction market
 orders that share a batch id (count scales with |score| from `entry_threshold` to
 `batch_full_score`; every leg is re-checked by the risk guard and the batch is cut short at

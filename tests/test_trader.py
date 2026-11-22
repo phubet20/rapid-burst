@@ -55,7 +55,7 @@ def test_autonomous_session_respects_invariants(tmp_path):
     assert connect_and_start(tr, br, T0 + 1)["ok"]
     run(tr, br, T0 + 1, T0 + 3600)
     assert inv.entries >= 5, inv.entries
-    assert inv.orders_without_sl == 0
+    assert inv.orders_with_broker_sl == 0       # default: NO broker-side SL (engine hard-close protects)
     assert inv.adds_into_loser == 0
     assert inv.opposite_while_open == 0
     assert inv.max_pos <= cfg.max_positions_total

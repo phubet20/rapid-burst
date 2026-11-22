@@ -80,12 +80,12 @@ def test_small_account_opens_a_burst_batch_with_sl_and_closes_it_together(tmp_pa
     first = sorted(batch_ids)[0]
     legs = [m for m in entries if f"batch {first}" in m]
     assert 2 <= len(legs) <= cfg.batch_max, legs
-    assert inv.orders_without_sl == 0 and inv.adds_into_loser == 0 and inv.opposite_while_open == 0
+    assert inv.orders_with_broker_sl == 0 and inv.adds_into_loser == 0 and inv.opposite_while_open == 0
     assert inv.max_pos_symbol <= cfg.max_positions_per_symbol
     exits = [l["msg"] for l in tr.logs if l["msg"].startswith("EXIT BATCH")]
     assert exits, [l["msg"] for l in tr.logs][-15:]
     assert any("fully closed" in l["msg"] for l in tr.logs)
-    assert not br.positions_ or all(p["sl"] for p in br.positions_.values())
+    assert not br.positions_ or all(not p["sl"] for p in br.positions_.values())   # Broker SL OFF
     # every opened order used the min lot (small account), never a bigger martingale size
     assert all(" 0.01 BTCUSDm" in m for m in entries)
 
@@ -163,3 +163,108 @@ def test_config_json_env_override(monkeypatch):
                                                      "unknown_key": 1}))
     c = EngineConfig.load()
     assert c.small_account_max_loss_pct == 3.0 and c.batch_max == 4
+
+
+# ------------------------------------------------ NO broker-side SL mode
+def _no_broker_tp(br):
+    orig = br.market_order
+    br.market_order = lambda s, side, v, sl, tp, dev, magic, c: orig(s, side, v, sl, 0.0, dev, magic, c)
+
+
+def _drop_after(ticks, t_cut, amount):
+    return [(t, b - amount, a - amount) if t > t_cut else (t, b, a) for t, b, a in ticks]
+
+
+def test_orders_have_no_broker_sl_and_engine_hard_close_fires():
+    import pathlib, tempfile
+    cfg = EngineConfig(batch_tp_units=500.0, batch_max_hold_seconds=10_000, max_hold_seconds=10_000,
+                       batch_max_loss_pct=100.0, exhaustion_z=99.0, weak_momentum_close_units=999.0,
+                       profit_trigger_units=999.0, reversal_score=5.0, adverse_fade_units=999.0,
+                       daily_loss_limit_pct=90, equity_drawdown_pct=90)
+    d = pathlib.Path(tempfile.mkdtemp())
+    tr, br = make(d, {"BTCUSDm": _drop_after(_series_up(), T0 + 172, 6.0)}, cfg)
+    _small_account(br, balance=1000.0, margin_per_lot=10.0)
+    _no_broker_tp(br)
+    _start(tr, br, T0 + 1)
+    seen = []
+
+    def on(t):
+        for p in br.positions_.values():
+            seen.append(p["sl"])
+    run(tr, br, T0 + 1, T0 + 260, on_step=on)
+    entries = [l["msg"] for l in tr.logs if l["msg"].startswith("ENTRY")]
+    assert entries and all("broker SL OFF" in m for m in entries), entries[:2]
+    assert seen and all(x == 0 for x in seen), "an order carried a broker SL"
+    hc = [l["msg"] for l in tr.logs if "hard close" in l["msg"] and l["msg"].startswith("EXIT")]
+    assert hc, [l["msg"] for l in tr.logs if "EXIT" in l["msg"] or "ENTRY" in l["msg"]][-8:]
+    assert not br.positions_                         # whole batch flat after the engine stop
+
+
+def test_batch_group_loss_pct_hard_close():
+    import pathlib, tempfile
+    cfg = EngineConfig(batch_tp_units=500.0, batch_max_hold_seconds=10_000, max_hold_seconds=10_000,
+                       sl_vol_units=500.0, batch_max_loss_pct=0.5, adverse_fade_units=500.0,
+                       reversal_score=5.0, daily_loss_limit_pct=90, equity_drawdown_pct=90,
+                       exhaustion_z=99.0, weak_momentum_close_units=999.0, profit_trigger_units=999.0)
+    d = pathlib.Path(tempfile.mkdtemp())
+    tr, br = make(d, {"BTCUSDm": _drop_after(_series_up(), T0 + 172, 6.0)}, cfg)
+    _small_account(br, balance=1000.0, margin_per_lot=1.0)
+    _no_broker_tp(br)
+    _start(tr, br, T0 + 1)
+    run(tr, br, T0 + 1, T0 + 260)
+    assert any("group loss" in l["msg"] for l in tr.logs if l["msg"].startswith("EXIT")), \
+        [l["msg"] for l in tr.logs if "EXIT" in l["msg"] or "ENTRY" in l["msg"]][-6:]
+    assert not br.positions_
+
+
+def test_unprotected_positions_flattened_when_engine_not_running():
+    import pathlib, tempfile
+    cfg = EngineConfig()
+    d = pathlib.Path(tempfile.mkdtemp())
+    tr, br = make(d, {"BTCUSDm": _series_up()}, cfg)
+    _small_account(br, balance=1000.0, margin_per_lot=10.0)
+    br.advance(T0 + 200)
+    br.positions_[7] = {"ticket": 7, "symbol": "BTCUSDm", "type": 0, "volume": 0.01, "price_open": 2650.0,
+                        "price_current": 2650.0, "sl": 0.0, "tp": 0.0, "profit": 0.0, "swap": 0.0,
+                        "magic": cfg.magic, "comment": "RBurst-old", "time": T0}
+    for i in range(4):
+        tr.step(T0 + 200 + i)       # connect -> adopt -> not running -> flatten
+    assert not br.positions_, "unprotected bot position survived a restart/reconnect"
+    assert any("flattening immediately" in l["msg"] for l in tr.logs)
+
+
+def test_broker_sl_and_emergency_sl_are_opt_in():
+    import pathlib, tempfile
+    for kw, expect in ((dict(broker_sl=True), "near"), (dict(emergency_sl=True), "far")):
+        cfg = EngineConfig(batch_tp_units=500.0, batch_max_hold_seconds=10_000, max_hold_seconds=10_000, **kw)
+        d = pathlib.Path(tempfile.mkdtemp())
+        tr, br = make(d, {"BTCUSDm": _series_up()}, cfg)
+        _small_account(br, balance=1000.0, margin_per_lot=10.0)
+        _start(tr, br, T0 + 1)
+        seen = {}
+
+        def on(t):
+            for p in br.positions_.values():
+                seen[p["ticket"]] = (p["price_open"], p["sl"])
+        run(tr, br, T0 + 1, T0 + 170, on_step=on)
+        assert seen and all(sl for _, sl in seen.values()), kw
+        dist = max(abs(o - sl) for o, sl in seen.values())
+        if expect == "far":
+            assert dist > 2.0, dist                  # far disaster stop, not a working stop
+        else:
+            assert dist < 2.0, dist
+
+
+def test_env_flags_parse_booleans(monkeypatch):
+    assert EngineConfig.load().broker_sl is False and EngineConfig.load().emergency_sl is False
+    monkeypatch.setenv("RB_BROKER_SL", "1")
+    monkeypatch.setenv("RB_EMERGENCY_SL", "false")
+    c = EngineConfig.load()
+    assert c.broker_sl is True and c.emergency_sl is False
+
+
+def test_snapshot_reports_broker_sl_off(tmp_path):
+    tr, br = make(tmp_path, {"BTCUSDm": _series_up()})
+    _start(tr, br, T0 + 1)
+    tr._build_snapshot(T0 + 2)
+    assert tr.get_snapshot()["engine"]["risk_config"]["broker_sl"] == "OFF"

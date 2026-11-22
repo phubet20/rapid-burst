@@ -16,6 +16,7 @@ class Invariants:
         self.max_pos_symbol = 0
         self.max_lots = 0.0
         self.orders_without_sl = 0
+        self.orders_with_broker_sl = 0
         self.adds_into_loser = 0
         self.opposite_while_open = 0
         self.entries = 0
@@ -33,6 +34,8 @@ def instrument(broker: SimBroker, cfg: EngineConfig, inv: Invariants):
             inv.opposite_while_open += 1
         if not sl:
             inv.orders_without_sl += 1
+        else:
+            inv.orders_with_broker_sl += 1
         r = orig(s, side, volume, sl, tp, deviation, magic, comment)
         if r.get("ok"):
             inv.entries += 1

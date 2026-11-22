@@ -230,7 +230,7 @@ def test_trader_enters_with_sl_on_streamed_burst(fake, tmp_path):
     assert entered, [l["msg"] for l in tr.logs][-8:]
     p = tr.own_positions[0]
     fp = fake.positions[p["ticket"]]
-    assert fp["comment"].startswith("RBurst-") and fp["stopLoss"] > 0 and fp["side"] == "BUY"
+    assert fp["comment"].startswith("RBurst-") and not fp["stopLoss"] and fp["side"] == "BUY"   # Broker SL OFF
     assert tr.cmd_stop()["ok"] and not [x for x in fake.positions.values() if x["comment"].startswith("RBurst")]
     tr.cmd_shutdown()
 
@@ -261,4 +261,14 @@ def test_candles_feed_trend_filter(fake, tmp_path):
     tr = compute_trend(m1, m5)
     assert tr.known and tr.dir == 1
     assert b.candles("NOPE", "M1", 1) == []               # unavailable -> empty, never synthesised
+    b.shutdown()
+
+
+def test_order_without_sl_sends_no_stoploss_field(fake, tmp_path):
+    b = mk(fake, tmp_path)
+    assert b.connect(DEMO["login"], DEMO["password"], DEMO["server"])[0]
+    assert b.select_symbol("XAUUSD")
+    r = b.market_order("XAUUSD", "BUY", 0.05, 0.0, 0.0, 20, MAGIC, "RBurst-nosl")
+    assert r["ok"], r
+    assert not fake.positions[r["ticket"]]["stopLoss"]
     b.shutdown()
