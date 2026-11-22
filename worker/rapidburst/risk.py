@@ -55,11 +55,14 @@ def size_position(equity: float, cfg: EngineConfig, sl_distance: float, tick_siz
     raw = budget / lpl
     vol = normalize_volume(min(raw, cfg.max_lot_per_order), vmin, vmax, vstep)
     if vol == 0.0:
-        # minimum lot would risk more than budget; allow only if within 1.5x budget
-        if vmin * lpl <= budget * 1.5 and vmin <= cfg.max_lot_per_order:
-            vol = vmin
-        else:
-            return SizeResult(0.0, vmin * lpl, f"min lot risk {vmin * lpl:.2f} > budget {budget:.2f}")
+        # risk-based lot is below the broker minimum (small account): trade the minimum lot only if
+        # its stop-loss loss stays within the small-account cap (and never above max_lot_per_order)
+        cap = max(budget * 1.5, equity * cfg.small_account_max_loss_pct / 100.0)
+        if vmin * lpl <= cap and vmin <= cfg.max_lot_per_order:
+            return SizeResult(vmin, vmin * lpl, f"min lot (small account: SL loss {vmin * lpl:.2f} "
+                                                f"<= cap {cap:.2f})")
+        return SizeResult(0.0, vmin * lpl, f"min lot SL loss {vmin * lpl:.2f} > small-account cap {cap:.2f} "
+                                           f"({cfg.small_account_max_loss_pct:g}% equity)")
     return SizeResult(vol, vol * lpl, "ok")
 
 
@@ -119,7 +122,7 @@ class RiskGuard:
 
     def check_entry(self, symbol: str, side: str, positions: Iterable[OpenPos], acct: AccountView,
                     new_volume: float, new_risk: float, new_margin: float, add_score_ok: bool,
-                    new_notional: float = 0.0) -> tuple[bool, str]:
+                    new_notional: float = 0.0, batch_leg: bool = False) -> tuple[bool, str]:
         cfg = self.cfg
         if self.halted:
             return False, f"halted: {self.halt_reason}"
@@ -131,8 +134,9 @@ class RiskGuard:
             return False, f"max {cfg.max_positions_per_symbol} positions on {symbol}"
         if any(p.side != side for p in mine):
             return False, "opposite position open on symbol (no hedging)"
-        if mine:
+        if mine and not batch_leg:
             # adding is allowed only into strength: every existing leg must be in profit
+            # (batch_leg = the 2nd..Nth order of a burst batch being opened right now on one signal)
             if any(p.profit <= 0 for p in mine):
                 return False, "no averaging into a losing position"
             if not add_score_ok:

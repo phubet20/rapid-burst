@@ -23,8 +23,21 @@ def test_size_xauusd():
 
 def test_size_min_lot_too_risky_is_rejected():
     cfg = EngineConfig(risk_per_trade_pct=0.25)
-    r = size_position(200, cfg, 5.0, 0.01, 1.0, 0.01, 100, 0.01)   # min lot risk $5 vs budget $0.5
-    assert r.volume == 0.0
+    r = size_position(200, cfg, 15.0, 0.01, 1.0, 0.01, 100, 0.01)  # min lot risk $15 > 5% of $200
+    assert r.volume == 0.0 and "small-account cap" in r.note
+
+
+def test_size_small_account_min_lot_fallback():
+    # $10 Exness demo, BTCUSDm: tick 0.01, $0.01/tick/lot, SL $25 -> min lot 0.01 loses $0.25 (2.5%)
+    cfg = EngineConfig()
+    r = size_position(10.0, cfg, 25.0, 0.01, 0.01, 0.01, 200, 0.01)
+    assert r.volume == 0.01 and abs(r.risk_money - 0.25) < 1e-9 and "small account" in r.note
+    # SL $60 -> $0.60 = 6% > 5% cap -> refused with a reason
+    r = size_position(10.0, cfg, 60.0, 0.01, 0.01, 0.01, 200, 0.01)
+    assert r.volume == 0.0 and "0.60" in r.note
+    # configurable cap
+    r = size_position(10.0, EngineConfig(small_account_max_loss_pct=10), 60.0, 0.01, 0.01, 0.01, 200, 0.01)
+    assert r.volume == 0.01
 
 
 def test_size_capped_by_max_lot():
@@ -34,7 +47,7 @@ def test_size_capped_by_max_lot():
 
 
 def test_limits():
-    cfg = EngineConfig(max_positions_total=3, max_positions_per_symbol=2, max_total_lots=1.0)
+    cfg = EngineConfig(max_positions_total=3, max_positions_per_symbol=2, max_total_lots=1.0, max_total_risk_pct=1.0)
     g = RiskGuard(cfg)
     win = OpenPos("XAUUSD", "BUY", 0.2, 5.0, 10)
     lose = OpenPos("XAUUSD", "BUY", 0.2, -5.0, 10)

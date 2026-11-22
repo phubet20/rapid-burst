@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import time
 import threading
 from datetime import datetime, timezone
 
@@ -71,6 +72,7 @@ class FakeTickerAll:
             r.add_delete("/v1/accounts/{aid}/positions/{t}", self.h_close)
             r.add_patch("/v1/accounts/{aid}/positions/{t}", self.h_modify)
             r.add_get("/v1/accounts/{aid}/deals-history", self.h_deals)
+            r.add_get("/v1/accounts/{aid}/candles", self.h_candles)
             r.add_get("/v1/stream", self.h_ws)
             self.server = TestServer(app)
             self.loop.run_until_complete(self.server.start_server())
@@ -184,6 +186,22 @@ class FakeTickerAll:
                             "freeMargin": self.balance + fl, "marginLevel": 0.0, "credit": None,
                             "serverTimeOffsetSeconds": 7200},
                 "positions": list(self.positions.values())})
+
+    async def h_candles(self, request):
+        """Synthetic rising bars (TEST DATA) in TickerAll's documented shape."""
+        g = self.guard(request)
+        if g:
+            return g
+        q = request.query
+        if q.get("symbol") not in self.quotes:
+            return web.json_response({"error": {"code": "SYMBOL_NOT_FOUND", "message": "unknown symbol"}}, status=404)
+        step = {"M1": 60, "M5": 300}.get(q.get("timeframe"), 60)
+        n = max(1, int(float(q.get("hours", 1)) * 3600 / step))
+        self.candle_calls = getattr(self, "candle_calls", 0) + 1
+        now = int(time.time()) // step * step
+        rows = [{"timestamp": now - (n - 1 - i) * step, "open": 100 + i, "high": 101 + i, "low": 99.5 + i,
+                 "close": 100.8 + i, "bid": 100.8 + i} for i in range(n)]
+        return web.json_response({"candles": rows[::-1], "count": n, "coverage": {}, "truncated": False})
 
     async def h_symbols(self, request):
         g = self.guard(request)

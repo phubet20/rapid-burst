@@ -388,3 +388,4 @@ class PositionState:
     peak_units: float = 0.0
     reason: str = ""
     closing_attempts: int = 0
+    batch_id: str = ""

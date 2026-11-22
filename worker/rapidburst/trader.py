@@ -15,7 +15,7 @@ import socket
 import threading
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future
 from typing import Any, Optional
 
@@ -23,6 +23,7 @@ from . import __version__
 from .config import EngineConfig
 from .engine import MomentumEngine, PositionState
 from .risk import AccountView, EntryPacer, OpenPos, RiskGuard, size_position
+from .trend import Trend, compute_trend, relation
 
 log = logging.getLogger("rapidburst")
 
@@ -72,6 +73,18 @@ class Trader:
         self.stopping = False
         self.flatten_pending = False
         self.unverified_entry: Optional[str] = None
+        # higher-timeframe trend per symbol (from real broker M1/M5 bars)
+        self.trends: dict[str, Trend] = {}
+        self.trend_ts: dict[str, float] = {}
+        # burst batches: id -> {symbol, side, opened, peak_units, mode, realized}
+        self.bursts: dict[str, dict] = {}
+        self.burst_cooldown: dict[str, float] = {}
+        # "why no trade" visibility
+        self.skip_counts: dict[str, Counter] = {}
+        self.skip_window: dict[str, Counter] = {}
+        self.skip_last: dict[str, float] = {}
+        self.decisions: deque = deque(maxlen=40)
+        self.last_why_log = 0.0
 
         avail, why = broker.available()
         if not avail:
@@ -84,6 +97,9 @@ class Trader:
         self.batch: dict = st.get("batch", {})
         self.server_offset: float = float(st.get("server_offset", 0.0))
         self.saved_pos_meta: dict = st.get("positions", {})
+        self.bursts = st.get("bursts", {}) or {}
+        self.skip_counts = {k: Counter(v) for k, v in (st.get("skip_counts") or {}).items()}
+        self.decisions.extend(st.get("decisions") or [])
         self._validate()
 
     # ---------------------------------------------------------------- state
@@ -102,7 +118,10 @@ class Trader:
             "selected": self.selected, "running": self.running, "batch": self.batch,
             "server_offset": self.server_offset,
             "positions": {str(k): {"entry_vu": v.entry_vu, "peak_units": v.peak_units, "open_time": v.open_time,
-                                   "reason": v.reason} for k, v in self.pos_state.items()},
+                                   "reason": v.reason, "batch_id": v.batch_id} for k, v in self.pos_state.items()},
+            "bursts": self.bursts,
+            "skip_counts": {k: dict(v) for k, v in self.skip_counts.items()},
+            "decisions": list(self.decisions),
         }
         tmp = self._state_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -182,7 +201,7 @@ class Trader:
         self.batch_realized = 0.0
         self.last_deals_check = 0.0
         self._save_state()
-        self.add_log("INFO", f"START - batch {self.batch['id']} on {', '.join(self.selected)}: account re-read "
+        self.add_log("INFO", f"START - session {self.batch['id']} on {', '.join(self.selected)}: account re-read "
                              f"(equity {self.account.get('equity')}), {len(self.own_positions)} bot position(s) adopted, "
                              f"{len(own_orders)} bot pending order(s); warming up on fresh live ticks "
                              f"({self.cfg.warmup_seconds:.0f}s) before the first entry")
@@ -191,6 +210,8 @@ class Trader:
     def _reset_engines(self) -> None:
         """Discard any previous tick history: the engine only uses ticks that arrive after START."""
         self.sym_status = {}
+        self.trend_ts = {}
+        self.skip_window = {}
         for s in list(dict.fromkeys(list(self.selected) + list(self.engines))):
             info = self.sym_info.get(s)
             if not info:
@@ -501,7 +522,8 @@ class Trader:
                     ticket=t, symbol=p["symbol"], side=self._side(p), volume=float(p["volume"]),
                     open_price=float(p["price_open"]), open_time=float(meta.get("open_time", time.time())),
                     sl=float(p.get("sl", 0.0)), tp=float(p.get("tp", 0.0)), entry_vu=float(vu or 0.0),
-                    peak_units=float(meta.get("peak_units", 0.0)), reason=meta.get("reason", "adopted"))
+                    peak_units=float(meta.get("peak_units", 0.0)), reason=meta.get("reason", "adopted"),
+                    batch_id=str(meta.get("batch_id", "")))
                 self.add_log("INFO", f"Re-adopted bot position #{t} {self._side(p)} {p['volume']} {p['symbol']}")
                 if p["symbol"] not in self.engines:
                     info = self.broker.symbol_info(p["symbol"])
@@ -512,10 +534,25 @@ class Trader:
         for t in [t for t in self.pos_state if t not in live]:
             ps = self.pos_state.pop(t)
             profit = self._closed_profit(t)
-            self.pacer.on_close(ps.symbol, profit if profit is not None else 0.0, time.time())
             self.add_log("INFO", f"Position #{t} {ps.side} {ps.symbol} closed"
+                                 + (f" [batch {ps.batch_id}]" if ps.batch_id else "")
                                  + (f", P/L {profit:+.2f}" if profit is not None else ""))
             self.last_deals_check = 0.0
+            b = self.bursts.get(ps.batch_id) if ps.batch_id else None
+            if b is None:
+                self.pacer.on_close(ps.symbol, profit if profit is not None else 0.0, time.time())
+                continue
+            b["realized"] = float(b.get("realized", 0.0)) + (profit or 0.0)
+            if not any(x.batch_id == ps.batch_id for x in self.pos_state.values()):
+                # whole batch is flat: one win/loss for the pacer, then the post-batch cooldown
+                now = getattr(self, "now_wall", None) or time.time()
+                self.pacer.on_close(ps.symbol, b["realized"], now)
+                self.burst_cooldown[ps.symbol] = now + self.cfg.batch_cooldown_seconds
+                self.add_log("INFO", f"BATCH {ps.batch_id} {b['side']} {ps.symbol} fully closed: "
+                                     f"P/L {b['realized']:+.2f} over {b.get('legs', '?')} order(s); "
+                                     f"cooldown {self.cfg.batch_cooldown_seconds:.0f}s")
+                self._decision(ps.symbol, b["side"], None, f"batch closed P/L {b['realized']:+.2f}")
+                self.bursts.pop(ps.batch_id, None)
         if initial and self.own_positions:
             self.add_log("INFO", f"Managing {len(self.own_positions)} existing bot position(s) after reconnect")
         self._save_state()
@@ -620,21 +657,60 @@ class Trader:
                         self.add_log("ERROR", f"#{t} had no SL and SL could not be set - closed: {cr['msg']}")
                         continue
                     self.add_log("WARNING", f"#{t} protective SL attached at {sl}")
-            if not self.running and not self.risk.halted:
-                continue          # exits are managed only while STARTed (server-side SL/TP protect otherwise)
-            eng = self.engines.get(ps.symbol)
+        if not self.running and not self.risk.halted:
+            return            # exits are managed only while STARTed (server-side SL/TP protect otherwise)
+        groups: dict[str, list[PositionState]] = {}
+        for t, ps in self.pos_state.items():
+            if t in live:
+                groups.setdefault(ps.batch_id or f"#{t}", []).append(ps)
+        for key, legs in groups.items():
+            sym = legs[0].symbol
+            eng = self.engines.get(sym)
             if eng is None:
                 continue
-            f = eng.features(self._server_now(ps.symbol, now_wall))
-            reason = eng.exit_decision(ps, f, now_wall) if self.running else None
-            if reason is None and self.risk.halted:
+            f = eng.features(self._server_now(sym, now_wall))
+            reason = None
+            if self.risk.halted:
                 reason = f"risk halt: {self.risk.halt_reason}"
-            if reason:
-                r = self.broker.close_position(t, self._close_dev(ps.symbol), self.cfg.magic)
+            elif self.running:
+                reason = self._group_exit(key, legs, f, now_wall)
+            if not reason:
+                continue
+            closed = []
+            for ps in legs:
+                r = self.broker.close_position(ps.ticket, self._close_dev(sym), self.cfg.magic)
                 ok = r["ok"] and r.get("verified")
-                self.add_log("INFO" if ok else "ERROR",
-                             f"EXIT #{t} {ps.side} {ps.volume} {ps.symbol}: {reason} -> "
-                             f"{'closed (verified)' if ok else r['msg']}")
+                closed.append(f"#{ps.ticket} {'ok' if ok else 'FAIL ' + str(r['msg'])}")
+                if not ok:
+                    ps.closing_attempts += 1
+            label = f"BATCH {key}" if not key.startswith("#") else f"#{legs[0].ticket}"
+            self.add_log("INFO" if all(c.endswith("ok") for c in closed) else "ERROR",
+                         f"EXIT {label} {legs[0].side} {sum(p.volume for p in legs):g} {sym}: {reason} -> "
+                         + ", ".join(closed))
+            self._refresh_account()
+
+    def _group_exit(self, key: str, legs: list, f, now_wall: float) -> Optional[str]:
+        """Exit decision for a burst batch (all legs together) or a single position."""
+        vol = sum(p.volume for p in legs)
+        agg = PositionState(ticket=legs[0].ticket, symbol=legs[0].symbol, side=legs[0].side, volume=vol,
+                            open_price=sum(p.open_price * p.volume for p in legs) / vol,
+                            open_time=min(p.open_time for p in legs),
+                            entry_vu=max(p.entry_vu for p in legs) or 0.0,
+                            peak_units=max(p.peak_units for p in legs), reason=legs[0].reason)
+        eng = self.engines[legs[0].symbol]
+        is_batch = not key.startswith("#")
+        if is_batch and agg.entry_vu > 0 and f.bid and f.ask:
+            d = 1 if agg.side == "BUY" else -1
+            exit_px = f.bid if agg.side == "BUY" else f.ask          # executable price: spread already paid
+            units = (exit_px - agg.open_price) * d / agg.entry_vu
+            if units >= self.cfg.batch_tp_units:
+                return f"batch target +{units:.2f}vu reached"
+            if now_wall - agg.open_time >= self.cfg.batch_max_hold_seconds:
+                return f"batch time stop {self.cfg.batch_max_hold_seconds:.0f}s ({units:+.2f}vu)"
+        reason = eng.exit_decision(agg, f, now_wall)
+        for p in legs:
+            p.peak_units = agg.peak_units
+        return reason
 
     # -------------------------------------------------------------- entries
     def _try_entries(self, now_wall: float) -> None:
@@ -658,21 +734,128 @@ class Trader:
                       "spread_pts": round(sig.features.spread / float(info["point"]), 1) if info.get("point") else None,
                       "tick_age": round(now_wall - self.last_receipt[s], 1) if s in self.last_receipt else None}
             self.sym_status[s] = status
+            tr = self.trends.get(s)
+            status["trend"] = tr.brief() if tr else None
             if sig.action == "HOLD":
+                self._skip(s, status, sig.reason, now_wall)
                 continue
             if not hedging and (any(p["symbol"] == s for p in self.foreign_positions)
                                 or any(p["symbol"] == s for p in self.own_positions)):
-                status["reason"] = "netting account: symbol already has a position"
+                self._skip(s, status, "netting account: symbol already has a position", now_wall, sig)
                 continue
             ok, why = self.pacer.can_enter(s, now_wall)
             if not ok:
-                status["reason"] = f"{sig.action} blocked: {why}"
+                self._skip(s, status, f"{sig.action} blocked: {why}", now_wall, sig)
                 continue
             sl_hist = self.slippage.get(s)
             if sl_hist and len(sl_hist) >= 3 and sum(sl_hist) / len(sl_hist) > cfg.max_avg_slippage_vu:
-                status["reason"] = "paused: poor execution quality (slippage)"
+                self._skip(s, status, "paused: poor execution quality (slippage)", now_wall, sig)
                 continue
-            self._enter(s, sig, info, acct, open_pos, now_wall, status)
+            cd = self.burst_cooldown.get(s, 0.0) - now_wall
+            if cd > 0:
+                self._skip(s, status, f"{sig.action} blocked: batch cooldown {cd:.0f}s", now_wall, sig)
+                continue
+            tr = self.trends.get(s)
+            rel = relation(tr, sig.action)
+            status["trend_rel"] = rel
+            mine = [ps for ps in self.pos_state.values() if ps.symbol == s]
+            risk_mult, batch_id, mode = 1.0, uuid.uuid4().hex[:6], "batch"
+            if mine:
+                # pyramiding into an open batch: only same side, only with the trend; RiskGuard
+                # additionally requires every open leg in profit (never adds to a loser)
+                if rel != "aligned":
+                    self._skip(s, status, f"{sig.action} skipped: batch open, adding only when trend aligned "
+                                          f"(trend {tr.label if tr else 'unknown'})", now_wall, sig)
+                    continue
+                n, batch_id, mode = 1, mine[0].batch_id or batch_id, "pyramid"
+            elif rel == "counter":
+                if abs(sig.score) < cfg.countertrend_min_score:
+                    self._skip(s, status, f"{sig.action} skipped: counter-trend ({tr.label}) needs "
+                                          f"|score| >= {cfg.countertrend_min_score:.2f}", now_wall, sig)
+                    continue
+                n, risk_mult, mode = 1, 0.5, "counter-trend"
+            else:
+                n = self._batch_size(abs(sig.score))
+            self._enter_batch(s, sig, info, acct, open_pos, now_wall, status, n, risk_mult, batch_id, mode)
+
+    def _batch_size(self, score: float) -> int:
+        c = self.cfg
+        lo, hi = max(1, c.batch_min), max(c.batch_min, c.batch_max)
+        span = max(1e-9, c.batch_full_score - c.entry_threshold)
+        frac = min(1.0, max(0.0, (score - c.entry_threshold) / span))
+        return int(lo + round(frac * (hi - lo)))
+
+    # ------------------------------------------------- "why no trade" ledger
+    @staticmethod
+    def _category(reason: str) -> str:
+        r = (reason or "").lower()
+        table = [("warming", "warming up"), ("no ticks", "no live ticks"), ("idle", "no live ticks"),
+                 ("stale", "no live ticks"), ("thin tick", "thin tick flow"), ("tick rate", "thin tick flow"),
+                 ("spread", "spread filter"), ("no momentum", "no momentum edge"), ("extended", "move extended"),
+                 ("batch cooldown", "batch cooldown"), ("cooldown", "cooldown"), ("per minute", "entry rate cap"),
+                 ("/min", "entry rate cap"), ("counter-trend", "counter-trend filter"),
+                 ("trend aligned", "batch open (no add)"), ("min lot", "sizing refused"),
+                 ("averaging", "no adding to losers"), ("add requires", "add needs stronger score"),
+                 ("margin", "margin"), ("risk", "risk cap"), ("max ", "risk cap"), ("opposite", "no hedge vs open"),
+                 ("slippage", "execution quality"), ("halt", "risk halt"), ("netting", "netting position"),
+                 ("loss streak", "loss-streak pause"), ("pause", "loss-streak pause")]
+        for k, v in table:
+            if k in r:
+                return v
+        return "".join(ch for ch in r.split(":")[0] if not ch.isdigit())[:32].strip() or "other"
+
+    def _skip(self, s: str, status: dict, reason: str, now_wall: float, sig=None) -> None:
+        status["reason"] = reason
+        if now_wall - self.skip_last.get(s, 0.0) < 1.0:      # sample at most once per second per symbol
+            return
+        self.skip_last[s] = now_wall
+        cat = self._category(reason)
+        self.skip_counts.setdefault(s, Counter())[cat] += 1
+        self.skip_window.setdefault(s, Counter())[cat] += 1
+        if sig is not None and sig.action != "HOLD":
+            self._decision(s, sig.action, sig.score, reason)
+
+    def _decision(self, s: str, side: str, score, outcome: str) -> None:
+        tr = self.trends.get(s)
+        self.decisions.append({"ts": round(getattr(self, "now_wall", None) or time.time(), 1), "symbol": s, "side": side,
+                               "score": None if score is None else round(float(score), 2),
+                               "trend": tr.label if tr else "unknown", "outcome": outcome[:160]})
+
+    def _log_why(self, now_wall: float) -> None:
+        if now_wall - self.last_why_log < 60.0:
+            return
+        self.last_why_log = now_wall
+        parts = []
+        for s, c in self.skip_window.items():
+            if c:
+                parts.append(f"{s}: " + ", ".join(f"{k} {v}" for k, v in c.most_common(4)))
+        self.skip_window = {}
+        if parts:
+            self.add_log("INFO", "WHY NO TRADE (last 60s, samples/s) " + " | ".join(parts))
+            self._save_state()
+
+    # ------------------------------------------------------------- trend
+    def _update_trends(self, now_wall: float) -> None:
+        fn = getattr(self.broker, "candles", None)
+        for s in self.selected:
+            if now_wall - self.trend_ts.get(s, 0.0) < self.cfg.trend_refresh_seconds:
+                continue
+            self.trend_ts[s] = now_wall
+            if fn is None or not self._tradable(s)[0]:
+                self.trends[s] = Trend(label="unknown (no bar history from this broker)")
+                continue
+            try:
+                m1 = fn(s, "M1", 0.75)
+                m5 = fn(s, "M5", 1.5)
+            except Exception as e:  # noqa: BLE001
+                m1, m5 = [], []
+                log.debug("candles %s failed: %s", s, e)
+            prev = self.trends.get(s)
+            tr = compute_trend(m1, m5, self.cfg.trend_min_strength)
+            tr.detail["m1_bars"], tr.detail["m5_bars"] = float(len(m1)), float(len(m5))
+            self.trends[s] = tr
+            if prev is None or prev.label.split(" ")[0] != tr.label.split(" ")[0]:
+                self.add_log("INFO", f"TREND {s}: {tr.label} (M1 {len(m1)} bars, M5 {len(m5)} bars)")
 
     def _pos_risk(self, p: dict) -> float:
         info = self.sym_info.get(p["symbol"]) or {}
@@ -682,7 +865,10 @@ class Trader:
             return float(self.account.get("equity", 0)) * self.cfg.risk_per_trade_pct / 100.0
         return max(0.0, abs(float(p["price_open"]) - sl) / ts * tv * float(p["volume"]))
 
-    def _enter(self, s, sig, info, acct, open_pos, now_wall, status) -> None:
+    def _enter_batch(self, s, sig, info, acct, open_pos, now_wall, status, n, risk_mult, batch_id, mode) -> None:
+        """Open up to n same-direction market orders sharing batch_id. Each leg carries its own SL;
+        each leg is re-checked by RiskGuard (positions, lots, notional, open risk, margin) and the batch
+        is cut short at the first refusal. Never martingale: every leg has the same risk-based size."""
         cfg = self.cfg
         f = sig.features
         point = float(info["point"])
@@ -690,58 +876,78 @@ class Trader:
         sl_dist = max(cfg.sl_vol_units * f.vol_unit, cfg.min_sl_spread_mult * f.spread, stops)
         tp_dist = max(cfg.tp_vol_units * f.vol_unit, 2 * sl_dist)
         tv = float(info.get("trade_tick_value_loss", 0) or info.get("trade_tick_value", 0))
-        size = size_position(acct.equity, cfg, sl_dist, float(info.get("trade_tick_size", 0)), tv,
+        size = size_position(acct.equity * risk_mult, cfg, sl_dist, float(info.get("trade_tick_size", 0)), tv,
                              float(info["volume_min"]), float(info["volume_max"]), float(info["volume_step"]))
         if size.volume <= 0:
-            status["reason"] = f"{sig.action} skipped: {size.note}"
-            return
-        price = f.ask if sig.action == "BUY" else f.bid
-        margin = self.broker.calc_margin(sig.action, s, size.volume, price)
-        if margin is None:
-            status["reason"] = "margin calc unavailable"
-            return
-        add_ok = abs(sig.score) >= cfg.add_threshold
-        notional = self._notional(s, size.volume, price)
-        ok, why = self.risk.check_entry(s, sig.action, open_pos, acct, size.volume, size.risk_money, margin, add_ok,
-                                        notional)
-        if not ok:
-            status["reason"] = f"{sig.action} blocked: {why}"
+            self._skip(s, status, f"{sig.action} skipped: {size.note}", now_wall, sig)
             return
         d = 1 if sig.action == "BUY" else -1
-        sl = price - d * sl_dist
-        tp = price + d * tp_dist
-        comment = f"{cfg.comment_prefix}-{uuid.uuid4().hex[:6]}"
-        self.pacer.inflight.add(s)
-        self.pacer.on_entry(s, now_wall)
-        try:
-            r = self.broker.market_order(s, sig.action, size.volume, sl, tp, self._deviation(s, f.spread, f.vol_unit),
-                                         cfg.magic, comment)
-        finally:
-            self.pacer.inflight.discard(s)
-        if not r.get("ok"):
-            self.add_log("WARNING", f"ENTRY {sig.action} {size.volume} {s} rejected: {r.get('msg')}")
-            if "not found" in str(r.get("msg")):
-                self.unverified_entry = r["msg"]
-                self.running = False
-                self._save_state()
-            return
-        fill = float(r["price"])
-        slip = (fill - float(r["req_price"])) * d / point
-        self.slippage.setdefault(s, deque(maxlen=10)).append(max(0.0, slip * point / max(f.vol_unit, point)))
-        ticket = int(r["ticket"])
-        self.pos_state[ticket] = PositionState(ticket=ticket, symbol=s, side=sig.action, volume=float(r["volume"]),
-                                               open_price=fill, open_time=now_wall, sl=sl, tp=tp,
-                                               entry_vu=f.vol_unit, reason=sig.reason)
-        self._save_state()
-        self.add_log("INFO", f"ENTRY {sig.action} {r['volume']} {s} @ {fill} #{ticket} score {sig.score:+.2f} "
-                             f"[{sig.reason}] SL {sl:.{int(info['digits'])}f} slip {slip:+.0f}pt "
-                             f"risk {size.risk_money:.2f} {r.get('latency', 0)*1000:.0f}ms")
-        self._refresh_account()
-        open_pos.append(OpenPos(s, sig.action, float(r["volume"]), 0.0, size.risk_money, notional))
+        add_ok = abs(sig.score) >= cfg.add_threshold
+        placed, why_stop = [], ""
+        self.pacer.on_entry(s, now_wall)          # one batch = one entry for the rate limiter
+        for i in range(max(1, n)):
+            f = self.engines[s].features(self._server_now(s, now_wall)) if i else f
+            price = f.ask if sig.action == "BUY" else f.bid
+            margin = self.broker.calc_margin(sig.action, s, size.volume, price)
+            if margin is None:
+                why_stop = "margin calc unavailable"
+                break
+            notional = self._notional(s, size.volume, price)
+            ok, why = self.risk.check_entry(s, sig.action, open_pos, acct, size.volume, size.risk_money, margin,
+                                            add_ok, notional, batch_leg=bool(placed))
+            if not ok:
+                why_stop = why
+                break
+            sl = price - d * sl_dist
+            tp = price + d * tp_dist
+            comment = f"{cfg.comment_prefix}-{batch_id}-{uuid.uuid4().hex[:4]}"[:31]   # unique per leg
+            self.pacer.inflight.add(s)
+            try:
+                r = self.broker.market_order(s, sig.action, size.volume, sl, tp,
+                                             self._deviation(s, f.spread, f.vol_unit), cfg.magic, comment)
+            finally:
+                self.pacer.inflight.discard(s)
+            if not r.get("ok"):
+                why_stop = f"rejected: {r.get('msg')}"
+                self.add_log("WARNING", f"ENTRY {sig.action} {size.volume} {s} rejected: {r.get('msg')}")
+                if "not found" in str(r.get("msg")):
+                    self.unverified_entry = r["msg"]
+                    self.running = False
+                    self._save_state()
+                break
+            fill = float(r["price"])
+            slip = (fill - float(r["req_price"])) * d / point
+            self.slippage.setdefault(s, deque(maxlen=10)).append(max(0.0, slip * point / max(f.vol_unit, point)))
+            ticket = int(r["ticket"])
+            self.pos_state[ticket] = PositionState(ticket=ticket, symbol=s, side=sig.action, volume=float(r["volume"]),
+                                                   open_price=fill, open_time=now_wall, sl=sl, tp=tp,
+                                                   entry_vu=f.vol_unit, reason=sig.reason, batch_id=batch_id)
+            placed.append(ticket)
+            self.add_log("INFO", f"ENTRY {sig.action} {r['volume']} {s} @ {fill} #{ticket} batch {batch_id} "
+                                 f"leg {len(placed)}/{n} ({mode}) score {sig.score:+.2f} [{sig.reason}] "
+                                 f"SL {sl:.{int(info['digits'])}f} slip {slip:+.0f}pt risk {size.risk_money:.2f} "
+                                 f"{r.get('latency', 0)*1000:.0f}ms")
+            open_pos.append(OpenPos(s, sig.action, float(r["volume"]), 0.0, size.risk_money, notional))
+            self._refresh_account()
+            acct = AccountView(float(self.account.get("balance", 0)), float(self.account.get("equity", 0)),
+                               float(self.account.get("margin_free", 0)), float(self.account.get("margin_level", 0)))
+        if placed:
+            b = self.bursts.setdefault(batch_id, {"symbol": s, "side": sig.action, "opened": now_wall,
+                                                  "mode": mode, "realized": 0.0, "legs": 0})
+            b["legs"] = int(b.get("legs", 0)) + len(placed)
+            tr = self.trends.get(s)
+            self._decision(s, sig.action, sig.score,
+                           f"OPENED {len(placed)}/{n} ({mode}, size {size.volume:g}, {size.note})"
+                           + (f"; stopped: {why_stop}" if why_stop else ""))
+            status["reason"] = f"batch {batch_id}: {len(placed)} order(s) {sig.action} (trend {tr.label if tr else 'unknown'})"
+            self._save_state()
+        else:
+            self._skip(s, status, f"{sig.action} blocked: {why_stop}", now_wall, sig)
 
     # ----------------------------------------------------------------- loop
     def step(self, now_wall: Optional[float] = None) -> None:
         now_wall = time.time() if now_wall is None else now_wall
+        self.now_wall = now_wall
         self._process_commands()
         self._ensure_connection(now_wall)
         if self.conn_state == "CONNECTED":
@@ -763,7 +969,10 @@ class Trader:
             if now_wall - self.last_trade_check > 10.0:
                 self.last_trade_check = now_wall
                 self._validate()
+            self._update_trends(now_wall)
             self._manage_exits(now_wall)
+            if self.running:
+                self._log_why(now_wall)
             if self.risk.halted and self.own_positions:
                 self._flatten("RISK HALT")
             if self.flatten_pending:
@@ -778,8 +987,9 @@ class Trader:
                         reason = "validation failing - entries paused"
                     if self.risk.halted:
                         reason = f"halted: {self.risk.halt_reason}"
+                    tr = self.trends.get(s)
                     self.sym_status[s] = {"signal": "HOLD" if not self.running else sig.action, "score": round(sig.score, 3),
-                                          "reason": reason, "features": sig.features.brief(),
+                                          "reason": reason, "trend": tr.brief() if tr else None, "features": sig.features.brief(),
                                           "tick_age": round(now_wall - self.last_receipt[s], 1) if s in self.last_receipt else None}
         if now_wall - self.last_snapshot >= self.cfg.snapshot_interval:
             self.last_snapshot = now_wall
@@ -793,6 +1003,9 @@ class Trader:
         for s in self.selected:
             ok_t, why_t = self._tradable(s)
             st = out.setdefault(s, {"signal": "HOLD", "score": 0.0, "reason": "", "features": {}})
+            tr = self.trends.get(s)
+            st["trend"] = tr.brief() if tr else None
+            st["skips"] = dict(self.skip_counts.get(s, Counter()).most_common(6))
             st["tradable"] = ok_t
             if not ok_t:
                 st["market"], st["signal"], st["reason"] = "n/a", "HOLD", f"not tradable: {why_t}"
@@ -804,6 +1017,17 @@ class Trader:
                                 if qs == "closed" else "price stream not connected - retrying")
                 st["signal"] = "HOLD"
         return out
+
+    def _risk_view(self) -> dict:
+        c = self.cfg
+        return {"risk_per_trade_pct": c.risk_per_trade_pct, "small_account_max_loss_pct": c.small_account_max_loss_pct,
+                "max_total_risk_pct": c.max_total_risk_pct, "daily_loss_limit_pct": c.daily_loss_limit_pct,
+                "equity_drawdown_pct": c.equity_drawdown_pct, "batch": f"{c.batch_min}-{c.batch_max}",
+                "batch_tp_units": c.batch_tp_units, "batch_max_hold_s": c.batch_max_hold_seconds,
+                "batch_cooldown_s": c.batch_cooldown_seconds, "entry_threshold": c.entry_threshold,
+                "countertrend_min_score": c.countertrend_min_score, "min_tick_rate": c.min_tick_rate,
+                "max_spread_bps": c.max_spread_bps, "max_positions_total": c.max_positions_total,
+                "max_positions_per_symbol": c.max_positions_per_symbol, "sl_vol_units": c.sl_vol_units}
 
     def _build_snapshot(self, now_wall: float) -> None:
         acct = self.account if self.conn_state == "CONNECTED" else {}
@@ -817,7 +1041,7 @@ class Trader:
                               "price_current": p.get("price_current"), "sl": p.get("sl"), "tp": p.get("tp"),
                               "profit": round(float(p.get("profit", 0)) + float(p.get("swap", 0)), 2),
                               "age_s": round(now_wall - ps.open_time) if ps else None,
-                              "reason": ps.reason if ps else ""})
+                              "reason": ps.reason if ps else "", "batch": ps.batch_id if ps else ""})
         snap = {
             "ts": now_wall,
             "worker": {"version": __version__, "host": socket.gethostname(),
@@ -836,7 +1060,11 @@ class Trader:
             "validation": self.validation,
             "engine": {"running": self.running, "start_wall": getattr(self, "start_wall", None), "halted": self.risk.halted, "halt_reason": self.risk.halt_reason,
                        "blocked": self.unverified_entry, "batch": self.batch, "symbols": self._symbol_view(),
-                       "selected": self.selected, "live_allowed": self.allow_live},
+                       "selected": self.selected, "live_allowed": self.allow_live,
+                       "bursts": {k: {kk: v.get(kk) for kk in ("symbol", "side", "mode", "legs")}
+                                  for k, v in self.bursts.items()},
+                       "decisions": list(self.decisions)[-15:],
+                       "risk_config": self._risk_view()},
             "pnl": ({"floating": round(floating, 2), "daily": round(self.daily_realized + floating, 2),
                      "daily_realized": round(self.daily_realized, 2),
                      "batch": round(self.batch_realized + floating, 2) if self.batch else None}

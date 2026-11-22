@@ -523,6 +523,25 @@ class TickerAllBroker:
         out = [t for t in list(buf) if t[3] > last_msc]
         return out[-max_count:]
 
+    def candles(self, symbol: str, timeframe: str = "M1", hours: float = 0.5) -> list[dict]:
+        """Real broker OHLC bars (oldest -> newest); [] when unavailable (never synthesised)."""
+        if not self.account_id:
+            return []
+        try:
+            res = self._req("GET", f"/v1/accounts/{self.account_id}/candles",
+                            query={"symbol": symbol, "timeframe": timeframe, "hours": hours}, timeout=20)
+        except Exception:  # noqa: BLE001
+            return []
+        out = []
+        for c in res.get("candles") or []:
+            try:
+                out.append({"time": float(c["timestamp"]), "open": float(c["open"]), "high": float(c["high"]),
+                            "low": float(c["low"]), "close": float(c["close"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda x: x["time"])
+        return out
+
     # ----------------------------------------------------- positions/orders
     def _map_pos(self, p: dict) -> dict:
         t = int(p.get("ticket") or 0)

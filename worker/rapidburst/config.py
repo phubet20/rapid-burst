@@ -20,13 +20,13 @@ class EngineConfig:
     breakout_lookback: float = 20.0   # micro-structure range lookback
     min_ticks_warmup: int = 40        # ticks required before any decision
     warmup_seconds: float = 60.0      # seconds of tick history required before any decision
-    min_tick_rate: float = 0.5        # ticks/sec required (liquidity / session open)
+    min_tick_rate: float = 0.3        # ticks/sec required (TickerAll BTCUSDm measured 0.7-1.2/s)
     max_tick_age: float = 10.0        # seconds; older last tick => market idle -> HOLD
 
     # --- entry scoring (no RSI, no fixed confirmation chain) ---
     min_impulse_units: float = 3.0  # fast displacement (vol units) that counts as a burst
     min_pressure: float = 0.35      # one-sided tick pressure that must accompany the impulse
-    entry_threshold: float = 0.60     # |score| needed to enter (score in [-1, 1])
+    entry_threshold: float = 0.55     # |score| needed to enter (score in [-1, 1])
     add_threshold: float = 0.70       # |score| needed to add a second/third order
     exhaustion_z: float = 3.2         # price z-score vs. 60s mean => extended, do not chase
     chase_disp_units: float = 4.0     # slow displacement (vol units) beyond which we refuse to chase
@@ -60,13 +60,26 @@ class EngineConfig:
     # --- risk ---
     risk_per_trade_pct: float = 0.25  # % of equity lost if the SL is hit
     max_lot_per_order: float = 1.0
-    max_positions_total: int = 4
-    max_positions_per_symbol: int = 2
+    max_positions_total: int = 8
+    max_positions_per_symbol: int = 5
     max_total_lots: float = 2.0
-    max_total_notional_x: float = 30.0  # sum of open notional (account ccy) <= x * equity, when computable
-    max_total_risk_pct: float = 1.0   # sum of open SL risk across bot positions
-    daily_loss_limit_pct: float = 3.0 # bot daily P/L <= -x% of day-start balance => halt
-    equity_drawdown_pct: float = 5.0  # equity below day peak by x% => halt
+    max_total_notional_x: float = 500.0  # sum of open notional <= x * equity (BTC min lot on $10 = ~90x; SL caps the loss)
+    max_total_risk_pct: float = 15.0  # sum of open SL risk across bot positions (% equity)
+    small_account_max_loss_pct: float = 5.0  # min lot allowed when its SL loss <= x% equity (small accounts)
+    daily_loss_limit_pct: float = 20.0  # bot daily P/L <= -x% of day-start balance => halt
+    equity_drawdown_pct: float = 30.0   # equity below day peak by x% => halt
+
+    # --- burst batches (2-5 same-direction orders on strong momentum; never martingale/grid) ---
+    batch_min: int = 2
+    batch_max: int = 5
+    batch_full_score: float = 0.90   # |score| at which the batch reaches batch_max
+    batch_tp_units: float = 1.0      # close the whole batch at +x vol units (executable price, after spread)
+    batch_max_hold_seconds: float = 120.0
+    batch_cooldown_seconds: float = 20.0
+    # --- higher-timeframe trend filter (M1/M5 bars) ---
+    trend_min_strength: float = 0.25   # below = flat
+    countertrend_min_score: float = 0.85  # counter-trend entry needs this |score|, single order, half risk
+    trend_refresh_seconds: float = 60.0
     min_margin_level_pct: float = 300.0
     margin_use_max_pct: float = 30.0  # new order margin must be < x% of free margin
 
@@ -82,13 +95,20 @@ class EngineConfig:
     def load(cls) -> "EngineConfig":
         cfg = cls()
         path = os.environ.get("RB_CONFIG_FILE")
+        data = {}
         if path and os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            names = {f.name for f in fields(cls)}
-            for k, v in data.items():
-                if k in names:
-                    setattr(cfg, k, type(getattr(cfg, k))(v))
+                data.update(json.load(fh))
+        raw = os.environ.get("RB_CONFIG_JSON", "").strip()     # server-side overrides (e.g. Render env var)
+        if raw:
+            try:
+                data.update(json.loads(raw))
+            except ValueError:
+                pass
+        names = {f.name for f in fields(cls)}
+        for k, v in data.items():
+            if k in names:
+                setattr(cfg, k, type(getattr(cfg, k))(v))
         return cfg
 
     def public(self) -> dict:

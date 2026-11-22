@@ -156,6 +156,51 @@ Limits to know (honest):
   "tick value unknown"), volume min/step/max, slippage in volatility units, per-symbol position
   limits and a total notional cap (`max_total_notional_x`).
 
+## Burst batches, small accounts and the trend filter
+
+**Burst batch.** On a strong momentum score the engine opens 2-5 same-direction market
+orders that share a batch id (count scales with |score| from `entry_threshold` to
+`batch_full_score`; every leg is re-checked by the risk guard and the batch is cut short at
+the first refusal). Every leg has its own server-side SL. The whole batch is closed together on:
+batch target (`batch_tp_units` vol units, measured at the executable bid/ask so the spread is
+already paid), momentum fade, reversal, or time stop (`batch_max_hold_seconds`). After a batch is
+flat there is a `batch_cooldown_seconds` pause. No martingale, no grid, never adds to a losing
+position, never opens against an open batch. Lots compound with equity through `risk_per_trade_pct`.
+
+**Small accounts.** When the risk-based lot is below the broker minimum, the minimum lot is used
+only if its SL loss is <= `small_account_max_loss_pct` of equity (default 5%) and total open SL
+risk stays <= `max_total_risk_pct` (15%); otherwise the signal is skipped with the reason
+logged. Defaults: daily loss limit 20%, equity drawdown stop 30% (halts and flattens).
+Example (Exness BTCUSDm, $10): spread ~$6.4, SL ~$20-30 -> 0.01 lot risks $0.20-0.30 (2-3%).
+
+**Trend filter.** Every 60 s the engine fetches real M1 (45 min) and M5 (90 min) bars from the
+broker (TickerAll `GET /v1/accounts/{id}/candles`, or MT5 `copy_rates_from_pos`) and computes
+trend direction + strength from M1 regression slope, M1 EMA(8/21) gap and M5 slope, each
+normalised by the average bar range. With-trend (or flat) signals open a full batch; a
+counter-trend signal needs |score| >= `countertrend_min_score` (0.85) and opens a single order
+at half risk; adding to an open batch (pyramiding) happens only when the trend is aligned and every
+leg is in profit. If no bars are available the trend shows "unknown" and is treated as neutral.
+
+**Why no trade?** Each symbol keeps counters of skip reasons (sampled once per second: warming
+up, no momentum edge, spread filter, sizing refused, counter-trend filter, cooldown, risk cap ...),
+shown in the Engine card together with the recent decisions and the active limits; a
+`WHY NO TRADE (last 60s)` summary is written to the log every minute while running.
+
+**Changing limits server-side.** Set `RB_CONFIG_JSON` on the Render service (or a JSON file via
+`RB_CONFIG_FILE`), e.g. `{"small_account_max_loss_pct": 3, "batch_max": 3, "daily_loss_limit_pct": 10}`.
+The UI cannot change risk limits.
+
+## Path to a LIVE account (not enabled)
+
+LIVE stays disabled. Two independent gates must both be opened deliberately:
+1. **Price/execution path.** TickerAll Free refuses live accounts (`FREE_TIER_LIVE_REJECTED`).
+   Either upgrade to a paid TickerAll tier that allows live accounts, or run the Windows
+   launcher with a real MT5 terminal (see "Install the launcher").
+2. **Engine gate.** The engine refuses non-DEMO accounts unless the machine running it sets
+   `RB_ALLOW_LIVE=I_UNDERSTAND_LIVE_RISK` (environment variable on Render or the Windows PC). It
+   can never be enabled from the web UI.
+Test on DEMO first, then reduce `small_account_max_loss_pct` / `batch_max` for real money.
+
 ## Install the launcher (your Windows PC or a Windows VPS, elevated PowerShell)
 ```
 & ([scriptblock]::Create((irm https://<backend>/bootstrap/install.ps1)))

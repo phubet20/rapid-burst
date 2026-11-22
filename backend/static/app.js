@@ -134,18 +134,27 @@
       (s.foreign_positions ? `${s.foreign_positions} manual/other (untouched)` : "");
     $("posBody").innerHTML = pos.length ? pos.map((x) =>
       `<tr><td>${esc(x.symbol)}</td><td class="${x.side === "BUY" ? "pos-v" : "neg-v"}">${x.side}</td><td>${fmt(x.volume, 2)}</td>` +
-      `<td>${esc(x.price_open)}</td><td class="${x.profit >= 0 ? "pos-v" : "neg-v"}">${x.profit > 0 ? "+" : ""}${fmt(x.profit)}</td><td>${x.age_s ?? "—"}s</td></tr>`).join("")
+      `<td>${esc(x.price_open)}${x.batch ? `<div class="tiny muted">batch ${esc(x.batch)}</div>` : ""}</td><td class="${x.profit >= 0 ? "pos-v" : "neg-v"}">${x.profit > 0 ? "+" : ""}${fmt(x.profit)}</td><td>${x.age_s ?? "—"}s</td></tr>`).join("")
       : `<tr><td colspan="6" class="muted">No bot positions</td></tr>`;
 
     const syms = eng.symbols || {};
-    $("engMeta").textContent = eng.batch && eng.batch.id ? `batch ${eng.batch.id}` : "";
+    $("engMeta").textContent = eng.batch && eng.batch.id ? `session ${eng.batch.id}` : "";
     $("engine").innerHTML = Object.keys(syms).length ? Object.entries(syms).map(([k, v]) => {
       const f = v.features || {};
       const cls = v.signal === "BUY" ? "pos-v" : v.signal === "SELL" ? "neg-v" : "muted";
       const mk = v.market === "live" ? ' <span class="pos-v tiny">● quoting</span>' : v.market === "closed" ? ' <span class="neg-v tiny">● no quotes / market closed</span>' : v.market === "n/a" ? ' <span class="neg-v tiny">● not tradable</span>' : "";
-      return `<div class="eng"><b>${esc(k)}</b>${mk} <span class="sig ${cls}">${esc(v.signal)}</span> score ${fmt(v.score, 2)} · ${esc(v.reason)}` +
+      const tr = v.trend;
+      const trHtml = tr ? (tr.known ? ` <span class="tiny ${tr.dir > 0 ? "pos-v" : tr.dir < 0 ? "neg-v" : "muted"}">trend ${tr.dir > 0 ? "▲" : tr.dir < 0 ? "▼" : "▬"} ${esc(tr.label)}</span>`
+                                    : ` <span class="tiny muted">trend ?</span>`) : "";
+      const sk = v.skips && Object.keys(v.skips).length ? `<div class="tiny muted">why no trade (count): ${Object.entries(v.skips).map(([a, b]) => esc(a) + " " + b).join(" · ")}</div>` : "";
+      return `<div class="eng"><b>${esc(k)}</b>${mk}${trHtml} <span class="sig ${cls}">${esc(v.signal)}</span> score ${fmt(v.score, 2)} · ${esc(v.reason)}` + sk +
         `<div class="tiny muted">vel ${f.vel ?? "—"} acc ${f.acc ?? "—"} press ${f.press ?? "—"} brk ${f.brk ?? "—"} exp ${f.exp ?? "—"} z ${f.z ?? "—"} · spread ${v.spread_pts ?? "—"}pt · ${f.tps ?? "—"} t/s · tick ${v.tick_age ?? "—"}s ago</div></div>`;
     }).join("") : `<div class="muted small">${eng.halted ? esc(eng.halt_reason) : "Engine idle"}</div>`;
+    const rc = eng.risk_config;
+    if (rc) $("engine").insertAdjacentHTML("beforeend", `<div class="tiny muted rc">Active limits: risk/trade ${rc.risk_per_trade_pct}% · small-account min-lot max loss ${rc.small_account_max_loss_pct}% · open risk ≤ ${rc.max_total_risk_pct}% · daily loss ${rc.daily_loss_limit_pct}% · drawdown ${rc.equity_drawdown_pct}% · batch ${rc.batch} orders, TP ${rc.batch_tp_units} vu, max hold ${rc.batch_max_hold_s}s, cooldown ${rc.batch_cooldown_s}s · entry |score| ≥ ${rc.entry_threshold} (counter-trend ≥ ${rc.countertrend_min_score}) · ≥ ${rc.min_tick_rate} ticks/s · spread ≤ ${rc.max_spread_bps} bp</div>`);
+    const dec = eng.decisions || [];
+    if (dec.length) $("engine").insertAdjacentHTML("beforeend", `<details class="small"><summary>Recent decisions (${dec.length})</summary>` +
+      dec.slice().reverse().map((d) => `<div class="tiny">${new Date(d.ts * 1000).toLocaleTimeString("en-GB")} ${esc(d.symbol)} ${esc(d.side)} ${d.score ?? ""} · trend ${esc(d.trend)} → ${esc(d.outcome)}</div>`).join("") + `</details>`);
     if (eng.blocked) $("engine").insertAdjacentHTML("afterbegin", `<div class="neg-v small">${esc(eng.blocked)}</div>`);
   }
 

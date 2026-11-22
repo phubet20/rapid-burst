@@ -26,7 +26,8 @@ def instrument(broker: SimBroker, cfg: EngineConfig, inv: Invariants):
 
     def wrapped(s, side, volume, sl, tp, deviation, magic, comment):
         mine = [p for p in broker.positions_.values() if p["magic"] == magic and p["symbol"] == s]
-        if any(p["profit"] <= 0 for p in mine):
+        batch = comment.rsplit("-", 1)[0] + "-"          # legs of the same burst batch (one signal)
+        if any(p["profit"] <= 0 and not str(p.get("comment", "")).startswith(batch) for p in mine):
             inv.adds_into_loser += 1
         if any((p["type"] == 0) != (side == "BUY") for p in mine):
             inv.opposite_while_open += 1

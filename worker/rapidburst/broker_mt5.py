@@ -125,6 +125,19 @@ class MT5Broker:
             return {}
         return _d(mt5.symbol_info_tick(symbol))
 
+    def candles(self, symbol: str, timeframe: str = "M1", hours: float = 0.5) -> list[dict]:
+        if mt5 is None or not self.initialized:
+            return []
+        tf = {"M1": (mt5.TIMEFRAME_M1, 1), "M5": (mt5.TIMEFRAME_M5, 5), "M15": (mt5.TIMEFRAME_M15, 15)}.get(timeframe)
+        if not tf:
+            return []
+        n = max(2, int(hours * 60 / tf[1]))
+        rates = mt5.copy_rates_from_pos(symbol, tf[0], 0, n)
+        if rates is None:
+            return []
+        return [{"time": float(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
+                 "low": float(r["low"]), "close": float(r["close"])} for r in rates]
+
     def quote_state(self, symbol: str) -> str:
         """MT5 gives server-time ticks only, so freshness cannot be proven here: 'unknown' when a
         last tick exists (the engine's own tick-age checks then decide), 'closed' when there is none."""
