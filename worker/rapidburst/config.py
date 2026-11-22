@@ -74,7 +74,6 @@ class EngineConfig:
     magic: int = 26112201
     comment_prefix: str = "RBurst"
     timezone: str = "Asia/Bangkok"
-    auto_resume: bool = True          # resume running after a worker restart if it was running
     stop_closes_positions: bool = True
 
     @classmethod

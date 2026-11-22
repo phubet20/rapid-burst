@@ -19,6 +19,7 @@ import zipfile
 from collections import deque
 from pathlib import Path
 
+import aiohttp
 from aiohttp import WSMsgType, web
 
 ROOT = Path(__file__).resolve().parent
@@ -37,8 +38,12 @@ def _env(name: str) -> str:
     return v
 
 
+def wake_topic(secret: str) -> str:
+    return "rb-" + hmac.new(secret.encode(), b"rapid-burst-wake", hashlib.sha256).hexdigest()[:40]
+
+
 class Hub:
-    def __init__(self, ui_password: str, worker_secret: str):
+    def __init__(self, ui_password: str, worker_secret: str, wake_url: str = ""):
         self.ui_password = ui_password
         self.worker_secret = worker_secret
         self.session_key = hashlib.sha256(("rb-session|" + ui_password + "|" + worker_secret).encode()).digest()
@@ -51,6 +56,37 @@ class Hub:
         self.ui_clients: set[web.WebSocketResponse] = set()
         self.login_attempts: dict[str, deque] = {}
         self.worker_zip = self._build_worker_zip()
+        self.wake_url = wake_url.rstrip("/")
+        self.last_wake = 0.0
+        self.wakes_sent = 0
+
+    async def wake(self) -> None:
+        """Ask the sleeping launcher to connect (ntfy publish of a content-free 'wake')."""
+        if self.worker_online() or not self.wake_url or time.time() - self.last_wake < 10:
+            return
+        self.last_wake = time.time()
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+                await s.post(f"{self.wake_url}/{wake_topic(self.worker_secret)}", data=b"wake")
+            self.wakes_sent += 1
+            log.info("wake signal sent to launcher")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("wake failed: %s", exc)
+
+    async def wait_worker(self, timeout: float) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.worker_online():
+                return True
+            await asyncio.sleep(0.25)
+        return self.worker_online()
+
+    async def notify_ui_count(self) -> None:
+        if self.worker_online():
+            try:
+                await self.worker_ws.send_json({"type": "ui", "clients": len(self.ui_clients)})
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---------------------------------------------------------- sessions
     def make_session(self) -> str:
@@ -91,7 +127,7 @@ class Hub:
         fut = asyncio.get_running_loop().create_future()
         self.pending[cid] = fut
         try:
-            await self.worker_ws.send_json({"type": "cmd", "id": cid, "cmd": cmd, "args": args})
+            await self.worker_ws.send_json({"type": "cmd", "id": cid, "cmd": cmd, "args": args, "ts": time.time()})
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
             return {"ok": False, "msg": "worker did not answer in time"}
@@ -109,13 +145,16 @@ class Hub:
         return buf.getvalue()
 
 
+HUB = web.AppKey("hub", Hub)
+
+
 def client_ip(request: web.Request) -> str:
     fwd = request.headers.get("X-Forwarded-For", "")
     return fwd.split(",")[0].strip() if fwd else (request.remote or "?")
 
 
 def require_ui(request: web.Request) -> None:
-    hub: Hub = request.app["hub"]
+    hub: Hub = request.app[HUB]
     if not hub.check_session(request.cookies.get("rb_session")):
         raise web.HTTPUnauthorized(text=json.dumps({"ok": False, "msg": "login required"}),
                                    content_type="application/json")
@@ -147,12 +186,12 @@ async def index(request: web.Request) -> web.StreamResponse:
 
 
 async def healthz(request: web.Request) -> web.Response:
-    hub: Hub = request.app["hub"]
+    hub: Hub = request.app[HUB]
     return web.json_response({"ok": True, "worker_online": hub.worker_online()})
 
 
 async def login(request: web.Request) -> web.Response:
-    hub: Hub = request.app["hub"]
+    hub: Hub = request.app[HUB]
     require_csrf(request)
     ip = client_ip(request)
     q = hub.login_attempts.setdefault(ip, deque())
@@ -184,7 +223,9 @@ async def logout(request: web.Request) -> web.Response:
 
 async def api_state(request: web.Request) -> web.Response:
     require_ui(request)
-    hub: Hub = request.app["hub"]
+    hub: Hub = request.app[HUB]
+    if not hub.worker_online():
+        await hub.wake()
     return web.json_response({**hub.state(), "logs": list(hub.logs)[-150:]})
 
 
@@ -209,15 +250,23 @@ def _validate_cmd(cmd: str, args: dict) -> dict:
 async def api_cmd(request: web.Request) -> web.Response:
     require_ui(request)
     require_csrf(request)
-    hub: Hub = request.app["hub"]
+    hub: Hub = request.app[HUB]
     body = await request.json()
     cmd = str(body.get("cmd", ""))
     args = _validate_cmd(cmd, body.get("args") or {})
+    if not hub.worker_online():
+        await hub.wake()
+        if not await hub.wait_worker(30):
+            return web.json_response({"ok": False, "msg": "Launcher offline - wake signal sent but the Windows launcher "
+                                                          "did not connect (is the PC/VPS on?)"})
     if cmd == "start":
         snap = hub.snapshot or {}
-        if not (hub.worker_online() and (snap.get("conn") or {}).get("state") == "CONNECTED"
-                and (snap.get("validation") or {}).get("ok")):
-            return web.json_response({"ok": False, "msg": "START refused: MT5 connection/validation not confirmed by worker"})
+        lc = ((snap.get("launcher") or {}).get("last_connect") or {})
+        live_ok = (snap.get("conn") or {}).get("state") == "CONNECTED" and (snap.get("validation") or {}).get("ok")
+        stored_ok = (snap.get("launcher") or {}).get("has_credentials") and lc.get("validation_ok")
+        if not (live_ok or stored_ok):
+            return web.json_response({"ok": False, "msg": "START refused: MT5 connection/validation not confirmed - "
+                                                          "use CONNECT MT5 first"})
     log.info("ui command %s from %s", cmd, client_ip(request))  # never log args (may hold ciphertext)
     result = await hub.send_cmd(cmd, args)
     return web.json_response(result)
@@ -225,21 +274,25 @@ async def api_cmd(request: web.Request) -> web.Response:
 
 async def ui_ws(request: web.Request) -> web.WebSocketResponse:
     require_ui(request)
-    hub: Hub = request.app["hub"]
+    hub: Hub = request.app[HUB]
     ws = web.WebSocketResponse(heartbeat=25)
     await ws.prepare(request)
     hub.ui_clients.add(ws)
+    await hub.notify_ui_count()
+    if not hub.worker_online():
+        await hub.wake()
     await ws.send_json({"type": "state", **hub.state(), "logs": list(hub.logs)[-150:]})
     try:
         async for _ in ws:
             pass
     finally:
         hub.ui_clients.discard(ws)
+        await hub.notify_ui_count()
     return ws
 
 
 async def worker_ws(request: web.Request) -> web.WebSocketResponse:
-    hub: Hub = request.app["hub"]
+    hub: Hub = request.app[HUB]
     auth = request.headers.get("Authorization", "")
     if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].encode(), hub.worker_secret.encode())):
         await asyncio.sleep(1.0)
@@ -252,6 +305,8 @@ async def worker_ws(request: web.Request) -> web.WebSocketResponse:
     if old is not None and not old.closed:
         await old.close(message=b"replaced by new worker connection")
     log.info("worker connected from %s", client_ip(request))
+    await ws.send_json({"type": "welcome", "server_time": time.time()})
+    await hub.notify_ui_count()
     await hub.broadcast({"type": "worker", "worker_online": True})
     try:
         async for msg in ws:
@@ -292,7 +347,7 @@ async def bootstrap_script(request: web.Request) -> web.Response:
 
 
 async def bootstrap_zip(request: web.Request) -> web.Response:
-    hub: Hub = request.app["hub"]
+    hub: Hub = request.app[HUB]
     key = request.headers.get("X-Worker-Secret", "")
     if not hmac.compare_digest(key.encode(), hub.worker_secret.encode()):
         await asyncio.sleep(1.0)
@@ -300,9 +355,9 @@ async def bootstrap_zip(request: web.Request) -> web.Response:
     return web.Response(body=hub.worker_zip, content_type="application/zip")
 
 
-def make_app(ui_password: str, worker_secret: str) -> web.Application:
+def make_app(ui_password: str, worker_secret: str, wake_url: str = "") -> web.Application:
     app = web.Application(middlewares=[security_headers], client_max_size=64 * 1024)
-    app["hub"] = Hub(ui_password, worker_secret)
+    app[HUB] = Hub(ui_password, worker_secret, wake_url)
     app.router.add_get("/", index)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/api/login", login)
@@ -322,7 +377,9 @@ def main() -> None:
     ui_pw, secret = _env("UI_PASSWORD"), _env("WORKER_SECRET")
     if len(ui_pw) < 10 or len(secret) < 24:
         raise SystemExit("UI_PASSWORD (>=10 chars) and WORKER_SECRET (>=24 chars) are too short")
-    web.run_app(make_app(ui_pw, secret), host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    wake = os.environ.get("WAKE_URL", "https://ntfy.sh").strip()
+    web.run_app(make_app(ui_pw, secret, "" if wake.lower() == "off" else wake), host="0.0.0.0",
+                port=int(os.environ.get("PORT", "10000")))
 
 
 if __name__ == "__main__":

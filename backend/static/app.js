@@ -56,18 +56,25 @@
     const eng = s.engine || {};
     const val = s.validation || {};
     const online = !!S.worker_online;
-    badge($("bWorker"), online ? "WORKER ON" : "WORKER OFF", online ? "ok" : "bad");
+    const L = s.launcher || {};
+    const lc = L.last_connect || null;
+    badge($("bWorker"), online ? "LAUNCHER ON" : "LAUNCHER WAKING…", online ? "ok" : "warn");
     const st = online ? (conn.state || "—") : "UNKNOWN";
-    badge($("bMt5"), "MT5 " + st, st === "CONNECTED" ? "ok" : st === "CONNECTING" ? "warn" : "bad");
-    const mode = acct && acct.mode;
+    badge($("bMt5"), st === "IDLE" ? "MT5 OFF (idle)" : "MT5 " + st,
+      st === "CONNECTED" ? "ok" : (st === "CONNECTING" || st === "IDLE") ? "warn" : "bad");
+    const mode = (acct && acct.mode) || (!acct && lc && lc.account && lc.account.mode) || null;
     badge($("bMode"), mode ? (mode === "REAL" ? "LIVE" : mode) : "NO ACCOUNT", mode === "DEMO" ? "ok" : mode ? "live" : "");
-    const engTxt = !online ? "ENGINE —" : eng.halted ? "HALTED" : eng.running ? "RUNNING" : "STOPPED";
-    badge($("bEngine"), engTxt, eng.halted ? "bad" : eng.running ? "ok" : "warn");
+    const phase = L.phase || (eng.running ? "RUNNING" : "IDLE");
+    const engTxt = !online ? "ENGINE —" : eng.halted ? "HALTED" : phase === "IDLE" ? "ENGINE OFF" : phase;
+    badge($("bEngine"), engTxt, eng.halted ? "bad" : phase === "RUNNING" ? "ok" : "warn");
 
     $("connLine").textContent = !online
-      ? "Worker offline: the Windows MT5 worker is not connected to this server."
+      ? "Waking the Windows launcher… (if this stays, the PC/VPS launcher is off or offline)"
+      : st === "IDLE"
+      ? `Engine off - nothing running. ${lc ? `Last check ${new Date(lc.ts * 1000).toLocaleString("en-GB")}: ${lc.validation_ok ? "validated ✓" : "not validated ✗ " + (lc.failed_checks || []).join(", ")}` : "Use CONNECT MT5 first."}`
       : `${conn.msg || ""}${conn.ping_ms != null ? ` · ping ${conn.ping_ms} ms` : ""}${conn.state === "CONNECTED" ? ` · algo trading ${conn.algo_trading ? "ON" : "OFF"}` : ""}`;
-    $("acctLine").textContent = acct ? `#${acct.login} · ${acct.server} · ${acct.company || ""} · ${acct.currency} · 1:${acct.leverage}` : "";
+    $("acctLine").textContent = acct ? `#${acct.login} · ${acct.server} · ${acct.company || ""} · ${acct.currency} · 1:${acct.leverage}`
+      : (lc && lc.account ? `last: #${lc.account.login} · ${lc.account.server} · ${lc.account.mode}` : "");
 
     const cur = acct ? acct.currency : "";
     $("mBal").textContent = acct ? fmt(acct.balance) : "—";
@@ -76,14 +83,17 @@
     const p = s.pnl;
     pl($("mFloat"), p ? p.floating : null); pl($("mDaily"), p ? p.daily : null); pl($("mBatch"), p ? p.batch : null);
 
-    const canStart = online && conn.state === "CONNECTED" && val.ok && !eng.running && !eng.halted && !eng.blocked;
+    const liveOk = conn.state === "CONNECTED" && val.ok;
+    const storedOk = L.has_credentials && lc && lc.validation_ok;
+    const canStart = online && (liveOk || storedOk) && !eng.running && !eng.halted && !eng.blocked &&
+      !["STARTING", "RUNNING", "STOPPING"].includes(phase);
     $("btnStart").disabled = !canStart;
-    $("btnStop").disabled = !online;
+    $("btnStop").disabled = false;
     $("btnConnect").textContent = conn.state === "CONNECTED" ? "RECONNECT MT5" : "CONNECT MT5";
 
     $("checks").innerHTML = (val.checks || []).map((c) =>
       `<li><span>${c.ok ? "✅" : "❌"}</span><span>${esc(c.name)}</span><span class="d">${esc(c.detail)}</span></li>`).join("")
-      || `<li class="muted">${online ? "Waiting for MT5 connection" : "No worker connected"}</li>`;
+      || `<li class="muted">${!online ? "Launcher not connected" : st === "IDLE" ? "Engine off - checks run on CONNECT MT5 / START" : "Waiting for MT5 connection"}</li>`;
 
     const sel = eng.selected || [];
     $("selSyms").textContent = sel.join(", ");
@@ -136,7 +146,7 @@
   $("connectForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const pk = (S.snapshot || {}).pubkey;
-    if (!S.worker_online || !pk) { $("actMsg").textContent = "✖ Worker offline - cannot connect MT5 yet"; return; }
+    if (!pk) { $("actMsg").textContent = "✖ Launcher has not connected yet - cannot encrypt credentials"; return; }
     if (!window.crypto || !crypto.subtle) { $("actMsg").textContent = "✖ Secure context (HTTPS) required"; return; }
     const der = Uint8Array.from(atob(pk), (c) => c.charCodeAt(0));
     const key = await crypto.subtle.importKey("spki", der, { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
@@ -147,8 +157,8 @@
     const r = await act("Connecting MT5", () => cmd("connect", { enc }));
     if (r.ok) $("connectPanel").classList.add("hidden");
   });
-  $("btnStart").addEventListener("click", () => act("Starting", () => cmd("start")));
-  $("btnStop").addEventListener("click", () => act("Stopping (closing bot positions)", () => cmd("stop")));
+  $("btnStart").addEventListener("click", () => act("Starting engine + MT5 (fresh account check, ~60s tick warm-up)", () => cmd("start")));
+  $("btnStop").addEventListener("click", () => act("Stopping (closing bot positions, then shutting engine + MT5 down)", () => cmd("stop")));
   $("btnRefresh").addEventListener("click", () => act("Refreshing", () => cmd("refresh")));
 
   async function search() {

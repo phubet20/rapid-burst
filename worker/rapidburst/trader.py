@@ -77,13 +77,13 @@ class Trader:
             self.conn_state, self.conn_msg = "UNAVAILABLE", why
         st = self._load_state()
         self.selected: list[str] = st.get("selected", ["XAUUSD"])
-        self.running: bool = bool(st.get("running", False)) and cfg.auto_resume
+        # Never resume trading from persisted state: trading starts only on an explicit START.
+        self.running: bool = False
+        self.was_running_before_restart = bool(st.get("running", False))
         self.batch: dict = st.get("batch", {})
         self.server_offset: float = float(st.get("server_offset", 0.0))
         self.saved_pos_meta: dict = st.get("positions", {})
         self._validate()
-        if self.running:
-            self.add_log("INFO", "Worker restarted while running - will resume after MT5 reconnect and validation")
 
     # ---------------------------------------------------------------- state
     def _state_path(self) -> str:
@@ -148,8 +148,22 @@ class Trader:
         return {"ok": ok, "msg": msg, "validation": self.validation}
 
     def cmd_start(self) -> dict:
-        if self.conn_state != "CONNECTED":
-            return {"ok": False, "msg": "MT5 not connected"}
+        """Idempotent START. Re-reads everything from the broker before trading and
+        rebuilds tick buffers from live ticks only (no stale signals)."""
+        if self.running:
+            return {"ok": True, "msg": "already running", "batch": self.batch.get("id")}
+        if self.conn_state != "CONNECTED" or not self.broker.is_connected():
+            creds = self.store.load_credentials()
+            if not creds:
+                return {"ok": False, "msg": "MT5 not connected - use CONNECT MT5 first"}
+            ok, msg = self._connect(creds)
+            if not ok:
+                return {"ok": False, "msg": f"MT5 connect failed: {msg}"}
+        # fresh re-read of account, positions and orders; re-adopt own positions by magic
+        self._refresh_account()
+        self._adopt_positions()
+        own_orders = [o for o in self.broker.orders() if int(o.get("magic", 0)) == self.cfg.magic]
+        self._prepare_symbols()
         self._validate()
         if not self.validation["ok"]:
             bad = [c["name"] for c in self.validation["checks"] if not c["ok"]]
@@ -158,21 +172,77 @@ class Trader:
             return {"ok": False, "msg": f"halted for today: {self.risk.halt_reason}"}
         if self.unverified_entry:
             return {"ok": False, "msg": f"blocked: {self.unverified_entry}"}
-        if not self.running:
-            self.running = True
-            self.stopping = False
-            self.batch = {"id": uuid.uuid4().hex[:8], "started_wall": time.time(),
-                          "started_server": time.time() + self.server_offset}
-            self.batch_realized = 0.0
-            self._save_state()
-            self.add_log("INFO", f"START - autonomous trading on {', '.join(self.selected)} (batch {self.batch['id']})")
-        return {"ok": True, "msg": "running"}
+        self._reset_engines()
+        self.running = True
+        self.stopping = False
+        self.start_wall = time.time()
+        self.batch = {"id": uuid.uuid4().hex[:8], "started_wall": time.time(),
+                      "started_server": time.time() + self.server_offset}
+        self.batch_realized = 0.0
+        self.last_deals_check = 0.0
+        self._save_state()
+        self.add_log("INFO", f"START - batch {self.batch['id']} on {', '.join(self.selected)}: account re-read "
+                             f"(equity {self.account.get('equity')}), {len(self.own_positions)} bot position(s) adopted, "
+                             f"{len(own_orders)} bot pending order(s); warming up on fresh live ticks "
+                             f"({self.cfg.warmup_seconds:.0f}s) before the first entry")
+        return {"ok": True, "msg": "running", "batch": self.batch["id"]}
+
+    def _reset_engines(self) -> None:
+        """Discard any previous tick history: the engine only uses ticks that arrive after START."""
+        self.sym_status = {}
+        for s in list(dict.fromkeys(list(self.selected) + list(self.engines))):
+            info = self.sym_info.get(s)
+            if not info:
+                continue
+            self.engines[s] = MomentumEngine(s, float(info.get("point", 0.0)), self.cfg)
+            lt = self.broker.last_tick(s) or {}
+            msc = int(lt.get("time_msc") or 0)
+            self.last_msc[s] = msc if msc > 0 else int((time.time() + self.server_offset) * 1000)
+            self.last_receipt.pop(s, None)
+
+    def cmd_set_credentials(self, creds: dict) -> dict:
+        """Launcher-only (local pipe): plain credentials, kept in memory by the engine process."""
+        self.store.save_credentials({"login": int(creds["login"]), "password": str(creds["password"]),
+                                     "server": str(creds["server"])})
+        return {"ok": True}
+
+    def cmd_connect_stored(self) -> dict:
+        creds = self.store.load_credentials()
+        if not creds:
+            return {"ok": False, "msg": "no credentials"}
+        self.add_log("INFO", f"CONNECT MT5 for account {creds['login']} on {creds['server']}")
+        ok, msg = self._connect(creds)
+        return {"ok": ok, "msg": msg, "validation": self.validation, "account": self._account_brief()}
+
+    def _account_brief(self) -> Optional[dict]:
+        a = self.account if self.conn_state == "CONNECTED" else {}
+        if not a:
+            return None
+        return {"login": a.get("login"), "server": a.get("server"), "company": a.get("company"),
+                "currency": a.get("currency"),
+                "mode": ACCOUNT_MODE.get(int(a.get("trade_mode", -1)), "UNKNOWN")}
+
+    def cmd_shutdown(self, force: bool = False) -> dict:
+        """Launcher-only: release MT5 and end this engine process (only when flat/stopped)."""
+        if self.running:
+            return {"ok": False, "msg": "engine is running - STOP first"}
+        if self.flatten_pending and not force:
+            return {"ok": False, "msg": "bot positions still open - STOP retrying"}
+        self.broker.shutdown()
+        self.conn_state, self.conn_msg = "SHUTDOWN", "engine shut down"
+        self.add_log("INFO", "Engine shut down - MT5 connection released")
+        self.stop_event.set()
+        return {"ok": True}
 
     def cmd_stop(self) -> dict:
         was = self.running
         self.running = False
         self.stopping = True
         self._save_state()
+        if self.conn_state != "CONNECTED" or not self.broker.is_connected():
+            creds = self.store.load_credentials()
+            if creds:
+                self._connect(creds)
         self.add_log("INFO", "STOP - new entries blocked" + ("" if was else " (was not running)"))
         result = self._flatten("STOP")
         self.flatten_pending = not result["ok"]
@@ -459,11 +529,13 @@ class Trader:
                         self.add_log("ERROR", f"#{t} had no SL and SL could not be set - closed: {cr['msg']}")
                         continue
                     self.add_log("WARNING", f"#{t} protective SL attached at {sl}")
+            if not self.running and not self.risk.halted:
+                continue          # exits are managed only while STARTed (server-side SL/TP protect otherwise)
             eng = self.engines.get(ps.symbol)
             if eng is None:
                 continue
             f = eng.features(self._server_now(ps.symbol, now_wall))
-            reason = eng.exit_decision(ps, f, now_wall)
+            reason = eng.exit_decision(ps, f, now_wall) if self.running else None
             if reason is None and self.risk.halted:
                 reason = f"risk halt: {self.risk.halt_reason}"
             if reason:
@@ -577,7 +649,8 @@ class Trader:
         self._process_commands()
         self._ensure_connection(now_wall)
         if self.conn_state == "CONNECTED":
-            self._pull_ticks(now_wall)
+            if self.running:
+                self._pull_ticks(now_wall)
             self._refresh_account()
             self._adopt_positions()
             self._update_realized(now_wall)
@@ -588,7 +661,9 @@ class Trader:
                                float(self.account.get("margin_free", 0)), float(self.account.get("margin_level", 0)))
             halt = self.risk.update(day_key, acct, self.daily_realized + floating)
             if halt:
-                self.add_log("ERROR", f"RISK HALT: {halt} - entries blocked, closing bot positions")
+                self.add_log("ERROR", f"RISK HALT: {halt} - trading stopped for today, closing bot positions")
+                self.running = False
+                self._save_state()
             if now_wall - self.last_trade_check > 10.0:
                 self.last_trade_check = now_wall
                 self._validate()
@@ -642,7 +717,7 @@ class Trader:
                          "margin_free": acct.get("margin_free"), "margin_level": acct.get("margin_level"),
                          "profit": acct.get("profit")} if acct else None),
             "validation": self.validation,
-            "engine": {"running": self.running, "halted": self.risk.halted, "halt_reason": self.risk.halt_reason,
+            "engine": {"running": self.running, "start_wall": getattr(self, "start_wall", None), "halted": self.risk.halted, "halt_reason": self.risk.halt_reason,
                        "blocked": self.unverified_entry, "batch": self.batch, "symbols": self.sym_status,
                        "selected": self.selected, "live_allowed": self.allow_live},
             "pnl": ({"floating": round(floating, 2), "daily": round(self.daily_realized + floating, 2),
@@ -651,7 +726,8 @@ class Trader:
                     if acct else None),
             "positions": positions,
             "foreign_positions": len(self.foreign_positions) if acct else None,
-            "pubkey": self.store.public_key_spki_b64(),
+            "pubkey": getattr(self.store, "public_key_spki_b64", lambda: None)(),
+            "flatten_pending": self.flatten_pending,
         }
         with self.lock:
             self.snapshot = snap
@@ -665,7 +741,7 @@ class Trader:
             return [x for x in self.logs if x["seq"] > seq]
 
     def run_forever(self) -> None:
-        self.add_log("INFO", f"Rapid Burst worker {__version__} started on {socket.gethostname()}")
+        self.add_log("INFO", f"Trading engine {__version__} started on {socket.gethostname()} (pid {os.getpid()})")
         while not self.stop_event.is_set():
             t0 = time.time()
             try:

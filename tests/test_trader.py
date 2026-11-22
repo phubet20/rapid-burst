@@ -101,19 +101,47 @@ def test_restart_recovery_readopts_positions(tmp_path):
         br.advance(t); tr.step(t); t += 0.3
     tickets = {int(p["ticket"]) for p in tr.own_positions}
     assert tickets
-    # simulate worker crash: new Trader, same data dir, same terminal/account
+    # simulate engine crash: new Trader process, same data dir, same terminal/account
     from rapidburst.secure_store import SecureStore
     from rapidburst.trader import Trader
     store2 = SecureStore(str(tmp_path))
     store2.save_credentials({"login": 12345678, "password": "test-only", "server": "Sim-Demo"})
     tr2 = Trader(br, store2, cfg, str(tmp_path))
-    assert tr2.running and tr2.selected == ["XAUUSD"]
-    br.advance(t); tr2.step(t)
-    assert tickets <= set(tr2.pos_state), "positions not re-adopted"
+    assert not tr2.running, "must never resume trading from persisted state"
+    assert tr2.selected == ["XAUUSD"]
+    sent = br.sent_orders
+    r = tr2.cmd_start()      # explicit START (sent by the launcher)
+    assert r["ok"], r
+    assert tickets <= set(tr2.pos_state), "positions not re-adopted on START"
     assert any("Re-adopted" in l["msg"] for l in tr2.logs)
-    run(tr2, br, t, t + 400)
+    # idempotent: a second START does not open a new batch
+    assert tr2.cmd_start()["msg"] == "already running"
+    # warm-up on fresh ticks only -> no entries in the first 60 s
+    run(tr2, br, t, t + 55)
+    assert br.sent_orders == sent, "entered on stale state before fresh warm-up"
+    eng = tr2.engines["XAUUSD"]
+    assert eng.buf.ticks and eng.buf.ticks[0].t > t - 0.5, "engine used ticks from before START"
+    run(tr2, br, t + 55, t + 400)
     # adopted positions are managed (exited) by the new process
     assert not (tickets & {int(p["ticket"]) for p in br.positions_.values()})
+
+
+def test_stop_when_disconnected_reconnects_then_flattens_and_shutdown(tmp_path):
+    cfg = EngineConfig()
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 3600)}, cfg)
+    assert connect_and_start(tr, br, T0 + 1)["ok"]
+    t = T0 + 1
+    while not tr.own_positions and t < T0 + 3600:
+        br.advance(t); tr.step(t); t += 0.3
+    assert tr.own_positions
+    assert not tr.cmd_shutdown()["ok"], "shutdown allowed while running"
+    br.connected_flag = False          # terminal lost connection
+    tr.conn_state = "DISCONNECTED"
+    r = tr.cmd_stop()
+    assert r["ok"], r
+    assert not [p for p in br.positions_.values() if p["magic"] == cfg.magic]
+    assert tr.cmd_shutdown()["ok"]
+    assert tr.stop_event.is_set() and br.shutdown_calls >= 1
 
 
 def test_disconnect_pauses_and_reconnects(tmp_path):

@@ -1,4 +1,4 @@
-# Render Blueprint - backend + iPhone UI (relay only; trading runs on the Windows MT5 worker)
+# Render Blueprint - backend + iPhone UI (relay only; trading runs on the Windows launcher/engine). Free plan sleeps when unused.
 services:
   - type: web
     name: rapid-burst
@@ -15,3 +15,5 @@ services:
         sync: false
       - key: WORKER_SECRET
         sync: false
+      - key: WAKE_URL
+        value: https://ntfy.sh

@@ -1,7 +1,10 @@
 <#
-  Rapid Burst worker - one-shot Windows bootstrap (Windows Server 2019/2022, Windows 10/11 x64)
+  Rapid Burst launcher - one-shot Windows bootstrap (your own Windows 10/11 PC, or a Windows VPS)
 
-  Run in an elevated PowerShell on the Windows VPS (or Windows PC) that will host MT5:
+  Installs an always-on, near-zero-resource LAUNCHER. The trading engine and the bot's own MT5
+  terminal are started only when you press START in the app and are shut down after STOP.
+
+  Run in an elevated PowerShell on the Windows PC/VPS:
 
     & ([scriptblock]::Create((irm __BACKEND_URL__/bootstrap/install.ps1))) -WorkerSecret '<WORKER_SECRET>'
 
@@ -10,7 +13,8 @@
     -Mt5SetupUrl '<broker mt5setup.exe url>'  use your broker's own MT5 installer instead of the MetaQuotes one
     -InstallDir 'C:\RapidBurst'
 
-  Re-running the same command updates the worker code and restarts it. Nothing here places trades.
+  Re-running the same command updates the code and restarts the launcher. Nothing here places trades.
+  Do not use the bot's own terminal (C:\RapidBurst\mt5) for manual trading; your normal MT5 is unaffected.
 #>
 param(
   [Parameter(Mandatory = $true)][string]$WorkerSecret,
@@ -97,9 +101,9 @@ if ($ini -notmatch "\[Experts\]") {
 Ok "Algo trading enabled in terminal config"
 
 # ---------------------------------------------------------------- 4. Python packages + worker code
-Step "Installing Python packages (MetaTrader5, aiohttp, cryptography, numpy)"
+Step "Installing Python packages (MetaTrader5, aiohttp, cryptography, numpy, psutil)"
 & $PyExe -m pip install --disable-pip-version-check -q --upgrade pip | Out-Null
-& $PyExe -m pip install --disable-pip-version-check -q --upgrade MetaTrader5 aiohttp cryptography numpy
+& $PyExe -m pip install --disable-pip-version-check -q --upgrade MetaTrader5 aiohttp cryptography numpy psutil
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 & $PyExe -c "import MetaTrader5 as m; print('MetaTrader5', m.__version__)"
 
@@ -140,7 +144,7 @@ $watch = Join-Path $InstallDir "watchdog.ps1"
 `$hb = '$Data\heartbeat.txt'
 `$stale = `$true
 if (Test-Path `$hb) { `$stale = ((Get-Date) - (Get-Item `$hb).LastWriteTime).TotalSeconds -gt 180 }
-`$alive = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { `$_.CommandLine -like '*main.py*' }
+`$alive = Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object { `$_.CommandLine -like '*\worker\main.py*' }
 if (`$stale -or -not `$alive) {
   "`$(Get-Date -Format o) watchdog restart (stale=`$stale alive=`$([bool]`$alive))" | Add-Content '$Logs\watchdog.log'
   Stop-ScheduledTask -TaskName RapidBurstWorker -ErrorAction SilentlyContinue
@@ -150,7 +154,7 @@ if (`$stale -or -not `$alive) {
 }
 "@ | Set-Content -Path $watch -Encoding UTF8
 
-Step "Registering scheduled tasks (start at logon, auto-restart, 5-minute watchdog)"
+Step "Registering scheduled tasks (launcher at logon, auto-restart, 5-minute watchdog)"
 $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $act = New-ScheduledTaskAction -Execute $ps -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`""
 $trg = New-ScheduledTaskTrigger -AtLogOn -User $User
@@ -183,12 +187,13 @@ Start-ScheduledTask -TaskName "RapidBurstWorker"
 $hb = Join-Path $Data "heartbeat.txt"
 $okHb = $false
 for ($i = 0; $i -lt 24; $i++) { Start-Sleep 5; if ((Test-Path $hb) -and ((Get-Date) - (Get-Item $hb).LastWriteTime).TotalSeconds -lt 30) { $okHb = $true; break } }
-if ($okHb) { Ok "worker heartbeat is live" } else { Write-Warning "No heartbeat yet - check $Logs\worker-console.log" }
+if ($okHb) { Ok "launcher heartbeat is live (idle: no engine, no MT5 terminal running)" } else { Write-Warning "No heartbeat yet - check $Logs\worker-console.log" }
 $h = Invoke-RestMethod -Uri "$BackendUrl/healthz" -TimeoutSec 60
-if ($h.worker_online) { Ok "backend sees the worker ONLINE" } else { Write-Warning "backend does not see the worker yet (it retries automatically)" }
+if ($h.worker_online) { Ok "backend sees the launcher ONLINE" } else { Write-Warning "backend does not see the launcher yet (it connects when the app is opened)" }
 Remove-Item $Tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
-Write-Host "Done. Open $BackendUrl on your iPhone, unlock, tap CONNECT MT5 and enter your DEMO login/password/server." -ForegroundColor Green
+Write-Host "Done. Open $BackendUrl on your iPhone, unlock, tap CONNECT MT5 and enter your DEMO login/password/server, then START." -ForegroundColor Green
+Write-Host "MT5 and the trading engine run only between START and STOP. Keep this PC on and awake while trading." -ForegroundColor Green
 Write-Host "Logs: $Logs   Data: $Data   Tasks: RapidBurstWorker, RapidBurstWatchdog" -ForegroundColor Green
-if (-not $AutoLogonPassword) { Write-Host "Note: the worker runs in your Windows session. Disconnect RDP (do not sign out). After a reboot, log in once via RDP or re-run with -AutoLogonPassword." -ForegroundColor Yellow }
+if (-not $AutoLogonPassword) { Write-Host "Note: the launcher runs in your Windows session (starts at logon). On a VPS disconnect RDP instead of signing out; after a reboot log in once or re-run with -AutoLogonPassword." -ForegroundColor Yellow }

@@ -1,31 +1,19 @@
-"""Backend + worker protocol end-to-end test (local).
+"""Backend auth/static tests + backend<->launcher end-to-end with the REAL MT5 adapter.
 
-Runs the real backend and the real worker (Trader + MT5Broker + BackendLink) in
-one process. On this Linux box the official MetaTrader5 package cannot load, so
-the worker must honestly report that MT5 is unavailable and expose no account data.
+On this Linux box the official MetaTrader5 package cannot load, so the system must
+honestly report that and expose no account data.
 """
 import asyncio
-import base64
 import io
 import json
-import threading
-import time
 import zipfile
 
 import aiohttp
-from aiohttp.test_utils import TestServer
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
 
-from backend.server import make_app
-from rapidburst.broker_mt5 import MT5Broker
-from rapidburst.config import EngineConfig
-from rapidburst.link import BackendLink
-from rapidburst.secure_store import SecureStore
-from rapidburst.trader import Trader
+from backend.server import HUB
 
-UI_PW = "test-ui-password-123"
-SECRET = "test-worker-secret-0123456789abcdef"
+from rapidburst.launcher import Launcher, find_processes
+from tests.e2e_util import (SECRET, UI_PW, cmd, encrypt_creds, login, start_backend, state, wait_for)
 
 
 def run(coro):
@@ -40,9 +28,7 @@ async def _login(s, base, pw=UI_PW):
 
 def test_auth_and_static():
     async def go():
-        server = TestServer(make_app(UI_PW, SECRET))
-        await server.start_server()
-        base = str(server.make_url(""))
+        server, base = await start_backend()
         async with aiohttp.ClientSession() as s:
             assert (await s.get(base + "/healthz")).status == 200
             html = await (await s.get(base + "/")).text()
@@ -60,25 +46,22 @@ def test_auth_and_static():
             r = await s.post(base + "/api/cmd", json={"cmd": "start"},
                              headers={"Cookie": f"rb_session={cookie}", "X-RB": "1"})
             assert (await r.json())["ok"] is False
-            # csrf header required
             r = await s.post(base + "/api/cmd", json={"cmd": "stop"}, headers={"Cookie": f"rb_session={cookie}"})
             assert r.status == 403
-            # forged session
             r = await s.get(base + "/api/state", headers={"Cookie": "rb_session=9999999999.abc.def"})
             assert r.status == 401
-            # worker endpoints need the secret
             assert (await s.get(base + "/bootstrap/worker.zip")).status == 401
             r = await s.get(base + "/bootstrap/worker.zip", headers={"X-Worker-Secret": SECRET})
             z = zipfile.ZipFile(io.BytesIO(await r.read()))
-            assert "main.py" in z.namelist() and "rapidburst/trader.py" in z.namelist()
+            names = z.namelist()
+            assert "main.py" in names and "engine_main.py" in names and "rapidburst/launcher.py" in names
             ps1 = await (await s.get(base + "/bootstrap/install.ps1")).text()
-            assert base.rstrip("/") in ps1 and SECRET not in ps1
+            assert base in ps1 and SECRET not in ps1
             try:
                 await s.ws_connect(base.replace("http", "ws") + "/worker/ws", headers={"Authorization": "Bearer nope"})
                 assert False, "bad worker secret accepted"
             except aiohttp.WSServerHandshakeError as e:
                 assert e.status == 401
-            # brute-force limit
             for _ in range(8):
                 await _login(s, base, "bad")
             st, _ = await _login(s, base)
@@ -87,56 +70,35 @@ def test_auth_and_static():
     run(go())
 
 
-def test_worker_link_end_to_end_reports_mt5_unavailable_honestly(tmp_path):
+def test_launcher_with_real_mt5_adapter_reports_unavailable_honestly(tmp_path):
     async def go():
-        server = TestServer(make_app(UI_PW, SECRET))
-        await server.start_server()
-        base = str(server.make_url("")).rstrip("/")
-        trader = Trader(MT5Broker(), SecureStore(str(tmp_path)), EngineConfig(), str(tmp_path))
-        th = threading.Thread(target=trader.run_forever, daemon=True)
-        th.start()
-        link = BackendLink(trader, base, SECRET, str(tmp_path / "hb.txt"))
-        task = asyncio.create_task(link.run())
-        hub = server.app["hub"]
-        for _ in range(100):
-            if hub.worker_online() and hub.snapshot:
-                break
-            await asyncio.sleep(0.1)
-        assert hub.worker_online()
+        server, base = await start_backend()
+        hub = server.app[HUB]
+        L = Launcher(base, SECRET, str(tmp_path), wake_url="", standby_timeout=5)
+        task = asyncio.create_task(L.run())
+        assert await wait_for(lambda: hub.worker_online() and hub.snapshot)
         async with aiohttp.ClientSession() as s:
-            _, cookie = await _login(s, base)
-            H = {"Cookie": f"rb_session={cookie}", "X-RB": "1"}
-            st = await (await s.get(base + "/api/state", headers=H)).json()
+            H = await login(s, base)
+            st = await state(s, base, H)
             snap = st["snapshot"]
-            assert st["worker_online"] is True
-            assert snap["conn"]["state"] == "UNAVAILABLE" and "MetaTrader5 package unavailable" in snap["conn"]["msg"]
-            assert snap["account"] is None and snap["pnl"] is None and snap["positions"] == []
-            assert snap["worker"]["mt5_package"] is False
-            # UI encrypts credentials with the worker public key (same as WebCrypto RSA-OAEP/SHA-256)
-            pub = serialization.load_der_public_key(base64.b64decode(snap["pubkey"]))
-            ct = pub.encrypt(json.dumps({"login": "1234567", "password": "never-log-me", "server": "Demo-Server"}).encode(),
-                             padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
-            r = await (await s.post(base + "/api/cmd", headers=H,
-                                    json={"cmd": "connect", "args": {"enc": base64.b64encode(ct).decode()}})).json()
+            assert snap["conn"]["state"] == "IDLE" and snap["account"] is None
+            assert snap["launcher"]["engine_pid"] is None
+            assert not find_processes(cmd_marker="engine_main.py")
+            # START without credentials is refused, nothing spawned
+            r = await cmd(s, base, H, "start")
+            assert not r["ok"]
+            enc = encrypt_creds(snap["pubkey"], "1234567", "never-log-me", "Demo-Server")
+            r = await cmd(s, base, H, "connect", {"enc": enc})
             assert r["ok"] is False and "MetaTrader5 package unavailable" in r["msg"]
-            r = await (await s.post(base + "/api/cmd", headers=H, json={"cmd": "start"})).json()
+            snap = (await state(s, base, H))["snapshot"]
+            assert snap["launcher"]["last_connect"]["validation_ok"] is False
+            r = await cmd(s, base, H, "start")
             assert r["ok"] is False and "START refused" in r["msg"]
-            r = await (await s.post(base + "/api/cmd", headers=H, json={"cmd": "search", "args": {"q": "XAU"}})).json()
-            assert r["ok"] is False and r["symbols"] == []
-            r = await (await s.post(base + "/api/cmd", headers=H, json={"cmd": "stop"})).json()
-            assert "not connected" in r["msg"]
-            await asyncio.sleep(1.5)
-            st = await (await s.get(base + "/api/state", headers=H)).json()
-            assert st["snapshot"]["conn"]["state"] == "UNAVAILABLE"
-            assert st["snapshot"]["account"] is None
-            blob = json.dumps(st)
+            # standby engine is shut down by itself (no START) -> back to zero processes
+            assert await wait_for(lambda: not find_processes(cmd_marker="engine_main.py"), 20)
+            assert await wait_for(lambda: L.phase == "IDLE", 10)
+            blob = json.dumps(await state(s, base, H)) + json.dumps(list(L.logs))
             assert "never-log-me" not in blob
-            assert all("never-log-me" not in l["msg"] for l in trader.logs)
-            # UI websocket receives live state
-            async with s.ws_connect(base.replace("http", "ws") + "/api/ws", headers={"Cookie": H["Cookie"]}) as ws:
-                m = await ws.receive_json(timeout=5)
-                assert m["type"] == "state" and m["worker_online"] is True
         task.cancel()
-        trader.stop_event.set()
         await server.close()
     run(go())

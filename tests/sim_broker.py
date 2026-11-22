@@ -94,6 +94,7 @@ class SimBroker:
 
     def shutdown(self):
         self.connected_flag = False
+        self.shutdown_calls = getattr(self, "shutdown_calls", 0) + 1
 
     def is_connected(self):
         return self.connected_flag and not self.drop
@@ -121,6 +122,12 @@ class SimBroker:
 
     def symbol_info(self, s):
         return dict(self.spec, name=s) if s in self.series else {}
+
+    def last_tick(self, s):
+        tk = self._tick(s)
+        if not tk or not self.is_connected():
+            return {}
+        return {"time": int(tk[0]), "time_msc": int(round(tk[0] * 1000)), "bid": tk[1], "ask": tk[2]}
 
     def ticks_since(self, s, last_msc, max_count=2000):
         if not self.is_connected():

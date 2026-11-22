@@ -1,0 +1,13 @@
+launcher pid 32628
+IDLE 60s: cpu 0.020s (0.03%), rss 50.9 MB, threads 2, children 0, engines 0
+after linger, worker_online = False
+woken via ntfy.sh in 0.2s
+idle snapshot: {'state': 'IDLE', 'msg': 'Trading engine stopped - no MT5 terminal or engine running', 'terminal_connected': False, 'algo_trading': False, 'ping_ms': None} account None launcher phase IDLE mt5_package False
+START without credentials: {'ok': False, 'msg': 'START refused: MT5 connection/validation not confirmed - use CONNECT MT5 first'}
+CONNECT: False MetaTrader5 package unavailable on this machine (ModuleNotFoundError: No module named 'MetaTrader5')
+engines right after CONNECT: 1
+START after failed validation: {'ok': False, 'msg': 'START refused: MT5 connection/validation not confirmed - use CONNECT MT5 first'}
+engines 20s later (standby timeout 15s): 0
+STOP: {'ok': False, 'msg': 'STOP: MT5 not connected - entries blocked; positions keep server-side SL. Engine will be shut down; press STOP again when MT5 is reachable to verify.'}
+engines after STOP: 0
+last logs: ['Trading engine 1.0.0 started on grok-bot-vm-532988997 (pid 33276)', 'Engine process started (pid 33276)', "MetaTrader5 package unavailable on this machine (ModuleNotFoundError: No module named 'MetaTrader5')", 'STOP - new entries blocked (was not running)', 'STOP: MT5 not connected - entries blocked; positions keep server-side SL', 'STOP: MT5 unreachable, bot positions cannot be verified - shutting the engine down; any bot positions keep their server-side SL/TP. Press STOP again when MT5 is reachable.', 'Engine shut down - MT5 connection released', 'Engine process 33276 ended (STOP gave up: MT5 unreachable)']
