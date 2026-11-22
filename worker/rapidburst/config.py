@@ -120,6 +120,24 @@ class EngineConfig:
     min_margin_level_pct: float = 300.0
     margin_use_max_pct: float = 30.0  # new order margin must be < x% of free margin
 
+    # --- BASKET mode (aggressive, user-accepted risk on the demo account): averaging + pyramiding + compounding ---
+    # All orders of one symbol/direction form ONE basket that closes together at a profit target (profit trailed).
+    # No tight SL, no wrong-way cut, no per-order BE/trail: the broker SL is a far disaster stop only.
+    basket_enabled: bool = True
+    max_margin_use_pct: float = 70.0     # RB_MAX_MARGIN_USE_PCT: total used margin <= x% of equity -> caps order count/size
+    basket_loss_pct: float = 30.0        # RB_BASKET_MAX_LOSS_PCT: basket floating loss >= x% of equity at basket start => close all
+    basket_target_pct: float = 2.0       # profit target of the whole basket, % of equity at basket start
+    basket_target_spread_mult: float = 3.0  # ... and never below x * the basket's round-trip spread cost
+    basket_trail_frac: float = 0.30      # once the target is reached: close when profit gives back this share of its peak
+    basket_max_orders: int = 8           # max orders per basket (also limited by the margin cap)
+    basket_avg_atr: float = 1.0          # add against the position every x * M1 ATR of adverse move (averaging)
+    basket_pyr_atr: float = 0.6          # add with the position every x * M1 ATR of favourable move + impulse (pyramiding)
+    basket_avg_mult: float = 1.0         # lot of an averaging add = base lot * x (1.0 = same lot; no martingale by default)
+    basket_add_cooldown: float = 3.0     # seconds between two adds of one basket
+    basket_min_margin_level: float = 150.0  # never add while margin level (%) is below this
+    basket_risk_pct: float = 3.0         # base lot compounds: first order loses x% of balance at the broker SL
+    basket_sl_atr: float = 10.0          # far broker SL per order = x * M1 ATR (disaster stop, not the exit)
+
     # --- loop ---
     loop_interval: float = 0.1
     snapshot_interval: float = 1.0
@@ -144,7 +162,10 @@ class EngineConfig:
                 pass
         for env, key in (("RB_BROKER_SL", "broker_sl"), ("RB_EMERGENCY_SL", "emergency_sl"),
                          ("RB_DAILY_LOSS_PCT", "daily_loss_limit_pct"), ("RB_MAX_DD_PCT", "equity_drawdown_pct"),
-                         ("RB_LEARNING_ENABLED", "learning_enabled")):
+                         ("RB_LEARNING_ENABLED", "learning_enabled"),
+                         ("RB_BASKET_ENABLED", "basket_enabled"), ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"),
+                         ("RB_BASKET_MAX_LOSS_PCT", "basket_loss_pct"), ("RB_BASKET_TARGET_PCT", "basket_target_pct"),
+                         ("RB_BASKET_MAX_ORDERS", "basket_max_orders"), ("RB_BASKET_AVG_MULT", "basket_avg_mult")):
             if os.environ.get(env, "").strip():
                 data[key] = os.environ[env]
         names = {f.name for f in fields(cls)}

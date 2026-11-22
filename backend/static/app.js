@@ -155,6 +155,17 @@
     }).join("") : `<div class="muted small">${eng.halted ? esc(eng.halt_reason) : "Engine idle"}</div>`;
     const rc = eng.risk_config;
     if (rc) $("engine").insertAdjacentHTML("beforeend", `<div class="tiny muted rc">Active limits: broker SL ${rc.broker_sl} (${esc(rc.sl_rule || "")}) · exposure ≤ ${rc.max_total_notional_x}× equity · risk/trade ${rc.risk_per_trade_pct}% · min-lot floor (no minimum balance; max orders now ${rc.tier_legs_now}, tiers ${rc.batch_tiers}) · open risk ≤ ${rc.max_total_risk_pct}% · daily loss ${rc.daily_loss_limit_pct ? rc.daily_loss_limit_pct + "%" : "OFF"} · drawdown stop ${rc.equity_drawdown_pct ? rc.equity_drawdown_pct + "%" : "OFF"} · batch loss cap ${rc.batch_max_loss_pct}% · batch ${rc.batch} orders, TP ${rc.batch_tp_units} vu, max hold ${rc.batch_max_hold_s}s, cooldown ${rc.batch_cooldown_s}s · entry |score| ≥ ${rc.entry_threshold} (counter-trend ≥ ${rc.countertrend_min_score}) · ≥ ${rc.min_tick_rate} ticks/s · spread ≤ ${rc.max_spread_bps} bp</div>`);
+    const bk = eng.baskets;
+    if (bk && bk.enabled) {
+      const its = Object.entries(bk.items || {});
+      const rowB = ([k, x]) => `<div class="tiny"><b>${esc(x.symbol)} ${esc(x.side)}</b> basket ${esc(k)} · ${x.orders}/${bk.max_orders} orders · ${fmt(x.volume, 2)} lots · ` +
+        `floating <b class="${x.net >= 0 ? "pos-v" : "neg-v"}">${x.net > 0 ? "+" : ""}${fmt(x.net)}</b> · target +${fmt(x.target)}` +
+        (x.armed ? ` · <span class="pos-v">trailing: peak +${fmt(x.peak)}, closes ≤ +${fmt(x.trail_floor)}</span>` : "") +
+        ` · loss stop −${fmt(x.loss_limit)} (${bk.loss_pct}% of equity at start ${fmt(x.eq0)}) · adds ${x.adds}</div>`;
+      $("engine").insertAdjacentHTML("beforeend", `<details class="small" open><summary>🧺 Baskets: margin used ${bk.margin_used ?? "—"} / cap ${bk.margin_cap ?? "—"} (${bk.margin_use_pct ?? "—"}% of equity, max ${bk.max_margin_use_pct}%)</summary>` +
+        (its.length ? its.map(rowB).join("") : `<div class="tiny muted">no open basket</div>`) +
+        `<div class="tiny muted">Orders average against / pyramid with the move, all close together at +${bk.target_pct}% of equity with profit trailed (${Math.round(bk.trail_frac * 100)}% give-back); no tight SL (far broker SL only). Higher risk by choice.</div></details>`);
+    }
     const lr = eng.learning;
     if (lr) {
       const row = (r) => `<div class="tiny">${esc(r.bucket)} · n ${r.n} · win ${Math.round(r.win * 100)}% · exp ${r.exp_r >= 0 ? "+" : ""}${r.exp_r}R · <b>${esc(r.state)}</b></div>`;

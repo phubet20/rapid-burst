@@ -724,6 +724,8 @@ class Trader:
             reason = None
             if self.risk.halted:
                 reason = f"risk halt: {self.risk.halt_reason}"
+            elif self._is_basket(key):
+                reason = self._basket_exit(key, legs, live)       # whole basket together: target+trail / loss stop
             else:
                 reason = self._hard_close(legs, live, f)          # software stop: needs no warm-up
                 if not reason and self.running and eng is not None:
@@ -825,8 +827,8 @@ class Trader:
         cfg = self.cfg
         for t, ps in self.pos_state.items():
             p = live.get(t)
-            if p is None:
-                continue
+            if p is None or self._is_basket(ps.batch_id):
+                continue                  # basket legs have no per-order BE/trail: the basket is trailed as a whole
             eng = self.engines.get(ps.symbol)
             f = eng.features(self._server_now(ps.symbol, now_wall)) if eng is not None else None
             px = self._exec_px(ps, p, f, now_wall)
@@ -977,6 +979,8 @@ class Trader:
             self.sym_status[s] = status
             tr = self.trends.get(s)
             status["trend"] = tr.brief() if tr else None
+            if cfg.basket_enabled and self._basket_step(s, eng, info, sig, status, now_wall):
+                continue
             if sig.action == "HOLD":
                 self._skip(s, status, sig.reason, now_wall)
                 continue
@@ -1049,7 +1053,235 @@ class Trader:
                 if not learn.allow and mode != "pyramid":      # adds to an SL-locked winner are never gated
                     self._skip(s, status, learn.why, now_wall, sig)
                     continue
+            if cfg.basket_enabled:
+                self._basket_order(s, sig.action, "open", sig, info, now_wall, status, batch_id, learn)
+                continue
             self._enter_batch(s, sig, info, acct, open_pos, now_wall, status, n, risk_mult, batch_id, mode, learn)
+
+    # ------------------------------------------------------------- BASKET mode
+    def _tv(self, s: str) -> tuple[float, float]:
+        info = self.sym_info.get(s) or {}
+        return (float(info.get("trade_tick_size", 0) or 0),
+                float(info.get("trade_tick_value_loss", 0) or info.get("trade_tick_value", 0) or 0))
+
+    def _is_basket(self, key: str) -> bool:
+        return bool((self.bursts.get(key) or {}).get("basket"))
+
+    def _margin_used(self) -> float:
+        eq = float(self.account.get("equity", 0) or 0)
+        m = float(self.account.get("margin", 0) or 0)
+        return m if m > 0 else max(0.0, eq - float(self.account.get("margin_free", 0) or 0))
+
+    def _basket_metrics(self, key: str, legs: list, live: dict) -> dict:
+        """Net floating P/L of the whole basket, its profit target, trail floor and loss-stop level."""
+        cfg = self.cfg
+        b = self.bursts.get(key) or {}
+        sym = legs[0].symbol
+        net = 0.0
+        for ps in legs:
+            p = live.get(ps.ticket) or {}
+            net += float(p.get("profit", 0.0)) + float(p.get("swap", 0.0)) + float(p.get("commission", 0.0) or 0.0)
+        eq0 = float(b.get("eq0") or self.account.get("equity", 0) or 0)
+        vol = sum(ps.volume for ps in legs)
+        ts, tv = self._tv(sym)
+        eng = self.engines.get(sym)
+        spread = float(eng.last.spread) if eng is not None and getattr(eng, "last", None) is not None else 0.0
+        spread_cost = spread / ts * tv * vol if ts and tv else 0.0
+        target = max(eq0 * cfg.basket_target_pct / 100.0, cfg.basket_target_spread_mult * spread_cost)
+        loss_limit = max(eq0 * cfg.basket_loss_pct / 100.0, 4.0 * spread_cost)
+        peak = float(b.get("peak", 0.0))
+        floor = max(peak * (1.0 - cfg.basket_trail_frac), 0.5 * target) if b.get("armed") else None
+        return {"net": round(net, 2), "eq0": round(eq0, 2), "target": round(target, 2), "loss_limit": round(loss_limit, 2),
+                "peak": round(peak, 2), "armed": bool(b.get("armed")), "trail_floor": round(floor, 2) if floor is not None else None,
+                "orders": len(legs), "volume": round(vol, 4), "spread_cost": round(spread_cost, 4)}
+
+    def _basket_exit(self, key: str, legs: list, live: dict) -> Optional[str]:
+        """Close the whole basket together: profit target with a trailed profit, or the moderate basket loss stop."""
+        b = self.bursts.get(key)
+        if b is None:
+            return None
+        m = self._basket_metrics(key, legs, live)
+        net = m["net"]
+        if net <= -m["loss_limit"]:
+            return (f"basket loss stop: {net:+.2f} <= -{m['loss_limit']:.2f} "
+                    f"({self.cfg.basket_loss_pct:g}% of equity at basket start {m['eq0']:.2f})")
+        if net >= m["target"]:
+            b["armed"] = True
+        if b.get("armed"):
+            b["peak"] = max(float(b.get("peak", 0.0)), net)
+            floor = max(b["peak"] * (1.0 - self.cfg.basket_trail_frac), 0.5 * m["target"])
+            if net <= floor:
+                return (f"basket profit trail: {net:+.2f} fell back to <= {floor:.2f} "
+                        f"(peak {b['peak']:+.2f}, target {m['target']:.2f})")
+        return None
+
+    def _basket_step(self, s: str, eng, info: dict, sig, status: dict, now_wall: float) -> bool:
+        """Manage adds of an existing basket on s. Returns True when a basket exists (normal entry path skipped)."""
+        cfg = self.cfg
+        mine = [ps for ps in self.pos_state.values() if ps.symbol == s]
+        if not mine:
+            return False
+        if not self.running or self.risk.halted:
+            return True
+        side = mine[0].side
+        if any(ps.side != side for ps in mine):
+            self._skip(s, status, f"{sig.action} skipped: opposite order open", now_wall, sig)
+            return True
+        bid_ = mine[0].batch_id or uuid.uuid4().hex[:6]
+        b = self.bursts.get(bid_)
+        if b is None or not b.get("basket"):
+            return True                      # an old-style batch (adopted): handled by the legacy exit logic
+        if len(mine) >= cfg.basket_max_orders:
+            self._skip(s, status, f"basket full: {len(mine)}/{cfg.basket_max_orders} orders", now_wall, sig)
+            return True
+        wait = float(b.get("last_add", 0.0)) + cfg.basket_add_cooldown - now_wall
+        if wait > 0:
+            self._skip(s, status, f"basket add cooldown {wait:.0f}s", now_wall, sig)
+            return True
+        atr, _ = self._atr(s)
+        f = eng.features(self._server_now(s, now_wall))
+        xq = self._exec_quote(s, now_wall)
+        mid = (xq[0] + xq[1]) / 2.0 if xq else f.mid
+        d = 1 if side == "BUY" else -1
+        last_mid = float(b.get("last_mid") or mine[-1].open_price)
+        adverse = (last_mid - mid) * d                      # > 0: price is against the basket
+        spacing = lambda mult: max(mult * atr, 3.0 * f.spread)   # noqa: E731
+        if not atr:
+            self._skip(s, status, "basket: no ATR yet", now_wall, sig)
+            return True
+        kind = None
+        if adverse >= spacing(cfg.basket_avg_atr):
+            kind = "avg"
+        elif -adverse >= spacing(cfg.basket_pyr_atr) and sig.action == side:
+            tr = self.trends.get(s)
+            if relation(tr, side) == "counter":
+                self._skip(s, status, f"pyramid skipped: against the trend", now_wall, sig)
+                return True
+            kind = "pyramid"
+        if kind is None:
+            status["reason"] = (f"basket {side} {len(mine)} order(s): waiting (adverse {adverse:+.2f}, "
+                                f"avg at {spacing(cfg.basket_avg_atr):.2f}, pyramid at -{spacing(cfg.basket_pyr_atr):.2f})")
+            return True
+        self._basket_order(s, side, kind, sig, info, now_wall, status, batch_id=bid_)
+        return True
+
+    def _basket_order(self, s: str, side: str, kind: str, sig, info: dict, now_wall: float, status: dict,
+                      batch_id: str, learn=None) -> bool:
+        """One market order of a basket (kind open|avg|pyramid): compounding base lot, far broker SL, no TP.
+        Refused when the total used margin would exceed max_margin_use_pct of equity (or margin level < floor)."""
+        cfg = self.cfg
+        eng = self.engines[s]
+        f = eng.features(self._server_now(s, now_wall))
+        d = 1 if side == "BUY" else -1
+        point = float(info["point"])
+        vmin, vmax, vstep = float(info["volume_min"]), float(info["volume_max"]), float(info["volume_step"])
+        ts, tv = self._tv(s)
+        atr, _ = self._atr(s)
+        stops = (int(info.get("trade_stops_level", 0)) + 5) * point
+        sl_dist = max(stops, cfg.basket_sl_atr * atr if atr else 2.0 * cfg.sl_vol_units * f.vol_unit, 3.0 * f.spread)
+        price = f.ask if side == "BUY" else f.bid
+        eq = float(self.account.get("equity", 0) or 0)
+        bal = float(self.account.get("balance", 0) or 0) or eq
+        b = self.bursts.get(batch_id)
+        cap = eq * cfg.max_margin_use_pct / 100.0
+        used = self._margin_used()
+        ml = float(self.account.get("margin_level", 0) or 0)
+        n_live = sum(1 for ps in self.pos_state.values() if ps.batch_id == batch_id)
+
+        def refuse(why: str) -> bool:
+            if kind == "open":
+                self.pacer.on_entry(s, now_wall)
+            self._skip(s, status, f"{sig.action} {kind} blocked: {why}", now_wall, sig)
+            return False
+
+        if cfg.basket_min_margin_level and 0 < ml < cfg.basket_min_margin_level:
+            return refuse(f"margin level {ml:.0f}% < {cfg.basket_min_margin_level:.0f}%")
+        if b is not None and b.get("lot0") and kind != "open":
+            lot0 = float(b["lot0"])
+        else:                                      # compounding: lot follows the balance, planned basket fits the margin cap
+            lot = (bal * cfg.basket_risk_pct / 100.0) / (sl_dist / ts * tv) if ts and tv and sl_dist else vmin
+            m_min = self.broker.calc_margin(side, s, vmin, price)
+            if m_min is None:
+                return refuse("margin calc unavailable")
+            if m_min > 0:
+                lot = min(lot, cap / (cfg.basket_max_orders * m_min / vmin))
+            lot0 = normalize_volume(min(max(lot, vmin), cfg.max_lot_per_order, vmax), vmin, vmax, vstep) or vmin
+        vol = lot0 * (cfg.basket_avg_mult if kind == "avg" else 1.0)
+        vol = normalize_volume(min(max(vol, vmin), cfg.max_lot_per_order, vmax), vmin, vmax, vstep) or vmin
+        margin = self.broker.calc_margin(side, s, vol, price)
+        if margin is None:
+            return refuse("margin calc unavailable")
+        if used + margin > cap and vol > vmin:      # shrink to what the cap allows (never below the minimum lot)
+            room = max(0.0, cap - used)
+            vol = normalize_volume(max(vmin, vol * room / margin), vmin, vmax, vstep) or vmin
+            margin = self.broker.calc_margin(side, s, vol, price)
+            if margin is None:
+                return refuse("margin calc unavailable")
+        if used + margin > cap:
+            return refuse(f"margin use cap: {used:.2f} + {margin:.2f} > {cfg.max_margin_use_pct:g}% of equity ({cap:.2f})")
+        sl = price - d * sl_dist if cfg.broker_sl else 0.0
+        comment = f"{cfg.comment_prefix}-{batch_id}-{uuid.uuid4().hex[:4]}"[:31]
+        self.pacer.inflight.add(s)
+        try:
+            r = self.broker.market_order(s, side, vol, sl, 0.0, self._deviation(s, f.spread, f.vol_unit), cfg.magic, comment)
+        finally:
+            self.pacer.inflight.discard(s)
+        if not r.get("ok"):
+            self.add_log("WARNING", f"BASKET {kind.upper()} {side} {vol} {s} rejected: {r.get('msg')}")
+            if "not found" in str(r.get("msg")):
+                self.unverified_entry = r["msg"]
+                self.running = False
+                self._save_state()
+            if kind == "open":
+                self.pacer.on_entry(s, now_wall)
+            self._skip(s, status, f"{sig.action} {kind} blocked: rejected: {r.get('msg')}", now_wall, sig)
+            if b is not None:
+                b["last_add"] = now_wall
+            return False
+        fill = float(r["price"])
+        slip = (fill - float(r["req_price"])) * d / point
+        self.slippage.setdefault(s, deque(maxlen=10)).append((now_wall, max(0.0, slip * point / max(f.vol_unit, point))))
+        ticket = int(r["ticket"])
+        self.pos_state[ticket] = PositionState(ticket=ticket, symbol=s, side=side, volume=float(r["volume"]),
+                                               open_price=fill, open_time=now_wall, sl=sl, tp=0.0, entry_vu=f.vol_unit,
+                                               reason=f"basket-{kind}: {sig.reason}", batch_id=batch_id,
+                                               hard_dist=sl_dist * cfg.hard_close_mult, peak_pl=-abs(f.spread))
+        risk_money = float(r["volume"]) / 1.0 * (sl_dist / ts * tv if ts and tv else 0.0)
+        if b is None:
+            b = self.bursts.setdefault(batch_id, {"symbol": s, "side": side, "opened": now_wall, "mode": "basket",
+                                                  "realized": 0.0, "legs": 0, "basket": True, "eq0": eq, "peak": 0.0,
+                                                  "armed": False, "adds": 0, "lot0": lot0})
+        b["legs"] = int(b.get("legs", 0)) + 1
+        b["lot"] = float(r["volume"])
+        b["risk"] = float(b.get("risk", 0.0)) + risk_money
+        b["last_mid"] = fill - d * f.spread / 2.0
+        b["last_add"] = now_wall
+        if kind != "open":
+            b["adds"] = int(b.get("adds", 0)) + 1
+        else:
+            self.pacer.on_entry(s, now_wall)
+            if learn is not None:
+                tr_ = self.trends.get(s)
+                imp_ = self.impulse.get(s)
+                atr_, _ = self._atr(s)
+                b.update(bucket=getattr(learn, "bucket", ""), type=("impulse" if sig.reason.startswith("impulse") else "momentum"),
+                         rel=status.get("trend_rel"), regime=vol_regime(f.spread, atr_), hour=time.gmtime(now_wall).tm_hour,
+                         learn_state=learn.state,
+                         comps={"score": round(sig.score, 3), "impulse": round(imp_.strength, 3) if imp_ and imp_.dir else 0.0,
+                                "pressure": round(f.pressure, 3), "vel": round(f.d_fast, 3), "breakout": f.breakout,
+                                "trend": round(tr_.dir * tr_.strength, 2) if tr_ and tr_.known else 0.0,
+                                "spread_atr": round(f.spread / atr_, 3) if atr_ else None})
+        dg = int(info["digits"])
+        self.add_log("INFO", f"BASKET {kind.upper()} {side} {r['volume']} {s} @ {fill} #{ticket} basket {batch_id} "
+                             f"order {n_live + 1}/{cfg.basket_max_orders} score {sig.score:+.2f} [{sig.reason}] "
+                             f"broker SL {format(sl, '.%df' % dg) if sl else 'OFF'} (far, {sl_dist:.{dg}f}) no TP; "
+                             f"margin used {used + margin:.2f}/{cap:.2f} ({cfg.max_margin_use_pct:g}% of equity) "
+                             f"slip {slip:+.0f}pt {r.get('latency', 0)*1000:.0f}ms")
+        self._decision(s, side, sig.score, f"BASKET {kind.upper()} order {n_live + 1} (lot {r['volume']}, margin {used + margin:.2f}/{cap:.2f})")
+        status["reason"] = f"basket {batch_id}: {n_live + 1} order(s) {side}"
+        self._refresh_account()
+        self._save_state()
+        return True
 
     def _entry_signal(self, s: str, eng, now: float):
         """Impulse detector first (fastest), the momentum score as fallback. Same safety gates."""
@@ -1443,6 +1675,7 @@ class Trader:
                        "selected": self.selected, "live_allowed": self.allow_live,
                        "bursts": {k: {kk: v.get(kk) for kk in ("symbol", "side", "mode", "legs")}
                                   for k, v in self.bursts.items()},
+                       "baskets": self._basket_view(),
                        "decisions": list(self.decisions)[-15:],
                        "learning": dict(self.learner.summary(), last=self.learn_view),
                        "risk_config": self._risk_view()},
@@ -1457,6 +1690,24 @@ class Trader:
         }
         with self.lock:
             self.snapshot = snap
+
+    def _basket_view(self) -> dict:
+        c = self.cfg
+        eq = float(self.account.get("equity", 0) or 0) if self.conn_state == "CONNECTED" else 0.0
+        live = {int(p["ticket"]): p for p in self.own_positions} if self.conn_state == "CONNECTED" else {}
+        items = {}
+        for k, b in self.bursts.items():
+            if not b.get("basket"):
+                continue
+            legs = [ps for ps in self.pos_state.values() if ps.batch_id == k and ps.ticket in live]
+            if legs:
+                items[k] = dict(self._basket_metrics(k, legs, live), symbol=b.get("symbol"), side=b.get("side"),
+                                adds=int(b.get("adds", 0)))
+        used = self._margin_used() if eq else 0.0
+        return {"enabled": c.basket_enabled, "max_margin_use_pct": c.max_margin_use_pct, "loss_pct": c.basket_loss_pct,
+                "target_pct": c.basket_target_pct, "trail_frac": c.basket_trail_frac, "max_orders": c.basket_max_orders,
+                "margin_used": round(used, 2), "margin_use_pct": round(used / eq * 100, 1) if eq else None,
+                "margin_cap": round(eq * c.max_margin_use_pct / 100, 2) if eq else None, "items": items}
 
     def get_snapshot(self) -> dict:
         with self.lock:

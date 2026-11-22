@@ -218,6 +218,29 @@ shown in the Engine card together with the recent decisions and the active limit
 `RB_CONFIG_FILE`), e.g. `{"small_account_max_loss_pct": 3, "batch_max": 3, "daily_loss_limit_pct": 10}`.
 The UI cannot change risk limits.
 
+## Basket mode: averaging, pyramiding, compounding (aggressive - user-accepted risk, DEMO)
+
+Default ON (`RB_BASKET_ENABLED=0` returns to the old tight-SL burst/scalp behaviour). All orders of a symbol/direction
+form ONE basket:
+
+- **Entry**: the M1 impulse / momentum signal opens the first order. Further orders: **averaging** when price moves
+  `basket_avg_atr` (1.0) M1-ATR against the last order, **pyramiding** when it moves `basket_pyr_atr` (0.6) ATR in favour
+  and a same-direction impulse confirms (never against the trend). Same lot (`basket_avg_mult` = 1.0, no martingale),
+  `basket_add_cooldown` 3 s apart, at most `basket_max_orders` (8).
+- **Margin-use cap (70%)**: `RB_MAX_MARGIN_USE_PCT=70` - an order is refused when total used margin would exceed 70% of
+  equity (the lot is shrunk to fit first); adds also stop while margin level < 150%. This caps order count and size.
+- **Compounding**: the base lot follows the balance (first order loses `basket_risk_pct`=3% of balance at its broker SL,
+  limited so a full basket fits the margin cap); it grows as the balance grows.
+- **Exits** (whole basket together): closes at the profit target (`basket_target_pct` 2% of equity at basket start,
+  never below 3x the spread cost), then the **profit is trailed** (closes when it gives back 30% of its peak, floor 50% of
+  target). **Basket loss stop** `RB_BASKET_MAX_LOSS_PCT=30` (% of equity at basket start) - NOT 70% (70% is margin use).
+  No wrong-way cut, no tight initial SL, no per-order BE/trailing; each order has only a far broker SL
+  (`basket_sl_atr` 10 x M1 ATR) as a disaster stop.
+- The learner still records each closed basket (cold-start min-lot sizing no longer applies to baskets; a losing bucket
+  still blocks new baskets). UI: *Baskets* panel (floating P/L, target, trail floor, loss stop, margin used vs cap).
+
+This is high risk: averaging into a trend can reach the 30% loss stop or the far broker SL.
+
 ## Adaptive learning from real closed trades (learner.py)
 
 * Every fully closed bot burst is written to a journal (`learning.json` in the engine data dir):
