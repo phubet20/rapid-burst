@@ -148,7 +148,7 @@
       const trHtml = tr ? (tr.known ? ` <span class="tiny ${tr.dir > 0 ? "pos-v" : tr.dir < 0 ? "neg-v" : "muted"}">trend ${tr.dir > 0 ? "▲" : tr.dir < 0 ? "▼" : "▬"} ${esc(tr.label)}</span>`
                                     : ` <span class="tiny muted">trend ?</span>`) : "";
       const sk = v.skips && Object.keys(v.skips).length ? `<div class="tiny muted">why no trade (count): ${Object.entries(v.skips).map(([a, b]) => esc(a) + " " + b).join(" · ")}</div>` : "";
-      return `<div class="eng"><b>${esc(k)}</b>${mk}${trHtml} <span class="sig ${cls}">${esc(v.signal)}</span> score ${fmt(v.score, 2)} · ${esc(v.reason)}` + sk +
+      return `<div class="eng"><b>${esc(k)}</b>${mk}${trHtml} <span class="sig ${cls}">${esc(v.signal)}</span> score ${fmt(v.score, 2)} · <b>${v.signal === "HOLD" ? "waiting for: " : ""}</b>${esc(v.reason)}` + sk +
         `<div class="tiny muted">vel ${f.vel ?? "—"} acc ${f.acc ?? "—"} press ${f.press ?? "—"} brk ${f.brk ?? "—"} exp ${f.exp ?? "—"} z ${f.z ?? "—"} · spread ${v.spread_pts ?? "—"}pt · ${f.tps ?? "—"} t/s · tick ${v.tick_age ?? "—"}s ago</div></div>`;
     }).join("") : `<div class="muted small">${eng.halted ? esc(eng.halt_reason) : "Engine idle"}</div>`;
     const rc = eng.risk_config;

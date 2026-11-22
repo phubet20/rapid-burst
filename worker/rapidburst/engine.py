@@ -188,7 +188,8 @@ class MomentumEngine:
         f.t, f.mid, f.bid, f.ask, f.spread = last.t, last.mid, last.bid, last.ask, last.spread
         span = last.t - self.buf.ticks[0].t
         if len(self.buf) < cfg.min_ticks_warmup or span < cfg.warmup_seconds:
-            f.reason = f"warming up ({len(self.buf)} ticks, {span:.0f}s)"
+            f.reason = (f"warming up: {len(self.buf)}/{cfg.min_ticks_warmup} ticks, "
+                        f"{span:.0f}/{cfg.warmup_seconds:.0f}s of live data")
             self.last = f
             return f
         if now - last.t > cfg.max_tick_age:
@@ -367,7 +368,9 @@ class MomentumEngine:
             return f"exhaustion take-profit (+{profit_u:.1f}u)"
         if d * f.score <= -cfg.reversal_score:
             return f"reversal (score {f.score:+.2f})"
-        if profit_u <= -cfg.adverse_fade_units and d * f.d_fast < 0 and d * f.pressure < 0:
+        # the spread is already inside profit_u (executable price): only react to loss beyond it
+        spread_u = (f.spread / vu) if vu else 0.0
+        if profit_u <= -(cfg.adverse_fade_units + spread_u) and d * f.d_fast < 0 and d * f.pressure < 0:
             return f"adverse fade ({profit_u:+.1f}u, momentum against)"
         if held >= cfg.max_hold_seconds:
             return f"time stop {held:.0f}s ({profit_u:+.1f}u)"
