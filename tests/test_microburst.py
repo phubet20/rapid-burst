@@ -59,7 +59,7 @@ def test_strength_is_two_sided_and_explains_itself():
     lvl = EngineConfig().mb_scan_support
     assert st.scan["BUY"]["A"] >= lvl and max(st.scan["BUY"]["B"], st.scan["BUY"]["C"]) >= lvl
     assert st.reason.startswith("BUY") and "A" in st.reason
-    assert "pre-burst" in decide(_live(early=1), EngineConfig()).reason
+    assert "early-burst" in decide(_live(early=1), EngineConfig()).reason
     st2 = decide(_live(vel=-0.5, accel=-0.3, eff=-0.8, seq_run=-5, seq_consist=-0.8, burst_dir=-1, body=-0.3,
                        close_loc=0.1, breakout=-1, imbalance=-0.7, bidask=-0.7, chase_up=0.0, chase_dn=0.3,
                        origin_dn=90.0), EngineConfig())
@@ -132,9 +132,13 @@ def test_losing_basket_is_held_inside_the_hard_stop_until_the_move_clearly_turns
     assert exit_reason(_g(), _live(failed=-1), 1, -0.05, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None
     # reversal + structure failure + more evidence: closed
     r = exit_reason(_g(), _live(failed=-1, vel=-0.2, imbalance=-0.7, t=110.0), 1, -0.05, 2, 0.6, 0.5, 0.8, 0.0, cfg)
-    assert r and "directional reversal" in r, r
-    # deep against with momentum against: cut before the hard stop
+    assert r and "structure invalidated" in r, r
+    # t32u: deep against on momentum noise WITHOUT a structure break is held (the structure stop rules) ...
     r = exit_reason(_g(), _live(vel=-0.2, imbalance=-0.7, t=110.0, regime="normal"), 1, -0.45, 1, 0.0, 0.5, 0.8, 0.0, cfg)
+    assert r is None, r
+    # ... the legacy momentum cut only when explicitly re-enabled by tuning
+    r = exit_reason(_g(), _live(vel=-0.2, imbalance=-0.7, t=110.0, regime="normal"), 1, -0.45, 1, 0.0, 0.5, 0.8, 0.0,
+                    EngineConfig(mb_cut_frac=0.5))
     assert r and "momentum against" in r, r
 
 
@@ -161,7 +165,9 @@ def _session(tmp_path, ticks, cfg=None, balance=1000.0, mpl=100.0, t_end=None):
 def test_loop_enters_the_burst_with_sl_no_tp_and_exits_the_group(tmp_path):
     tr, br, inv, orders = _session(tmp_path, series_up(), t_end=T0 + 200)
     burst = [o for o in orders if T0 + 150 <= o["t"] <= T0 + 158]
-    assert burst and burst[0]["side"] == "BUY" and burst[0]["t"] - (T0 + 150) < 2.0, orders
+    # t32u: a losing pre-burst basket is now held to its structure stop instead of a momentum cut, so the burst
+    # basket goes in right after that stop (no hedging) - still within a few seconds of the burst start
+    assert burst and burst[0]["side"] == "BUY" and burst[0]["t"] - (T0 + 150) < 4.0, orders
     assert all(o["sl"] and o["tp"] == 0.0 for o in orders)                # broker SL, engine-driven exits
     assert inv.adds_into_loser == 0 and inv.opposite_while_open == 0
     exits = [l["msg"] for l in tr.logs if l["msg"].startswith("EXIT GROUP")]
@@ -227,13 +233,13 @@ def test_no_daily_loss_halt_and_safe_mode_defaults(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("RB_DAILY_LOSS_PCT", "3")                    # stale env var: ignored
     c = EngineConfig.load()
-    # t30u (owner request): aggressive compounding defaults, catastrophic-only safe mode
-    assert not hasattr(c, "daily_loss_limit_pct") and c.equity_drawdown_pct == 50.0
-    assert c.max_margin_use_pct == 90.0 and c.risk_per_batch_pct == 50.0 and c.max_total_risk_pct == 100.0
+    # t32u: ruin-avoiding defaults (10% basket, 25% total, safe mode 30% below the closed-balance peak)
+    assert not hasattr(c, "daily_loss_limit_pct") and c.equity_drawdown_pct == 30.0
+    assert c.max_margin_use_pct == 90.0 and c.risk_per_batch_pct == 10.0 and c.max_total_risk_pct == 25.0
     assert c.max_orders_per_batch == 8 and c.min_orders_per_batch == 2 and c.broker_sl
 
 
-def test_safe_mode_flattens_pauses_entries_and_keeps_running(tmp_path):
+def test_safe_mode_pauses_entries_keeps_stops_and_keeps_running(tmp_path):
     tr, br = make(tmp_path, {"BTCUSDm": series_up()})
     _small_account(br, balance=1000.0, margin_per_lot=100.0)
     _start(tr, br, T0 + 1)
@@ -241,8 +247,10 @@ def test_safe_mode_flattens_pauses_entries_and_keeps_running(tmp_path):
     tr.risk.halted, tr.risk.halt_reason, tr.risk.safe_until = True, "SAFE MODE: (test)", T0 + 10000
     n0 = len([l for l in tr.logs if l["msg"].startswith("ENTRY")])
     run(tr, br, T0 + 151.3, T0 + 200)
-    assert not br.positions_ and tr.running
+    # t32u: safe mode no longer flattens - open baskets keep their broker stops; only new entries pause
+    assert tr.running and all(p["sl"] for p in br.positions_.values())
     assert len([l for l in tr.logs if l["msg"].startswith("ENTRY")]) == n0
+    assert not any("SAFE MODE" in l["msg"] and "closed" in l["msg"] for l in tr.logs)
     assert "SAFE MODE" in tr.sym_status["BTCUSDm"]["reason"]
 
 

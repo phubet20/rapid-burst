@@ -52,6 +52,7 @@ class Learner:
         self.buckets: dict[str, dict] = {}
         self.journal: list[dict] = []
         self.total = 0
+        self.ind: dict[str, dict] = {}         # t32u: symbol -> indicator -> {"n", "s"} (vote x outcome R)
         self.load()
 
     # ------------------------------------------------------------ storage
@@ -59,6 +60,7 @@ class Learner:
         self.buckets = d.get("buckets", {})
         self.journal = d.get("journal", [])[-500:]
         self.total = int(d.get("total", len(self.journal)))
+        self.ind = d.get("ind", {}) if isinstance(d.get("ind", {}), dict) else {}
 
     def load(self) -> None:
         local = None
@@ -82,7 +84,7 @@ class Learner:
             self._apply(best)
 
     def dump(self) -> dict:
-        return {"buckets": self.buckets, "journal": self.journal[-500:], "total": self.total}
+        return {"buckets": self.buckets, "journal": self.journal[-500:], "total": self.total, "ind": self.ind}
 
     def save(self) -> None:
         data = json.dumps(self.dump())
@@ -133,6 +135,14 @@ class Learner:
             b["raw"] = int(b.get("raw", 0)) + 1
         else:
             self.buckets[k] = {"n": 1.0, "sr": r, "sr2": r * r, "w": 1.0 if r > 0 else 0.0, "t": now, "raw": 1}
+        votes = entry.get("ind_votes") or {}
+        if votes:
+            sym = str(entry.get("symbol", "?"))
+            tab = self.ind.setdefault(sym, {})
+            for name, v in votes.items():
+                c = tab.setdefault(name, {"n": 0, "s": 0.0})
+                c["n"] += 1
+                c["s"] += float(v) * r                 # vote toward the trade side x outcome (R): + = it helped
         self.journal.append(dict(entry, r=round(r, 3), ts=round(now, 1)))
         self.journal = self.journal[-500:]
         self.total += 1
@@ -160,6 +170,18 @@ class Learner:
         return Decision(True, False, 1.0, False, "neutral",
                         f"learning {key}: unproven (exp {mean:+.2f}R n {n:.1f}) - normal size")
 
+    def ind_weights(self, symbol: str, k: float = 1.5, prior: float = 10.0) -> dict:
+        """Learned confluence weights for a symbol: 1 + k * shrunk mean(vote x R), clamped to [0.3, 2.0].
+        Indicators whose vote kept matching winners weigh more; those that pointed into losers weigh less."""
+        out = {}
+        for name, c in (self.ind.get(symbol) or {}).items():
+            n = float(c.get("n", 0))
+            if n <= 0:
+                continue
+            mean = float(c.get("s", 0.0)) / (n + prior)
+            out[name] = max(0.3, min(2.0, 1.0 + k * mean))
+        return out
+
     def summary(self, now: float | None = None, top: int = 3) -> dict:
         rows = []
         for k in self.buckets:
@@ -172,4 +194,5 @@ class Learner:
         return {"trades": self.total, "buckets": len(rows), "top": rows[:top],
                 "bottom": [r for r in rows[::-1][:top] if r not in rows[:top]],
                 "min_samples": self.min_samples, "memory": self.remote_status,
+                "ind_weights": {sym: {k: round(v, 2) for k, v in self.ind_weights(sym).items()} for sym in self.ind},
                 "decay": "none (never reset)" if self.half_life <= 0 else f"half-life {self.half_life / 3600:g} h"}

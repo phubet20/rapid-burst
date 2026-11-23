@@ -56,6 +56,10 @@ def test_basket_break_even_then_dynamic_trailing_only_forward(tmp_path):
         assert live == sorted(live) and all(sls), (t, sls)
     trail_msgs = [m for m in msgs if m.startswith("SL #") and "trail" in m]
     assert any("momentum strong" in m for m in trail_msgs) or any("momentum normal" in m for m in trail_msgs)
+    t_end = series_up()[-1][0]
+    tr.cmd_stop()                                   # t32u: the trail still holds the trend at the end -> close it
+    br.advance(t_end + 0.5)
+    tr.step(t_end + 0.5)
     perf = tr._perf_view()
     assert perf["protection"]["baskets_with_be"] >= 1 and "entries_per_m1_bar" in perf
     assert perf["source"] == "real broker deals"     # here: the simulated broker's deals (test double)

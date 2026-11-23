@@ -250,7 +250,7 @@ def test_untradable_symbol_explains_why_and_select_revalidates(fake, tmp_path):
 
 
 def test_candles_feed_m1_m5_with_tick_volume(fake, tmp_path):
-    from rapidburst.mtf import TF, m5_bias
+    from rapidburst.mtf import TF, m1_trend
     b = mk(fake, tmp_path)
     ok, msg = b.connect(DEMO["login"], DEMO["password"], DEMO["server"], 20000)
     assert ok, msg
@@ -261,7 +261,7 @@ def test_candles_feed_m1_m5_with_tick_volume(fake, tmp_path):
     assert len(b.candles("BTCUSDm", "M5", 1.5)) == 24      # look-back sent as an integer (ceil)
     tf = TF(300)
     tf.load(m5, m5[-1]["time"] + 30)
-    assert m5_bias(tf.state(m5[-1]["time"] + 30))[0] > 0  # rising test bars -> up bias
+    assert m1_trend(tf.state(m5[-1]["time"] + 30))[0] > 0  # rising test bars -> up bias
     assert b.candles("NOPE", "M1", 1) == [] and b.candle_error   # unavailable -> empty, never synthesised
     b.shutdown()
 

@@ -47,7 +47,64 @@ Oracle Cloud Always Free and Google Cloud free tiers have no free Windows. AWS/A
 Windows VM for a limited period with a card on file (1 GB RAM is tight for MT5) – the same installer works
 there; nothing in this repo buys or starts cloud resources.
 
-## t30u: M1 Rapid Basket Scalper (current engine, refactored in place)
+## t32u: conflict fixes, indicator confluence, structure stop (current)
+
+Conflicts fixed (from the t31u live audit):
+- **Safe mode** measures drawdown from the **closed-balance peak** (min(balance, equity)), never a floating spike, and
+  only **pauses new entries**: open baskets keep their own structure/BE/trail stops. After the pause the first entry
+  needs a **fresh M1 structure confirmation** (swing break, or HH/HL / LH/LL with the trade). Last resort only:
+  equity `safe_flatten_pct` (60 %) below the session peak flattens bot positions and pauses 30 min, then restarts
+  from the new balance (no all-day stop).
+- **Losers are no longer cut on momentum noise** (`mb_cut_frac` 0 = off, the 180 s stale exit is off). A loser is held
+  inside its structure stop and closed early only when the structure is invalidated: the M1 swing is broken against
+  the basket, or micro-structure fails with a broad reversal against the M1 trend (or before M1 bars exist).
+- **All exits use the basket's money P/L** (broker profit + swap of every leg, including adds); the peak restarts after
+  an add (new average price).
+- **Adds only share the basket's BE/trail stop**; if that stop cannot be set that close to price the add is skipped.
+- **Trailing in an intact M1 trend is left to the trail** (no spike / exhaustion close unless the structure breaks).
+- **Never a single order**: if `min_orders_per_batch` (2) min lots do not fit the risk/margin budget the symbol is
+  skipped (with the reason shown) until equity grows.
+- **M1 trigger (D) is required** once M1 bars exist; entering into an M1 swing already broken against the side is
+  vetoed (the exit would invalidate it at once).
+- Per-symbol feed check: the allowed tick gap adapts to the symbol's own tick spacing (FX pairs tick less than BTC).
+- Dead M5 code and labels removed (`m5_bias`, the M5 series and poll, "M5 aligned" labels -> "M1 trend").
+
+Indicator confluence (indicators.py, family F), from real broker M1 candles + the live price, computed once per closed
+bar: EMA ribbon 8/13/21/34/55, session VWAP, Bollinger(20,2)/Keltner(20,1.5) squeeze + breakout, ADX/DI(14),
+Stochastic RSI(14,14,3), Supertrend(10,3), ATR(14)/ATR(50) regime, OBV slope, Donchian(20) break, Heikin-Ashi trend,
+pivot support/resistance. Votes are weighted per symbol by **learned weights** (learner.py `ind`: vote x outcome R of
+every real closed basket, persisted with the learning memory, never decays). Vetoes: confluence < `ind_min_score`
+against the side, entering within `ind_sr_near_atr` ATR of support/resistance without a breakout, chop (ADX < 18 with
+no breakout, or a squeeze without the break).
+
+Structure stop: beyond the last M1 swing low (BUY) / high (SELL) + spread + 0.1 ATR, clamped to 0.5-1.6 ATR, never
+inside the broker stops level or 3x spread; ATR stop when no swing is on that side. BE + dynamic trailing unchanged
+(every SL change verified on MT5).
+
+Risk defaults (all tunable at runtime): basket stop risk 10 % of equity (`risk_per_batch_pct`, scaled 0.6-1.0 by the
+score), all open stops <= 25 % (`max_total_risk_pct`), min-lot-floor accounts <= 15 %
+(`small_account_batch_risk_pct`), safe mode 30 % below the closed-balance peak. Why: the t30u 50 %/100 % limits lost
+the account twice in one day; at 10 %/25 % a run of 4-5 full stop-outs costs ~35-45 % instead of the whole account.
+With ~$56 equity two BTCUSDm min lots fit; XAUUSDm (often $3-4 of structure-stop risk per 0.01 lot) only trades when two min lots fit the 15 % budget, otherwise it is skipped with the reason shown.
+No martingale, no averaging down, no grid; re-entry stays immediate (no cooldown) and learning keeps every result.
+
+### Replay on REAL market data (tools/replay_real.py) - a replay, not live results
+Binance public data for 2026-11-23 (BKK): BTCUSDT aggTrades (<= 5 ticks/s) + 1m klines for BTCUSDm, 09:53-13:53;
+PAXGUSDT (gold-backed token, thin: ~1 trade / 3 s) for XAUUSDm, 05:53-13:53. Broker conditions MODELLED: spread
+BTC $6.0 / XAU $0.24 (as seen on the demo), fills at the quote 0.9 s after the send, Exness-like contract specs,
+1:2000 leverage, start equity $56.60. Same data, each version with its own default settings:
+
+| replay | baskets | win rate | profit factor | net | max drawdown (of peak) | safe-mode trips |
+|---|---|---|---|---|---|---|
+| BTC before (18f7c1a) | 114 | 44.7 % | 1.01 | +79.81 | 5,757.94 (97.7 %: peaked near $5.9k, ended $136) | 9 |
+| BTC after (t32u) | 114 | 65.8 % | 1.28 | +50.63 | 39.38 (26.9 %) | 0 |
+| XAU proxy before | 128 | 43.0 % | 0.84 | -52.23 | 77.37 (94.7 %) | 9 |
+| XAU proxy after | 35 | 54.3 % | 0.65 | -23.49 | 29.47 (48.3 %) | 3 |
+
+Read it honestly: one short window per symbol, a proxy for gold, modelled costs; it says nothing certain about future
+results. The gold proxy still lost - small accounts on XAU min lots carry large per-order risk.
+
+## t30u: M1 Rapid Basket Scalper (base engine, refactored in place)
 
 Owner request (t30u): faster, M1 only, continuous baskets, no risk-amount limits. Changes on top of the engine
 described below:

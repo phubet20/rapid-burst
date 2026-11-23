@@ -4,7 +4,7 @@ import math
 
 from rapidburst.config import EngineConfig
 from rapidburst.microburst import Micro, decide, exit_reason
-from rapidburst.mtf import MTFView, TF, TFState, m1_timing, m5_bias
+from rapidburst.mtf import MTFView, TF, TFState, m1_timing, m1_trend
 from tests.harness import make, run
 from tests.paths import T0, _force_signal, _small_account, _start, series_up
 
@@ -55,25 +55,25 @@ def test_broker_bars_merge_with_live_ticks_and_corrections_rebuild():
     assert st.ready and st.src == "broker+ticks"
 
 
-def test_m5_bias_up_down_ambiguous_and_m1_timing():
+def test_m1_trend_up_down_sideways_and_m1_timing():
     up = TF(300)
     b = _bars([100 + i * 0.4 for i in range(60)])
     up.load(b, b[-1]["time"] + 300)
     for k in range(30):
         up.on_tick(b[-1]["time"] + 300 + k * 5, b[-1]["close"] + k * 0.03)
     s = up.state(b[-1]["time"] + 450)
-    bias, lab, sup = m5_bias(s)
-    assert bias > 0.3 and lab.startswith("up")
+    bias, lab, sup = m1_trend(s)
+    assert bias > 0.3 and lab.startswith("M1 up")
     dn = TF(300)
     b2 = _bars([100 - 0.4 * i - 0.01 * i * i for i in range(60)])   # accelerating sell-off
     dn.load(b2, b2[-1]["time"] + 300)
     dn.on_tick(b2[-1]["time"] + 310, b2[-1]["close"] - 0.2)
-    assert m5_bias(dn.state(b2[-1]["time"] + 320))[0] < -0.3
+    assert m1_trend(dn.state(b2[-1]["time"] + 320))[0] < -0.3
     flat = TF(300)
     b3 = _bars([100 + (0.2 if i % 2 else -0.2) for i in range(60)])
     flat.load(b3, b3[-1]["time"] + 300)
     flat.on_tick(b3[-1]["time"] + 310, 100.0)
-    assert "ambiguous" in m5_bias(flat.state(b3[-1]["time"] + 320))[1]
+    assert "sideways" in m1_trend(flat.state(b3[-1]["time"] + 320))[1]
     assert m1_timing(s, 1, bias) > m1_timing(s, -1, bias)
 
 
@@ -88,8 +88,8 @@ def _live(**kw):
 
 
 def _view(bias, supported=True, slope=0.1, accel=0.05, vol=1.5, exhaust=0):
-    v = MTFView(m5=TFState(ready=True, exhaust=exhaust), m1=TFState(ready=True, hist_slope=slope, hist_accel=accel,
-                                                                    vol_x=vol, body=0.4, range_x=1.0))
+    v = MTFView(m1=TFState(ready=True, exhaust=exhaust, hist_slope=slope, hist_accel=accel,
+                            vol_x=vol, body=0.4, range_x=1.0))
     v.bias, v.supported = bias, supported
     v.bias_label = "test"
     v.m1_up, v.m1_dn = m1_timing(v.m1, 1, bias), m1_timing(v.m1, -1, bias)
@@ -180,4 +180,4 @@ def test_stats_come_only_from_closed_baskets_with_attribution(tmp_path):
     if pf["batches"]:
         assert {"win_rate", "profit_factor", "expectancy", "avg_win", "avg_loss", "orders", "batches_per_hour",
                 "reentry_s", "avg_spread_pts", "avg_slip_pts", "attribution", "max_drawdown"} <= set(pf)
-        assert set(pf["attribution"]) == {"m5", "macd", "volume", "tick"}
+        assert set(pf["attribution"]) == {"trend", "macd", "volume", "tick"}

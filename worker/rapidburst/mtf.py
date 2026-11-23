@@ -281,10 +281,9 @@ class TF:
 @dataclass
 class MTFView:
     """M1-ONLY view (t30u): `bias` = the M1 MAIN TREND (EMA + MACD + HH/HL-LH/LL swing structure), `m1_up/dn` =
-    the M1 intrabar trigger. `m5` is kept as an alias of the M1 state for older callers - no M5 gate anywhere."""
-    m5: TFState = field(default_factory=TFState)
+    the M1 intrabar trigger. t32u: the dead M5 alias is removed."""
     m1: TFState = field(default_factory=TFState)
-    bias: float = 0.0            # -1..1 M5 direction bias (signed)
+    bias: float = 0.0            # -1..1 M1 main-trend bias (signed)
     bias_label: str = "unknown"
     supported: bool = False
     m1_up: float = 0.0           # M1 timing score for BUY 0..1
@@ -296,27 +295,7 @@ class MTFView:
     def brief(self) -> dict:
         return {"bias": round(self.bias, 2), "label": self.bias_label, "supported": self.supported,
                 "m1_up": round(self.m1_up, 2), "m1_dn": round(self.m1_dn, 2),
-                "m5": self.m5.brief(), "m1": self.m1.brief()}
-
-
-def m5_bias(s: TFState) -> tuple[float, str, bool]:
-    if not s.ready:
-        return 0.0, "unknown (no M5 bars yet)", False
-    macd = _clip(s.hist / 0.3) * (1.0 if s.macd_ready else 0.5)
-    mom = _clip(s.hist_slope / 0.15) * (1.0 if s.macd_ready else 0.5)
-    body = _clip(s.body / 0.6) * min(1.0, s.range_x)
-    vol = 0.0 if s.vol_x is None else _clip(s.vol_x - 1.0)
-    rsi = _clip((s.rsi - 50.0) / 20.0) * (1.0 if s.rsi_ready else 0.0)        # soft: level/direction only
-    b = 0.32 * s.trend + 0.18 * macd + 0.14 * mom + 0.13 * body + 0.13 * s.structure + 0.1 * rsi
-    b *= 1.0 + 0.25 * max(0.0, vol) * (1 if b * body > 0 else 0)        # activity supporting the move
-    exhausting = s.exhaust != 0 and s.exhaust * b > 0
-    if exhausting:
-        b *= 0.5
-    b = _clip(b)
-    supported = abs(b) >= 0.25 and not exhausting and (mom * b >= 0)
-    lab = ("up" if b > 0 else "down") if abs(b) >= 0.2 else "ambiguous"
-    lab += " (exhausting)" if exhausting else " (supported)" if supported else ""
-    return b, lab, supported
+                "m1": self.m1.brief()}
 
 
 def m1_trend(s: TFState) -> tuple[float, str, bool]:
@@ -370,21 +349,19 @@ def m1_timing(s: TFState, d: int, bias: float) -> float:
 
 
 class MTF:
-    """Per symbol M1 series (t30u: M1 only; the M5 series is no longer polled or used)."""
+    """Per symbol M1 series (M1 only)."""
 
     def __init__(self):
         self.m1 = TF(60, 300)
-        self.m5 = TF(300, 300)
-        self.polled = {"M1": 0.0, "M5": 0.0}
+        self.polled = {"M1": 0.0}
         self.poll_err = ""
 
     def on_tick(self, t: float, price: float) -> None:
         self.m1.on_tick(t, price)
-        self.m5.on_tick(t, price)
 
     def view(self, now: float) -> MTFView:
         m1 = self.m1.state(now)
-        v = MTFView(m5=m1, m1=m1)
+        v = MTFView(m1=m1)
         v.bias, v.bias_label, v.supported = m1_trend(m1)
         v.m1_up, v.m1_dn = m1_timing(v.m1, 1, v.bias), m1_timing(v.m1, -1, v.bias)
         return v

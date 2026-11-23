@@ -91,7 +91,7 @@ class AccountView:
 
 class RiskGuard:
     """Account-wide guards. There is NO all-day daily-loss halt. An equity drawdown from the session peak puts
-    the bot in SAFE MODE: bot positions are flattened, new entries pause (5 min, doubling on repeats, max 30 min),
+    the bot in SAFE MODE (t32u: peak = closed balance; only NEW entries pause, open baskets keep their stops), entries pause (5 min, doubling on repeats, max 30 min),
     then trading resumes from a new reference peak with reduced size (single min-lot batches for a while)."""
 
     def __init__(self, cfg: EngineConfig):
@@ -101,6 +101,9 @@ class RiskGuard:
         self.halt_reason = ""
         self.safe_until = 0.0
         self.safe_count = 0
+        self.need_confirm = False      # t32u: after safe mode, the next entry needs fresh M1 structure
+        self.session_peak = 0.0
+        self.catastrophic = False      # equity below safe_flatten_pct of the peak -> flatten (last resort)
         self.probe_left = 0            # batches still forced to one min-lot order after a safe-mode pause
         self.floor_risk = 0.0          # largest min-lot-floor BASKET stop risk this session (money)
 
@@ -108,6 +111,8 @@ class RiskGuard:
         self.peak_equity = equity
         self.halted, self.halt_reason = False, ""
         self.safe_until, self.safe_count, self.probe_left = 0.0, 0, 0
+        self.need_confirm, self.catastrophic = False, False
+        self.session_peak = equity
         self.floor_risk = 0.0
 
     def dd_limit(self) -> float:
@@ -121,18 +126,40 @@ class RiskGuard:
         return lim
 
     def update(self, now: float, acct: AccountView) -> Optional[tuple]:
-        """Returns ("safe", msg) when safe mode starts, ("resume", msg) when it ends, else None."""
+        """Returns ("safe", msg) when safe mode starts, ("resume", msg) when it ends, else None.
+        t32u: the reference peak is the CLOSED-equity peak (balance), never a floating spike - an open basket's
+        unrealised profit cannot set a peak that the same basket's normal pullback then "loses". Safe mode only
+        PAUSES NEW ENTRIES (each open basket keeps its own structure stop / trail); after the pause the first
+        entry needs a fresh M1 structure confirmation (`need_confirm`). `catastrophic` (flatten) is only set when
+        equity falls `safe_flatten_pct` below the peak."""
         if acct.equity <= 0:
             return None
+        # closed equity: the balance, but never above current equity (an open loss is not a "peak")
+        bal = min(acct.balance, acct.equity) if acct.balance > 0 else acct.equity
+        self.peak_equity = max(self.peak_equity, bal)
+        self.session_peak = max(self.session_peak, bal)            # never re-based by a safe-mode resume
+        fl = self.cfg.safe_flatten_pct
+        if (fl > 0 and not self.catastrophic and self.session_peak > 0
+                and acct.equity < self.session_peak * (1 - fl / 100.0)):
+            # last resort: flatten bot positions (trader) and pause entries for the maximum pause, then restart
+            # from the new balance (no all-day stop)
+            self.catastrophic, self.halted = True, True
+            self.safe_until = max(self.safe_until, now + self.cfg.safe_pause_max_s)
+            self.halt_reason = (f"CATASTROPHIC: equity {acct.equity:.2f} is more than {fl:g}% below the session peak "
+                                f"{self.session_peak:.2f} - bot positions closed, entries paused "
+                                f"{self.cfg.safe_pause_max_s / 60:.0f} min")
+            return "safe", self.halt_reason
         if self.halted:
             if now < self.safe_until:
                 return None
+            if self.catastrophic:
+                self.catastrophic, self.session_peak = False, bal
             self.halted, self.halt_reason = False, ""
-            self.peak_equity = acct.equity                  # new reference: no instant re-trigger
+            self.peak_equity = bal                          # new reference: no instant re-trigger
             self.probe_left = self.cfg.safe_probe_batches
-            return "resume", (f"SAFE MODE ended - entries resume with reduced size ({self.probe_left} single "
-                              f"min-lot batch(es)), new drawdown reference {acct.equity:.2f}")
-        self.peak_equity = max(self.peak_equity, acct.equity)
+            self.need_confirm = True
+            return "resume", (f"SAFE MODE ended - entries resume after a FRESH M1 structure confirmation "
+                              f"(swing break / HH-HL or LH-LL with the trade), new reference {bal:.2f}")
         dd = self.cfg.equity_drawdown_pct
         lim = self.dd_limit()
         if dd > 0 and self.peak_equity > 0 and acct.equity < self.peak_equity - lim:
@@ -141,7 +168,8 @@ class RiskGuard:
             self.safe_until = now + pause
             self.halted = True
             self.halt_reason = (f"SAFE MODE: equity {acct.equity:.2f} is {lim:.2f} ({lim / self.peak_equity * 100:.1f}%) "
-                                f"below the session peak {self.peak_equity:.2f} - entries paused {pause / 60:.0f} min")
+                                f"below the closed-balance peak {self.peak_equity:.2f} - NEW entries paused "
+                                f"{pause / 60:.0f} min (open baskets keep their stops)")
             return "safe", self.halt_reason
         return None
 

@@ -122,12 +122,19 @@ def test_add_to_basket_sends_same_lot_orders_into_the_open_basket(tmp_path):
     g = tr.bursts[gid]
     for p in tr.own_positions:                          # every leg in profit (no averaging down)
         p["profit"] = 1.0
-    g["prot"], g["prot_level"] = "BE", 0.0
     m, st = tr._micro("BTCUSDm", T0 + 5)
+    # t32u: an add only goes in when it can SHARE the basket's BE/trail stop
+    g["prot"], g["prot_level"] = "BE", 0.0
+    status = {}
+    assert not tr._add_to_basket("BTCUSDm", legs, g, m, st, tr.sym_info["BTCUSDm"], status, T0 + 5, T0 + 5)
+    assert "shared break-even/trail stop" in status["reason"]
+    g["last_add"] = 0.0
+    g["prot_level"] = round(m.bid - 2 * m.spread, 2)
     n0 = len(br.positions_)
     status = {}
     ok = tr._add_to_basket("BTCUSDm", legs, g, m, st, tr.sym_info["BTCUSDm"], status, T0 + 5, T0 + 5)
     assert ok, status
+    assert all(p["sl"] == g["prot_level"] for p in br.positions_.values() if "-a" in p["comment"])
     assert ok and len(br.positions_) > n0
     lots = {p["volume"] for p in br.positions_.values()}
     assert len(lots) == 1 and all(p["sl"] for p in br.positions_.values())          # same lot, hard stop
@@ -144,4 +151,16 @@ def test_young_loser_inside_the_m1_trend_is_not_cut_on_micro_noise():
     v2 = _view(0.6)
     v2.m1.sbreak = -1                                    # the M1 swing low broke: the trend case is over
     r = exit_reason(g, _live(mtf=v2, **kw), 1, -0.1, 3, 0.9, 0.5, 0.8, 0.0, cfg)
-    assert r and "directional reversal against" in r
+    assert r and "structure invalidated" in r
+
+
+def test_t32u_trailing_basket_in_intact_trend_is_left_to_the_trail():
+    cfg = EngineConfig()
+    g = {"target": 0.3, "peak_pl": 0.9, "peak_vel": 0.5, "last_ext_t": 100.0, "prot": "trail"}
+    turn = _live(vel=-0.3, accel=-0.3, imbalance=-0.7, bidask=-0.7, mtf=_view(0.5))
+    assert exit_reason(g, turn, 1, 0.5, 3, 0.0, 0.5, 0.8, 0.0, cfg) is None             # the trail manages
+    v = _view(0.5)
+    v.m1.sbreak = -1                                                                   # structure broke
+    r = exit_reason(dict(g), _live(vel=-0.3, accel=-0.3, imbalance=-0.7, bidask=-0.7, mtf=v), 1, 0.5, 3, 0.0,
+                    0.5, 0.8, 0.0, cfg)
+    assert r is not None

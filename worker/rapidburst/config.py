@@ -29,6 +29,9 @@ INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE"
 # Engine settings that may be changed at RUNTIME (no redeploy, the MT5 login stays): name -> (min, max).
 # Only strategy/sizing knobs inside safe bounds. Never: live trading, broker SL on/off, magic, credentials.
 TUNABLE = {
+    "sl_struct_buffer_atr": (0.0, 0.5), "sl_min_atr": (0.2, 2.0), "sl_max_atr": (0.5, 4.0),
+    "ind_min_score": (0.0, 0.6), "ind_sr_near_atr": (0.0, 1.0), "safe_flatten_pct": (0.0, 95.0), "exit_min_r": (0.0, 2.0),
+    "ind_enabled": (0, 1), "ind_chop_veto": (0, 1), "mb_require_m1_trigger": (0, 1), "sl_structure": (0, 1),
     "mb_threshold": (0.35, 0.90), "mb_edge": (0.0, 0.40), "mb_min_agree": (2, 5), "mb_scan_support": (0.2, 0.7),
     "mb_max_chase_atr": (0.3, 4.0), "mb_max_bar_atr": (0.3, 5.0), "loss_streak_threshold_add": (0.0, 0.1),
     "mb_min_velocity": (0.05, 0.8), "m1_trend_veto": (0.2, 1.0), "min_orders_per_batch": (1, 8),
@@ -38,7 +41,7 @@ TUNABLE = {
     "max_lot_per_order": (0.01, 100.0), "max_batch_lots": (0.01, 500.0), "max_total_lots": (0.01, 1000.0),
     "min_margin_level_pct": (50.0, 1000.0), "margin_use_max_pct": (10.0, 100.0), "safe_probe_batches": (0, 5),
     "exit_min_signals": (2, 6), "exit_retrace_atr": (0.05, 1.0), "exit_retrace_spread": (0.5, 6.0),
-    "exit_retrace_frac": (0.1, 0.9), "exit_opp_frac": (0.5, 1.5), "mb_cut_frac": (0.2, 1.0),
+    "exit_retrace_frac": (0.1, 0.9), "exit_opp_frac": (0.5, 1.5), "mb_cut_frac": (0.0, 1.0),
     "mb_max_hold_seconds": (0, 1800), "mb_min_net_spread": (0.0, 3.0),
     "be_trigger_atr": (0.1, 2.0), "be_trigger_spread": (1.0, 10.0), "be_lock_spread_mult": (0.0, 2.0),
     "trail_atr_frac": (0.05, 1.5), "trail_atr_strong": (0.05, 2.0), "trail_atr_fade": (0.03, 1.0),
@@ -111,7 +114,6 @@ class EngineConfig:
                                       # D M1 timing, E M5 bias), one of them C or D (structure / candle trigger):
                                       # speed+volume alone (A+B) never trades
     candle_poll_m1_s: float = 8.0     # broker M1 candle refresh (the forming bar comes from live ticks)
-    candle_poll_m5_s: float = 60.0    # broker M5 candle refresh
     mb_max_chase_atr: float = 1.80    # RB_MB_MAX_CHASE_ATR: no entry if price is > x ATR from the recent swing
     mb_max_bar_atr: float = 2.20      # RB_MB_MAX_BAR_ATR: no entry if the live candle body is > x ATR in that direction
     mb_abnormal_range_atr: float = 1.5
@@ -135,25 +137,39 @@ class EngineConfig:
     mb_decay_frac: float = 0.30       # velocity below x * its peak since entry = decay
     mb_opp_pressure: float = 0.40     # opposing tick / bid-ask proxy >= x
     mb_stall_seconds: float = 3.0     # no new favourable extreme for x s = stall
-    mb_cut_frac: float = 0.50         # losing >= x of the stop distance with >= 2 reversal signals => cut
+    mb_cut_frac: float = 0.0          # losing >= x of the stop distance with >= 2 reversal signals => cut
     exit_spike_atr: float = 0.5       # spike exit: peak net profit >= x * M1 ATR and the bar turns back ...
     exit_spike_wick_frac: float = 0.3 # ... (retraced >= x of the peak + velocity flip + opposing pressure/wick)
     m1_trend_veto: float = 0.45       # M1 main trend this strongly against = no counter-trend entry (unless the
                                       # M1 / micro structure just broke in the entry direction)
-    mb_max_hold_seconds: float = 180.0  # stale guard: not in net profit after x s AND momentum gone => close
+    mb_max_hold_seconds: float = 0.0  # stale guard: not in net profit after x s AND momentum gone => close
     commission_per_lot: float = 0.0   # round-trip commission per lot in account currency (cost in net P/L)
 
     # --- orders, batch & exposure (risk-based; no martingale, no averaging down, no grid) ---
-    risk_per_trade_pct: float = 50.0  # RB_RISK_PER_TRADE_PCT: % of equity lost if one order's stop is hit
+    risk_per_trade_pct: float = 10.0  # RB_RISK_PER_TRADE_PCT: % of equity lost if one order's stop is hit
     sl_atr: float = 0.8               # hard stop distance = max(x * M1 ATR, sl_spread_mult * spread, stops level)
     sl_spread_mult: float = 4.0
+    # t32u STRUCTURE stop: beyond the last M1 swing low (BUY) / high (SELL) + spread + sl_struct_buffer_atr*ATR,
+    # clamped to [sl_min_atr, sl_max_atr] x ATR (and >= stops level, >= 3x spread); ATR stop when no swing
+    sl_structure: bool = True
+    sl_struct_buffer_atr: float = 0.10
+    sl_min_atr: float = 0.5
+    sl_max_atr: float = 1.6
+    # t32u indicator confluence (family F) - indicators.py
+    ind_enabled: bool = True
+    ind_min_score: float = 0.42       # confluence for the side below this (indicators lean against) => veto
+    ind_sr_near_atr: float = 0.20     # no entry into S/R closer than x ATR (unless breaking it)
+    ind_chop_veto: bool = True        # ADX < 18 with no breakout, or a squeeze without the break => no entry
+    exit_min_r: float = 0.0           # discretionary profit exits only at net >= x * stop distance (0 = off)
+    mb_require_m1_trigger: bool = True  # once M1 bars exist, the M1 trigger family D must agree
+    safe_flatten_pct: float = 60.0    # last resort: equity this % below the closed-balance peak => flatten all
     soft_stop_mult: float = 1.15      # engine mirror of the hard stop (if the broker SL fails)
     # batch: ONE batch per signal, opened at once, same lot per order, never added to later
     max_orders_per_batch: int = 8     # RB_MAX_ORDERS_PER_BATCH: orders in one batch (a CAP, never forced: the count
                                       # follows momentum quality, then equity/lot/margin/exposure limits cut it)
     # order count from the score: n = 1 + round(7 x q), q = (strength - threshold) / (1 - threshold), then cut by
     # risk, margin, stop distance and exposure
-    risk_per_batch_pct: float = 50.0  # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
+    risk_per_batch_pct: float = 10.0  # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
     max_batch_lots: float = 100.0      # lots in one batch
     batch_run_cancel_frac: float = 1.0  # cancel the rest of a batch if price ran > x * target from the decision
     max_lot_per_order: float = 50.0
@@ -167,22 +183,22 @@ class EngineConfig:
     add_max_per_step: int = 2
     max_total_lots: float = 400.0
     max_total_notional_x: float = 0.0    # sum of open notional <= x * equity
-    max_total_risk_pct: float = 100.0  # RB_MAX_TOTAL_RISK_PCT: sum of open stop risk <= x% of equity
+    max_total_risk_pct: float = 25.0  # RB_MAX_TOTAL_RISK_PCT: sum of open stop risk <= x% of equity
     max_margin_use_pct: float = 90.0  # RB_MAX_MARGIN_USE_PCT: total used margin <= x% of equity
     min_margin_level_pct: float = 110.0
     margin_use_max_pct: float = 100.0 # one order may use <= x% of the free margin
     small_account_max_loss_pct: float = 0.0  # 0 = min lot always allowed (free margin permitting)
-    small_account_batch_risk_pct: float = 50.0  # min-lot-floor accounts: ALL open bot stops together <= x% of
+    small_account_batch_risk_pct: float = 15.0  # min-lot-floor accounts: ALL open bot stops together <= x% of
                                       # equity (scaled by score 0.6..1.0) -> several min-lot orders per basket
     group_loss_pct: float = 60.0      # RB_GROUP_LOSS_PCT: hard exit when one basket's floating loss >= x% equity
     # NO all-day daily-loss halt. Equity drawdown => SAFE MODE (flatten, pause new entries, resume reduced)
-    equity_drawdown_pct: float = 50.0 # RB_MAX_DD_PCT: equity x% below the session peak => safe mode (0 = off)
+    equity_drawdown_pct: float = 30.0 # RB_MAX_DD_PCT: equity x% below the session peak => safe mode (0 = off)
     safe_pause_s: float = 180.0       # first safe-mode pause; doubles on each repeat in a session ...
     safe_pause_max_s: float = 1800.0  # ... up to this
     safe_probe_batches: int = 0       # after a pause: this many single min-lot batches before normal sizing
     safe_min_stopouts: float = 1.5    # min-lot floor accounts: the safe-mode drawdown is never smaller than this
                                       # many full basket stop losses (one normal basket stop must not trip it) ...
-    safe_dd_cap_pct: float = 50.0     # ... but never more than x% of the peak equity
+    safe_dd_cap_pct: float = 40.0     # ... but never more than x% of the peak equity
     emergency_stale_s: float = 15.0   # open positions and no fresh price for x s => emergency close
     exec_fail_max: int = 3            # entry rejects within 60 s before the symbol is paused
     exec_fail_pause_s: float = 60.0

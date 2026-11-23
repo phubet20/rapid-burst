@@ -10,7 +10,7 @@ ONE engine. Five families are scored on the same moment and feed ONE decision:
                                      breakout, structure break, pullback recovery, short rebound, anti-chase
   D. M1 entry timing (mtf.py)       - forming-bar direction/body expansion, MACD histogram expansion and slope
                                      change (no full cross needed), RSI level/slope (soft), tick-volume expansion,\n                                     continuation with M5
-  E. M5 direction bias (mtf.py)     - EMA trend, body/range expansion, MACD direction/histogram/momentum change, RSI,
+  E. M1 main trend (mtf.py; t32u: the dead M5 timeframe is removed)     - EMA trend, body/range expansion, MACD direction/histogram/momentum change, RSI,
                                      tick-volume activity, HH/HL vs LH/LL, supported vs exhausting
 The decision scores how well they AGREE; no single family is mandatory, activity alone never trades, M5 is a
 filter (soft penalty when ambiguous/weak against, veto only when clearly against and supported).
@@ -56,6 +56,7 @@ class Micro:
     vu: float = 0.0                 # typical 3 s move (price units)
     # A. tick flow & micro momentum
     tick_rate: float = 0.0          # ticks/s over the last 5 s
+    gap_lim: float = 0.0            # per-symbol allowed tick gap (t32u)
     rate_ratio: float = 1.0         # vs the 60 s baseline
     seq_run: int = 0                # signed length of the current same-direction tick run
     seq_consist: float = 0.0        # mean direction of the last 12 price changes (-1..1)
@@ -118,6 +119,8 @@ class Micro:
     n_ticks: int = 0
     # multi-timeframe (real broker M1/M5 candles + forming bar from ticks), set by the trader
     mtf: Optional[object] = None    # mtf.MTFView
+    ind: Optional[object] = None    # indicators.IndView (t32u confluence layer, family F)
+    ind_w: Optional[dict] = None    # learned indicator weights for this symbol
 
     def brief(self) -> dict:
         r = lambda x, n=3: round(x, n)   # noqa: E731
@@ -534,7 +537,11 @@ class TickScanner:
         while self.gaps and self.gaps[0][0] < now - 10.0:
             self.gaps.popleft()
         m.gap_max = max(self.gaps[0][1] if self.gaps else 0.0, m.latency)
-        m.stable = m.gap_max <= cfg.mb_max_gap_s and m.latency <= cfg.mb_max_gap_s
+        # t32u (15): per-symbol feed check - a quiet FX pair ticks less often than BTC; the gap limit adapts to
+        # the symbol's own normal tick spacing (4x, capped at 20 s); latency still uses the configured cap
+        typ_gap = 30.0 / max(self.r30.n, 1.5)
+        m.gap_lim = min(20.0, max(cfg.mb_max_gap_s, 4.0 * typ_gap))
+        m.stable = m.gap_max <= m.gap_lim and m.latency <= cfg.mb_max_gap_s
         fast = m.rate_ratio >= 1.6 and (m.burst_z >= 2.0 or m.range_exp >= 1.2)
         if fast:
             m.regime = "fast"
@@ -574,12 +581,12 @@ class Strength:
 
 
 SCAN_W = {"fast": (1.3, 0.9, 0.8), "normal": (1.0, 1.0, 1.0), "quiet": (0.8, 0.8, 1.3), "chop": (0.8, 1.0, 1.2)}
-W_M1, W_M5 = 1.0, 0.8          # D = M1 timing (MACD histogram / body / volume / continuation), E = M5 direction
-FAMILIES = ("A", "B", "C", "D", "E")
+W_M1, W_TREND, W_IND = 1.0, 0.8, 1.2   # D = M1 timing, E = M1 main trend, F = indicator confluence (t32u)
+FAMILIES = ("A", "B", "C", "D", "E", "F")
 
 
 def _mtf_scores(m: Micro, d: int) -> tuple:
-    """(D, E, M5 bias signed for this side) or None for a family whose timeframe has no data yet."""
+    """(D, E, M1 trend bias signed for this side) or None for a family whose timeframe has no data yet."""
     v = m.mtf
     if v is None:
         return None, None, 0.0
@@ -641,10 +648,25 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         num, den = num + W_M1 * dd, den + W_M1
         c["m1_timing"] = dd
     if e is not None:
-        num, den = num + W_M5 * e, den + W_M5
-        c["m5_bias"] = e
+        num, den = num + W_TREND * e, den + W_TREND
+        c["m1_trend"] = e
+    iv = m.ind
+    f = None
+    if iv is not None and getattr(iv, "ready", False) and getattr(cfg, "ind_enabled", True):
+        f = iv.score(d, m.ind_w)
+        num, den = num + W_IND * f, den + W_IND
+        c["confluence"] = f
     s = num / den
     vetoes = []
+    if f is not None:
+        from .indicators import sr_block
+        sr = sr_block(iv, d, m.mid, m.atr, cfg.ind_sr_near_atr)
+        if sr:
+            vetoes.append(f"S/R: {sr} - no entry straight into a level")
+        if iv.chop and cfg.ind_chop_veto:
+            vetoes.append(f"chop: {iv.chop_why}")
+        if f < cfg.ind_min_score:
+            vetoes.append(f"indicator confluence {f:.2f} < {cfg.ind_min_score:.2f} against the side")
     v = m.mtf
     if v is not None and v.m1.ready:
         if bias <= -cfg.m1_trend_veto and not (v.m1.sbreak == d or m.struct_break == d):
@@ -656,8 +678,11 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
             s += 0.05                                  # with the M1 main trend
         if v.m1.exhaust == d:
             s -= 0.06
+        if v.m1.sbreak == -d:
+            # t32u: the exit treats an M1 swing broken against the trade as invalidation - so never ENTER into it
+            vetoes.append("M1 swing structure broken against this side (the exit would invalidate it at once)")
     if m.early == d:
-        s += 0.06                                     # pre-burst: acceleration starting out of compression
+        s += 0.06                                     # early burst: acceleration starting out of compression
     chase = m.chase_up if d > 0 else m.chase_dn
     allow = cfg.mb_max_chase_atr * (1.3 if m.regime == "fast" else 1.0)
     if chase > allow:
@@ -680,7 +705,8 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         vetoes.append(f"spread {m.spread_target:.2f}x the capture target (cost too high)")
     if d * m.vel <= 0 or c["velocity"] < cfg.mb_min_velocity:
         vetoes.append("no live force in that direction now")
-    fam = (round(a, 3), round(b, 3), round(cs, 3), None if dd is None else round(dd, 3), None if e is None else round(e, 3))
+    fam = (round(a, 3), round(b, 3), round(cs, 3), None if dd is None else round(dd, 3),
+           None if e is None else round(e, 3), None if f is None else round(f, 3))
     return _clip(s), c, fam, vetoes
 
 
@@ -718,12 +744,14 @@ def decide(m: Micro, cfg) -> Strength:
         avail = [f for f, x in zip(FAMILIES, sc) if x is not None]
         agree = [f for f, x in zip(FAMILIES, sc) if x is not None and x >= lvl]
         need = max(2, min(cfg.mb_min_agree, len(avail)))
-        trigger = [f for f in agree if f in ("C", "D")]           # micro-structure or M1 intrabar trigger
+        # t32u: once M1 bars exist the M1 trigger (D) is REQUIRED; before that micro-structure (C) triggers
+        trig_fams = ("D",) if (cfg.mb_require_m1_trigger and "D" in avail) else ("C", "D")
+        trigger = [f for f in agree if f in trig_fams]
         if len(agree) < need or not trigger:
             return None, (f"{side} {best:.2f} but only {len(agree)}/{len(avail)} families agree "
-                          f"({''.join(agree) or '-'}), need {need} incl. a structure/candle trigger (C or D) - no "
+                          f"({''.join(agree) or '-'}), need {need} incl. the trigger ({'/'.join(trig_fams)}) - no "
                           f"single-indicator, speed-only or volume-only entries")
-        tag = " pre-burst" if m.early == d else ""
+        tag = " early-burst" if m.early == d else ""
         fams = " ".join(f"{f}{x:.2f}" for f, x in zip(FAMILIES, sc) if x is not None)
         return best, f"{side} {best:.2f} >= {st.threshold:.2f} [{m.regime}{tag}] agree {''.join(agree)} | {fams}"
     first = 1 if b >= s else -1
@@ -752,7 +780,6 @@ def exit_signals(g: dict, m: Micro, d: int, opp: float, thr: float, cfg) -> dict
     opp_press = d * m.imbalance <= -cfg.mb_opp_pressure or d * m.bidask <= -cfg.mb_opp_pressure
     stall = (m.t - float(g.get("last_ext_t", m.t))) >= cfg.mb_stall_seconds * (0.6 if m.regime == "fast" else 1.0)
     v1 = m.mtf.m1 if m.mtf is not None and m.mtf.m1.ready else None
-    v5 = m.mtf.m5 if m.mtf is not None and m.mtf.m5.ready else None
     rsi_turn = (v1 is not None and v1.rsi_ready and d * v1.rsi_slope < -cfg.exit_rsi_turn
                 and (d * v1.rsi_accel < 0 or d * (v1.rsi - 50.0) > 20.0))
     macd_turn = v1 is not None and d * v1.hist_slope < -0.03 and d * v1.hist_accel < 0
@@ -760,7 +787,7 @@ def exit_signals(g: dict, m: Micro, d: int, opp: float, thr: float, cfg) -> dict
     vol_fade = v1 is not None and v1.vol_x is not None and v1.vol_x < 0.7 and (decay or stall)
     reversal = (flip and opp_press) or opp >= cfg.exit_opp_frac * thr
     struct_fail = m.failed == -d or m.struct_break == -d or (m.rejection == -d and flip)
-    exhaustion = m.exhaustion == d or (v5 is not None and v5.exhaust == d)
+    exhaustion = m.exhaustion == d or (v1 is not None and v1.exhaust == d)
     return {"RSI-turn": rsi_turn, "MACD-hist-turn": macd_turn, "candle-momentum-loss": candle_loss,
             "volume-weakening": vol_fade, "reversal": reversal, "structure-failure": struct_fail,
             "exhaustion": exhaustion, "_continuing": (vel > 0 and not decay and not opp_press and not macd_turn
@@ -794,8 +821,21 @@ def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, t
     wick = m.rejection == -d
     v = m.mtf
     trend_with = v is not None and v.m1.ready and d * v.bias >= 0.25
+    m1_broke = v is not None and v.m1.ready and v.m1.sbreak == -d          # M1 swing (HL/LH) broken against us
+    # t32u: structure intact = M1 trend with us (or not against) and no M1 swing break / micro structure failure
+    intact = (not m1_broke) and not sig["structure-failure"] and (trend_with or v is None or not v.m1.ready
+                                                                  or d * v.bias > -0.25)
     # 1. in profit: hold while momentum continues; close when the evidence agrees
+    # t32u: a discretionary profit exit must be worth it against the risk taken - below exit_min_r x stop the
+    # basket is left to break-even / trail / structure (no +0.3 exits on a 4.0 stop)
+    small = cfg.exit_min_r > 0 and stop_dist > 0 and net < cfg.exit_min_r * stop_dist and not m1_broke
+    if net >= min_net and small and not (g.get("prot") and sig["reversal"] and sig["structure-failure"]):
+        return None
     if net >= min_net:
+        # t32u (7): once the trailing stop is active and the structure is intact the TRAIL manages the exit -
+        # no premature spike / exhaustion close in a running trend
+        if g.get("prot") == "trail" and intact and trend_with:
+            return None
         # spike exit: after a real spike the M1 bar starts turning back (velocity flip + opposing tick pressure or
         # a growing wick against us + a retrace of the spike) -> take it now; the engine re-evaluates at once
         if (peak >= cfg.exit_spike_atr * atr and retr >= cfg.exit_spike_wick_frac * peak and flip
@@ -804,7 +844,7 @@ def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, t
                     f"{' + opposing pressure' if press else ''}{' + wick against' if wick else ''}, {tags})")
         if score >= cfg.exit_min_signals and not continuing:
             return f"momentum exhausted in profit ({score} signals: {tags}): {net:+.4g}"
-        if trend_with and not sig["structure-failure"] and retr < 0.6 * peak and not (flip and press):
+        if trend_with and intact and retr < 0.6 * peak and not (flip and press):
             return None                     # pullback inside the M1 trend: hold (the trailing stop protects)
         if retrace and (score >= cfg.exit_min_signals - 1 or (score >= 1 and not continuing)):
             return (f"profit protection: retraced {retr:.4g} from peak {peak:+.4g} with {tags} "
@@ -812,17 +852,22 @@ def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, t
         if sig["reversal"] and sig["structure-failure"]:
             return f"directional reversal in profit ({tags}): {net:+.4g}"
         return None
-    # 2. not (yet) in net profit: hold inside the hard stop unless the move clearly turned
-    if peak >= min_net and retrace and score >= 1:
-        return f"profit gone: peak {peak:+.4g} -> {net:+.4g} ({tags})"
-    # t30u: inside the M1 main trend (no M1 swing break against us) a young basket is not cut on micro noise -
-    # the reversal must be broad (>= 4 signals) and already cost >= 35 % of the stop; the hard stop still rules
-    in_trend = trend_with and v.m1.sbreak != -d
-    if sig["reversal"] and sig["structure-failure"] and score >= 3 and (
-            not in_trend or (score >= 4 and stop_dist > 0 and net <= -0.35 * stop_dist)):
-        return f"directional reversal against the basket ({score} signals: {tags}): {net:+.4g}"
-    if stop_dist > 0 and net <= -cfg.mb_cut_frac * stop_dist and score >= 2 and not continuing:
-        return f"momentum against: {net:+.4g} (>= {cfg.mb_cut_frac:g} of stop) {tags}"
-    if cfg.mb_max_hold_seconds > 0 and held >= cfg.mb_max_hold_seconds and not continuing and score >= 1:
+    # 2. not in net profit. t32u: losers are NOT cut on momentum noise any more (that cut -1.7..-4.4 baskets that
+    # then went our way). They are held inside the structure stop while the M1 structure is intact and closed
+    # only when the structure that justified the entry is invalidated (or by the structure stop at the broker).
+    if m1_broke:
+        return f"structure invalidated: M1 swing broken against the basket ({tags}): {net:+.4g}"
+    if (sig["structure-failure"] and sig["reversal"] and not trend_with and score >= cfg.exit_min_signals
+            and peak >= min_net and retrace):
+        return f"profit gone + structure failed ({tags}): peak {peak:+.4g} -> {net:+.4g}"
+    if (sig["structure-failure"] and sig["reversal"] and v is not None and v.m1.ready and d * v.bias <= -0.25
+            and score >= cfg.exit_min_signals):
+        return f"structure invalidated: micro structure failed against the M1 trend ({tags}): {net:+.4g}"
+    if (v is None or not v.m1.ready) and sig["structure-failure"] and sig["reversal"] and score >= 3:
+        # no M1 bars yet: the micro structure is the structure - broad reversal through it invalidates the trade
+        return f"structure invalidated: micro structure failed with a broad reversal ({score} signals: {tags}): {net:+.4g}"
+    if cfg.mb_cut_frac > 0 and stop_dist > 0 and net <= -cfg.mb_cut_frac * stop_dist and score >= 2 and not continuing:
+        return f"momentum against: {net:+.4g} (>= {cfg.mb_cut_frac:g} of stop) {tags}"   # legacy, off by default
+    if cfg.mb_max_hold_seconds > 0 and held >= cfg.mb_max_hold_seconds and not continuing and score >= 1 and not intact:
         return f"stale: {held:.0f}s without net profit ({net:+.4g}, {tags})"
     return None

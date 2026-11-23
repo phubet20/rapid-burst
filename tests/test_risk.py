@@ -128,7 +128,8 @@ def test_pacer_has_no_fixed_cooldowns_and_streak_only_raises_the_bar():
 
 
 def test_min_lot_floor_total_cap_and_catastrophic_safe_mode():
-    cfg = EngineConfig()                                  # t30u aggressive defaults
+    cfg = EngineConfig(max_total_risk_pct=100.0, small_account_batch_risk_pct=50.0, equity_drawdown_pct=50.0,
+                       safe_dd_cap_pct=50.0)            # the t30u aggressive limits (t32u defaults are lower)
     g = RiskGuard(cfg)
     g.reset_session(13.0)
     small = AccountView(13, 13, 12, 0)
