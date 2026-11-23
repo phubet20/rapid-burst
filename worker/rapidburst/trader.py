@@ -1786,6 +1786,12 @@ class Trader:
                 self.recoveries["cycle_tp"] += 1
                 return (f"CYCLE TAKE PROFIT {sym}: hedge + recovery legs net {tot:+.2f} >= {tgt:.2f} "
                         f"({len(allsym)} legs, sides {'/'.join(sorted(sides))})"), allsym
+            if multi and len(sides) > 1:
+                # t44u (owner): both sides open on the symbol (an old hedged set) close TOGETHER, in profit. A green
+                # basket is never taken alone while its opposite basket is red - that is what left one side + and the
+                # other -; the set waits for its combined net to reach the cycle target above.
+                self._reverse_to.pop(sym, None)
+                return None, None
         money = self._net(legs, live)
         green = money > cfg.tp_min_money
         d = 1 if legs[0].side == "BUY" else -1
@@ -1814,13 +1820,17 @@ class Trader:
                                                      peak * (1.0 - cfg.profit_lock_giveback)):
                 fast = (f"PROFIT LOCK: basket net {money:+.2f} fell from its peak {peak:+.2f} (lock {lock:.2f}) - "
                         f"taking the profit before it turns red")
-            elif green and (st.side == ("SELL" if d > 0 else "BUY")
-                            or (getattr(m, "ready", False) and d * m.vel < 0 and money < 0.5 * max(peak, lock))):
-                # t43u: about to turn negative by the signal (opposite signal, or price moving against while thin)
-                fast = (f"EARLY CLOSE: {'opposite ' + st.side + ' signal' if st.side in ('BUY', 'SELL') else 'price turning against'}"
-                        f" while still green ({money:+.2f}) - close before it turns red")
+            elif green and st.side == ("SELL" if d > 0 else "BUY"):
+                # t43u: about to turn negative by the signal. t44u (owner: closes were too short): ONLY a real opposite
+                # signal closes early - a momentary velocity flip (d * m.vel < 0) no longer does, and the opposite
+                # signal must persist through the normal anti-jitter confirmation (not the 1-tick profit-grab one)
+                fast = (f"EARLY CLOSE: opposite {st.side} signal while still green ({money:+.2f}) - "
+                        f"close before it turns red")
             if fast:
-                reason = self._confirm_soft_exit(key, sym, fast, m, now_wall, cfg.profit_lock_confirm_s, 1)
+                if fast.startswith("EARLY CLOSE"):
+                    reason = self._confirm_soft_exit(key, sym, fast, m, now_wall)
+                else:
+                    reason = self._confirm_soft_exit(key, sym, fast, m, now_wall, cfg.profit_lock_confirm_s, 1)
                 if reason and self._net(legs, live) > cfg.tp_min_money:
                     return reason, legs
                 return None, None

@@ -485,3 +485,20 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   (`emergency_stale_s`). A red basket is never closed by the strategy: the loss guardian hedges / layers it and the
   cycle closes when the combined net is in profit. This cannot guarantee the account never decreases: open losses
   can grow without a stop until the margin emergency closes them.
+
+## t44u — recovery cancelled, sets close together, longer targets, stricter entries (owner request)
+
+* **Hedge basket and averaging layers are CANCELLED.** Live logs showed the guardian opening an opposite basket
+  every time a basket was red for ~20 s (dozens in 25 minutes), leaving one side green and the other red.
+  `hedge_enabled` / `avg_enabled` default to False, `EngineConfig.load()` forces them off (config file,
+  `RB_CONFIG_JSON`) and they, `avg_*` and `recovery_*` are no longer runtime-tunable. A red basket is now simply
+  HELD: no new orders, closed only when it returns to profit (or by the margin / data-feed emergencies above).
+* **Mixed sets close together.** If both sides are still open on a symbol (an old hedged set), a green basket is
+  never taken alone: the whole set closes when its combined net >= `cycle_tp_pct` of equity (`CYCLE TAKE PROFIT`).
+* **Longer profit capture:** `tp_target_atr` 0.4 -> 0.6, `tp_grab_x` 1.5 -> 2.0 (immediate grab at 1.2 ATR instead
+  of 0.6), `tp_target_giveback` 20% -> 25%. EARLY CLOSE now needs a real opposite signal that persists through the
+  normal anti-jitter confirmation; a momentary velocity flip no longer closes a thin profit.
+* **Entries** (no hedge safety net any more): `regime_counter_veto` - no entry against an intact M5 structure (SELL
+  in UP / BUY in DOWN) unless a wick tip or demand/supply zone backs it; `regime_chase_atr` 2.0 -> 1.5;
+  `regime_mid_penalty` 0.06 -> 0.10 (middle of a sideways range); `mb_edge` 0.03 -> 0.06 (a near-tie BUY/SELL is
+  noise). These are reasoned changes, NOT back-tested on real data.

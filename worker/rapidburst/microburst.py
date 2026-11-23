@@ -677,6 +677,10 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         bonus = getattr(cfg, "regime_bonus", 0.10)
         if rv.dir == -d:
             s -= 0.15                                  # against the remembered state (a structure break flips it first)
+            if getattr(cfg, "regime_counter_veto", True) and not (wick or in_zone):
+                # t44u: no hedge safety net any more - do not trade against an INTACT M5 structure unless a wick /
+                # zone backs it (a real reversal breaks the structure first, which flips the state: not blocked)
+                vetoes.append(f"against the M5 structure ({rv.state} phase {rv.phase}) with no wick / zone to back it")
         elif rv.dir == d:
             ext = d * (m.mid - rv.origin) / max(rv.atr, 1e-12) if rv.origin else 0.0
             if ext > getattr(cfg, "regime_chase_atr", 2.0) and not wick and not in_zone:
@@ -691,7 +695,7 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
             if edge and (wick or in_zone):
                 s += bonus                             # sideways: fade the range edge at a wick
             elif 0.35 < pos < 0.65:
-                s -= 0.06                              # middle of the range: weak
+                s -= getattr(cfg, "regime_mid_penalty", 0.06)   # middle of the range: weak (t44u: 0.06 -> 0.10)
         c["regime"] = rv.dir * d
     if f is not None:
         from .indicators import sr_block

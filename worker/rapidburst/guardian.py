@@ -1,7 +1,12 @@
 """t42u LOSS GUARDIAN (owner-requested, demo): stands guard over every open bot basket, every loop, signal or not.
 
+t44u (owner): the hedge basket and the averaging layers below are CANCELLED (hedge_enabled / avg_enabled are forced
+off in EngineConfig.load() and are not tunable), so the guardian now only WATCHES red baskets and reports them; the
+trader's `_recovery` returns False without opening anything. The code paths stay only so an old saved state and the
+combined CYCLE TAKE PROFIT of an already-open mixed set keep working.
+
 For each symbol with bot positions it measures each side's net (broker P/L + swap), age and whether it ever went
-green, and acts through the trader's own verified execution paths:
+green, and (when enabled) acts through the trader's own verified execution paths:
   * red and not green after `recovery_after_s`, or red beyond `recovery_loss_pct` of equity, with the OPPOSITE side
     signalling -> opposite (hedge) basket;
   * still red and price `avg_spacing_atr` ATR better than the worst entry -> owner-requested averaging layer
@@ -49,7 +54,7 @@ class LossGuardian:
                     if tr._recovery(s, mine, m, st, info, status, now_wall, time.time(), hedging):
                         action = "recovery action taken"
                     else:
-                        action = status.get("reason") or "red - waiting for an opposite signal / layer spacing"
+                        action = status.get("reason") or "red - holding (no hedge / averaging; closes in profit)"
                 if now_wall - self._last_log.get(s, 0.0) > 15.0:
                     self._last_log[s] = now_wall
                     tr.add_log("INFO", f"GUARD {s}: net {total:+.2f} " + ", ".join(

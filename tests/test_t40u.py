@@ -67,7 +67,8 @@ def test_close_only_in_profit(tmp_path):
 
 
 def test_recovery_hedge_opens_opposite_basket(tmp_path):
-    tr, br, ctl = _session(tmp_path, recovery_after_s=5.0, avg_enabled=False)
+    # t44u: hedging is OFF by default and locked off in load(); this exercises the retained legacy path explicitly
+    tr, br, ctl = _session(tmp_path, recovery_after_s=5.0, hedge_enabled=True, avg_enabled=False)
     ctl["side"] = "BUY"
     run(tr, br, T0 + 1.3, T0 + 3)
     assert br.positions_ and {p["type"] for p in br.positions_.values()} == {0}
@@ -82,7 +83,7 @@ def test_recovery_hedge_opens_opposite_basket(tmp_path):
 
 
 def test_recovery_layers_at_better_prices_capped(tmp_path):
-    tr, br, ctl = _session(tmp_path, hedge_enabled=False, avg_max_layers=2, avg_spacing_atr=0.5)
+    tr, br, ctl = _session(tmp_path, hedge_enabled=False, avg_enabled=True, avg_max_layers=2, avg_spacing_atr=0.5)
     ctl["side"] = "BUY"
     run(tr, br, T0 + 1.3, T0 + 3)
     assert br.positions_ and {p["type"] for p in br.positions_.values()} == {0}
@@ -113,7 +114,7 @@ def test_recovery_layers_at_better_prices_capped(tmp_path):
 
 
 def test_cycle_take_profit_closes_hedged_legs_together(tmp_path):
-    tr, br, ctl = _session(tmp_path, recovery_after_s=1.0, avg_enabled=False)
+    tr, br, ctl = _session(tmp_path, recovery_after_s=1.0, hedge_enabled=True, avg_enabled=False)
     ctl["side"] = "BUY"
     run(tr, br, T0 + 1.3, T0 + 3)
     assert br.positions_ and {p["type"] for p in br.positions_.values()} == {0}
@@ -175,7 +176,7 @@ def _green_session(tmp_path):
 
 def test_t43u_take_profit_at_target_grab(tmp_path):
     tr, br, ctl, held = _green_session(tmp_path)
-    tr._net = lambda legs, live: 1e6                                   # far beyond 1.5x any target -> grab now
+    tr._net = lambda legs, live: 1e6                                   # far beyond tp_grab_x x any target -> grab now
     run(tr, br, T0 + 3.3, T0 + 4.2)
     assert not (held & set(br.positions_))
     assert any("TAKE PROFIT" in l["msg"] for l in tr.logs if l["msg"].startswith("EXIT GROUP"))

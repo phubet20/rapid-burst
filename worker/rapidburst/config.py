@@ -34,9 +34,10 @@ TUNABLE = {
     "nostop_margin_use_pct": (5.0, 90.0), "batch_margin_pct": (1.0, 60.0), "emergency_margin_level_pct": (50.0, 1000.0),
     "zone_target_exit": (0, 1), "full_batch": (0, 1),
     "regime_enabled": (0, 1), "regime_pivot_k": (1, 5), "regime_max_phase": (3, 12), "regime_adx_min": (0.0, 40.0),
-    "regime_chase_atr": (0.5, 6.0), "regime_bonus": (0.0, 0.3), "hedge_enabled": (0, 1), "recovery_after_s": (5.0, 3600.0),
-    "recovery_loss_pct": (0.2, 50.0), "avg_enabled": (0, 1), "avg_spacing_atr": (0.2, 10.0), "avg_max_layers": (0, 10),
-    "avg_lot_mult": (1.0, 3.0), "cycle_tp_pct": (0.01, 10.0), "tp_min_money": (0.0, 100.0),
+    "regime_chase_atr": (0.5, 6.0), "regime_bonus": (0.0, 0.3), "regime_counter_veto": (0, 1), "regime_mid_penalty": (0.0, 0.3),
+    # t44u: hedge / averaging recovery is CANCELLED (owner) - hedge_enabled, avg_*, recovery_* are deliberately NOT tunable
+    # and EngineConfig.load() forces them off, so neither the UI nor RB_CONFIG_JSON can switch them back on
+    "cycle_tp_pct": (0.01, 10.0), "tp_min_money": (0.0, 100.0),
     "tp_target_atr": (0.05, 3.0), "tp_target_money": (0.0, 1000.0), "tp_target_giveback": (0.05, 0.9),
     "tp_grab_x": (1.0, 5.0), "profit_lock_min_money": (0.0, 100.0), "profit_lock_spread_x": (0.5, 10.0), "profit_lock_giveback": (0.1, 0.9),
     "profit_lock_floor_frac": (0.0, 0.9), "profit_lock_confirm_s": (0.0, 3.0), "zones_enabled": (0, 1), "zone_weight": (0.0, 0.3), "zone_impulse_atr": (0.5, 3.0),
@@ -119,7 +120,7 @@ class EngineConfig:
     mb_vel_ref_atr: float = 0.25      # velocity (ATR per window) that counts as full strength
     mb_min_velocity: float = 0.08     # the chosen side needs at least this much live velocity component
     mb_threshold: float = 0.40        # t35u: 0.55 -> 0.40 (live: 'below threshold' was ~50/60 s of every minute); base strength threshold (adapted to regime, spread and slippage risk)
-    mb_edge: float = 0.03             # t35u: 0.08 -> 0.03; chosen side must beat the other side by this much (each side scored on its own)
+    mb_edge: float = 0.06             # t35u: 0.08 -> 0.03, t44u: 0.06 (no hedge safety net any more: a near-tie BUY/SELL is noise); chosen side must beat the other side by this much (each side scored on its own)
     mb_scan_support: float = 0.35     # a family (A/B/C/D/E) supports a side when its score >= this
     mb_min_agree: int = 2             # families that must agree (of A tick, B activity/candle, C structure,
                                       # D M1 timing, E M5 bias), one of them C or D (structure / candle trigger):
@@ -191,27 +192,37 @@ class EngineConfig:
     regime_pivot_k: int = 2
     regime_max_phase: int = 5
     regime_adx_min: float = 15.0
-    regime_chase_atr: float = 2.0     # no entry once price is > x ATR (M5) beyond the pullback origin (already spiked)
+    regime_chase_atr: float = 1.5     # t44u: 2.0 -> 1.5; no entry once price is > x ATR (M5) beyond the pullback origin (already spiked)
     regime_bonus: float = 0.10        # strength bonus for a pullback-wick entry with the trend / a range-edge fade
-    # t40u recovery (OWNER-REQUESTED): hedge basket and averaging layers instead of loss stops
-    hedge_enabled: bool = True        # basket not green after recovery_after_s or red beyond recovery_loss_pct AND the
-    recovery_after_s: float = 20.0    # t41u: 20 s; opposite side has a valid signal -> open the opposite basket (hedging account)
+    # t44u: an entry AGAINST an intact M5 structure (SELL while the state is UP, BUY while it is DOWN) is vetoed unless
+    # a wick / demand-supply zone backs it (a real reversal breaks the structure first and flips the state, so it is
+    # not blocked); the middle of a sideways range costs regime_mid_penalty (was 0.06)
+    regime_counter_veto: bool = True
+    regime_mid_penalty: float = 0.10
+    # t40u recovery (OWNER-REQUESTED) was CANCELLED in t44u (owner): the hedge basket and the averaging layers kept
+    # opening opposite / extra baskets on every red basket, leaving one side green and the other red. Both stay OFF
+    # (EngineConfig.load() forces them off; they are not runtime-tunable). The fields remain only so old saved state,
+    # tests and the legacy CYCLE TAKE PROFIT path (closing already-open mixed sets together) keep working.
+    hedge_enabled: bool = False
+    recovery_after_s: float = 20.0
     recovery_loss_pct: float = 2.0
-    avg_enabled: bool = True          # add layers to a LOSING basket at better prices (owner-requested averaging)
+    avg_enabled: bool = False
     avg_spacing_atr: float = 1.0      # each layer >= x M1 ATR beyond the previous worst entry
     avg_max_layers: int = 4
     avg_lot_mult: float = 1.0         # lot multiplier per layer (1.0 = no martingale; tunable up by the owner)
-    cycle_tp_pct: float = 0.3         # hedged/recovery cycle closes when the symbol's combined net >= x% of equity
+    cycle_tp_pct: float = 0.3         # a mixed / layered set closes TOGETHER when the symbol's combined net >= x% of equity
     tp_min_money: float = 0.0         # close only when the basket net > this (account currency)
     # t41u fast PROFIT LOCK: once a basket's net > max(profit_lock_min_money, profit_lock_spread_x x its spread cost)
     # the profit is locked; it closes at once (short anti-jitter confirm) when the net gives back
     # profit_lock_giveback of its peak or falls to the floor (profit_lock_floor_frac x the lock level) - before red
     # t43u profit TARGET (not tiny): basket net >= max(tp_target_money, tp_target_atr x M1 ATR on its lots); after it
     # the profit is grabbed when it gives back tp_target_giveback of its peak, or at once at tp_grab_x x the target
-    tp_target_atr: float = 0.4
+    # t44u (owner: closes were too short): target 0.4 -> 0.6 ATR, immediate grab 1.5x -> 2.0x the target (0.6 -> 1.2 ATR),
+    # giveback 20% -> 25% of the peak so a normal wobble no longer ends a basket that is still running
+    tp_target_atr: float = 0.6
     tp_target_money: float = 0.10
-    tp_target_giveback: float = 0.2
-    tp_grab_x: float = 1.5
+    tp_target_giveback: float = 0.25
+    tp_grab_x: float = 2.0
     profit_lock_min_money: float = 0.03
     profit_lock_spread_x: float = 2.0
     profit_lock_giveback: float = 0.4
@@ -332,6 +343,8 @@ class EngineConfig:
                     setattr(cfg, k, v)
                 else:
                     setattr(cfg, k, type(cur)(v))
+        cfg.hedge_enabled = False          # t44u (owner): the hedge / averaging recovery is cancelled - never re-enabled
+        cfg.avg_enabled = False            # from a config file, RB_CONFIG_JSON or the runtime tune endpoint
         return cfg
 
     @classmethod
