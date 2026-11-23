@@ -8,7 +8,20 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, asdict, fields
+from dataclasses import dataclass, asdict, fields
+
+
+RISK_ENV = (("RB_BROKER_SL", "broker_sl"), ("RB_SAFE_PAUSE_S", "safe_pause_s"),
+            ("RB_MAX_DD_PCT", "equity_drawdown_pct"), ("RB_LEARNING_ENABLED", "learning_enabled"),
+            ("RB_RISK_PER_TRADE_PCT", "risk_per_trade_pct"), ("RB_MAX_TOTAL_RISK_PCT", "max_total_risk_pct"),
+            ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"), ("RB_MAX_ORDERS_PER_GROUP", "max_orders_per_batch"),
+            ("RB_MAX_ORDERS_PER_BATCH", "max_orders_per_batch"), ("RB_RISK_PER_BATCH_PCT", "risk_per_batch_pct"),
+            ("RB_GROUP_LOSS_PCT", "group_loss_pct"), ("RB_MB_MAX_CHASE_ATR", "mb_max_chase_atr"),
+            ("RB_MB_MAX_BAR_ATR", "mb_max_bar_atr"), ("RB_MB_THRESHOLD", "mb_threshold"),
+            ("RB_SL_ATR", "sl_atr"), ("RB_COMMISSION_PER_LOT", "commission_per_lot"))
+INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE", "RB_CONFIG_JSON", "RB_DATA_DIR",
+             "RB_ENV_FILE", "RB_FALLBACK_POLL_MINUTES", "RB_KEEPALIVE_SECONDS", "RB_LINGER_SECONDS",
+             "RB_STANDBY_SECONDS", "RB_TEST_BROKER_FACTORY", "RB_UI_PASSWORD", "RB_WAKE_URL"}
 
 
 @dataclass
@@ -146,14 +159,7 @@ class EngineConfig:
             except ValueError:
                 pass
         # (RB_DAILY_LOSS_PCT is no longer read: there is no all-day daily-loss halt)
-        for env, key in (("RB_BROKER_SL", "broker_sl"), ("RB_SAFE_PAUSE_S", "safe_pause_s"),
-                         ("RB_MAX_DD_PCT", "equity_drawdown_pct"), ("RB_LEARNING_ENABLED", "learning_enabled"),
-                         ("RB_RISK_PER_TRADE_PCT", "risk_per_trade_pct"), ("RB_MAX_TOTAL_RISK_PCT", "max_total_risk_pct"),
-                         ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"), ("RB_MAX_ORDERS_PER_GROUP", "max_orders_per_batch"),
-                         ("RB_MAX_ORDERS_PER_BATCH", "max_orders_per_batch"), ("RB_RISK_PER_BATCH_PCT", "risk_per_batch_pct"),
-                         ("RB_GROUP_LOSS_PCT", "group_loss_pct"), ("RB_MB_MAX_CHASE_ATR", "mb_max_chase_atr"),
-                         ("RB_MB_MAX_BAR_ATR", "mb_max_bar_atr"), ("RB_MB_THRESHOLD", "mb_threshold"),
-                         ("RB_SL_ATR", "sl_atr"), ("RB_COMMISSION_PER_LOT", "commission_per_lot")):
+        for env, key in RISK_ENV:
             if os.environ.get(env, "").strip():
                 data[key] = os.environ[env]
         names = {f.name for f in fields(cls)}
@@ -166,6 +172,25 @@ class EngineConfig:
                 else:
                     setattr(cfg, k, type(cur)(v))
         return cfg
+
+    @classmethod
+    def env_report(cls) -> dict:
+        """Which risk/engine env overrides are active on this server (values of these numeric settings only),
+        RB_CONFIG_JSON keys (no values) and NAMES of set RB_* variables this version ignores (never values)."""
+        names = {f.name for f in fields(cls)}
+        applied = {e: os.environ[e].strip() for e, _ in RISK_ENV if os.environ.get(e, "").strip()}
+        cj = []
+        raw = os.environ.get("RB_CONFIG_JSON", "").strip()
+        if raw:
+            try:
+                cj = sorted(json.loads(raw))
+            except ValueError:
+                cj = ["<invalid JSON>"]
+        known = {e for e, _ in RISK_ENV} | INFRA_ENV
+        ignored = sorted(k for k in os.environ if k.startswith("RB_") and k not in known)
+        return {"applied": applied, "config_json_keys": cj,
+                "config_json_ignored": [k for k in cj if k not in names and k != "<invalid JSON>"],
+                "ignored_env": ignored}
 
     def public(self) -> dict:
         return asdict(self)

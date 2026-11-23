@@ -185,3 +185,14 @@ def test_verified_closed_ticket_is_never_closed_twice(tmp_path):
     br.positions = real_pos
     assert len(calls) == n and len(set(calls)) == len(calls)
     assert tr.lat_exits and "close_ms" in tr.lat_exits[-1]
+
+
+def test_env_report_flags_stale_vars_and_never_shows_secret_values(monkeypatch):
+    monkeypatch.setenv("RB_DAILY_LOSS_PCT", "3")
+    monkeypatch.setenv("RB_BASKET_ENABLED", "1")
+    monkeypatch.setenv("RB_MAX_MARGIN_USE_PCT", "70")
+    monkeypatch.setenv("RB_UI_PASSWORD", "very-secret-value")
+    r = EngineConfig.env_report()
+    assert r["applied"] == {"RB_MAX_MARGIN_USE_PCT": "70"}
+    assert {"RB_DAILY_LOSS_PCT", "RB_BASKET_ENABLED"} <= set(r["ignored_env"])
+    assert "very-secret-value" not in repr(r) and "RB_UI_PASSWORD" not in r["ignored_env"]

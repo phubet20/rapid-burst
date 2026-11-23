@@ -25,6 +25,22 @@ import aiohttp
 
 log = logging.getLogger("rb.cloud")
 REPO = Path(__file__).resolve().parent.parent
+_ENV_REPORT: Optional[dict] = None
+
+
+def config_env_report() -> dict:
+    """Active engine env overrides (numeric risk settings only) and names of ignored stale RB_* vars.
+    Never includes secrets (passwords / API keys are not RB_ risk settings and their values are never read)."""
+    global _ENV_REPORT
+    if _ENV_REPORT is None:
+        try:
+            if str(REPO / "worker") not in sys.path:
+                sys.path.insert(0, str(REPO / "worker"))
+            from rapidburst.config import EngineConfig     # noqa: WPS433
+            _ENV_REPORT = EngineConfig.env_report()
+        except Exception as exc:  # noqa: BLE001
+            _ENV_REPORT = {"error": type(exc).__name__}
+    return _ENV_REPORT
 
 ACTIVE_PHASES = {"STARTING", "RUNNING", "STOPPING"}
 
@@ -70,7 +86,8 @@ class CloudEngine:
         return {"mode": "cloud", "provider": "TickerAll",
                 "launcher_pid": self.proc.pid if self.proc and self.proc.returncode is None else None,
                 "launcher_restarts": self.restarts, "keepalive": dict(self.keepalive),
-                "api_key_set": bool((self.extra_env.get("TICKERALL_API_KEY") or os.environ.get("TICKERALL_API_KEY", "")).strip())}
+                "api_key_set": bool((self.extra_env.get("TICKERALL_API_KEY") or os.environ.get("TICKERALL_API_KEY", "")).strip()),
+                "config_env": config_env_report()}
 
     def child_env(self) -> dict:
         env = dict(os.environ)
