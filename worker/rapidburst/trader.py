@@ -94,6 +94,8 @@ class Trader:
         self.m1_bars: dict[str, list] = {}          # completed broker M1 bars (candle context)
         self._mcache: dict[str, tuple] = {}          # per-loop micro analysis cache
         self._ind_cache: dict = {}
+        self._reverse_to: dict = {}
+        self.reversals = 0
         self.last_burst: dict[str, dict] = {}        # duplicate prevention: last traded burst per symbol
         self._recv_wall: dict[str, float] = {}       # real wall time the latest tick of a symbol reached the worker
         self._feed_ms: dict[str, float] = {}         # broker tick time -> worker receipt (when the API provides it)
@@ -839,7 +841,7 @@ class Trader:
     def _ind_view(self, s: str, mt, price: float):
         """Indicator confluence (indicators.py) from the real closed M1 bars, recomputed once per new closed bar
         (cached), plus the live price."""
-        bars = mt.m1.bars
+        bars = mt.m5.bars if len(mt.m5.bars) >= 30 else mt.m1.bars      # t34u: indicators on the M5 frame
         if not bars:
             return None
         key = (len(bars), bars[-1]["time"], bars[-1]["close"])
@@ -968,13 +970,13 @@ class Trader:
                 continue
             last = self.last_burst.get(s)
             lvl = m.micro_hi if side == "BUY" else m.micro_lo
-            if (last and last.get("side") == side and abs(float(last.get("origin", 0.0)) - st.origin) < 0.5
+            if (last and last.get("rejected") and last.get("side") == side
                     and abs(float(last.get("level", lvl)) - lvl) <= 0.1 * max(m.atr, 1e-12)
-                    and last.get("lost", True)):
-                # only a signal that FAILED (losing basket) or was rejected by the broker is not re-fired; a signal
-                # whose basket won may be re-entered at once if it still scores (continuation)
-                self._skip(s, status, f"{side} skipped: duplicate - this exact signal (same swing and trigger level) "
-                                      f"already failed / was rejected", now_wall, sig)
+                    and now_wall - float(last.get("wall", 0.0)) < 3.0):
+                # t34u: only a signal the BROKER REJECTED is not re-sent for 3 s (no blind resend). A losing basket's
+                # signal no longer locks that side until the swing changes (that held re-entry back 25-40 s live)
+                self._skip(s, status, f"{side} skipped: the broker just rejected this signal - not re-sent blindly",
+                           now_wall, sig)
                 continue
             if last and float(last.get("tick_t", -1.0)) == m.t:
                 self._skip(s, status, f"{side} skipped: duplicate - same tick", now_wall, sig)
@@ -986,18 +988,16 @@ class Trader:
                 learn.bucket = bucket
                 self.learn_view[s] = learn.why
                 if not learn.allow:
-                    self._skip(s, status, learn.why, now_wall, sig)
-                    continue
-            if self.risk.need_confirm:
-                v = m.mtf
-                dd = 1 if side == "BUY" else -1
-                fresh = v is not None and v.m1.ready and (v.m1.sbreak == dd or (v.m1.swing == dd and v.m1.structure == dd))
-                if not fresh:
-                    self._skip(s, status, f"{side} waits: after safe mode the first entry needs a fresh M1 structure "
-                                          f"confirmation (swing break or HH/HL-LH/LL with the trade)", now_wall, sig)
-                    continue
+                    # t34u: the learner sizes, it never locks entries - a losing setup trades the min lot
+                    learn.allow, learn.min_lot = True, True
+                    learn.why += " -> min lot (no skip)"
+            rev = self._reverse_to.pop(s, None)
             if self._open_batch(s, side, m, st, info, status, now_wall, t_dec, learn):
                 self.risk.need_confirm = False
+                if rev:
+                    g = self.bursts.get(self.last_burst.get(s, {}).get("gid", ""), {})
+                    g["reversal"] = True
+                    self.reversals += 1
 
     def _add_check(self, s: str, legs: list, g: dict, m, st, now_wall: float) -> Optional[str]:
         """Pyramid ADD (None = add now, else why not): only into a basket whose stop is already at break-even or
@@ -1277,7 +1277,7 @@ class Trader:
         self.pacer.on_entry(s, now_wall)
         if opened == 0:
             # the broker rejected this setup: never resend the SAME unchanged signal (no retry loop)
-            self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t,
+            self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t, "rejected": True, "wall": now_wall,
                              "level": m.micro_hi if side == "BUY" else m.micro_lo}
             return False
         g = self.bursts[gid]
@@ -1292,7 +1292,9 @@ class Trader:
         v1 = v.m1 if v is not None and v.m1.ready else None
         fam = st.scan.get(side, {})
         g["attr"] = {
-            "trend": ("n/a" if v is None or not v.m1.ready else "aligned" if d * v.bias >= 0.2
+            "trend": ("n/a" if v is None or not v.m5.ready else "aligned" if d * v.m5_bias >= 0.2
+                      else "against" if d * v.m5_bias <= -0.2 else "neutral") if v is not None and v.m5.ready else
+                     ("n/a" if v is None or not v.m1.ready else "aligned" if d * v.bias >= 0.2
                    else "against" if d * v.bias <= -0.2 else "neutral"),
             "macd": ("n/a" if v1 is None else "expanding with" if d * v1.hist_slope > 0.03
                      else "turning against" if d * v1.hist_slope < -0.03 else "flat"),
@@ -1301,6 +1303,7 @@ class Trader:
             "tick": "strong" if (fam.get("A") or 0) >= 0.6 else "moderate",
             "agree": "".join(k for k, x in fam.items() if x is not None and x >= cfg.mb_scan_support),
             "regime": m.regime}
+        g["sb0"] = v.m1.sbreak if v is not None and v.m1.ready else 0       # M1 swing state at entry
         g["spread_pts"] = round(m.spread / point, 1) if point else None
         g["m1_bar"] = self._m1_bar(s, now_wall)
         self._cycles(s, now_wall)["opened"] += 1
@@ -1318,7 +1321,7 @@ class Trader:
         if iv is not None and getattr(iv, "ready", False):
             g["ind_votes"] = {k: round(d * x, 3) for k, x in iv.votes.items()}      # toward the trade side
         g["sl_src"] = sl_src
-        msg = (f"BATCH {gid} {side} {s}: {opened}/{n} order(s) filled, {opened * size.volume:g} lots | M1 trend {g['attr']['trend']}, "
+        msg = (f"BATCH {gid} {side} {s}: {opened}/{n} order(s) filled, {opened * size.volume:g} lots | M5 {g['attr']['trend']}, "
                f"M1 MACD {g['attr']['macd']}, volume {g['attr']['volume']}, agree {g['attr']['agree']}"
                + (f" | re-entry {g['reentry_s']:.2f}s after the last basket closed" if "reentry_s" in g else ""))
         if opened < n:
@@ -1473,6 +1476,8 @@ class Trader:
                 reason = self._protect_basket(key, legs, live, m, st, now_wall)   # BE / dynamic trailing
             if not reason and self.running:
                 reason = self._micro_exit(key, legs, live, m, st, now_wall)
+            if not reason and self.running:
+                reason = self._reversal_check(legs, m, st)
             if not reason:
                 continue
             closed = []
@@ -1512,6 +1517,22 @@ class Trader:
                          + ", ".join(closed))
             self._refresh_account()
             self._adopt_positions()          # book the closed basket now: the same loop can re-enter on a fresh signal
+
+    def _reversal_check(self, legs: list, m, st) -> Optional[str]:
+        """t34u AUTO-REVERSAL: the OPPOSITE side passes its own entry check (positive evidence, threshold, families)
+        and beats the held side's strength by `reverse_edge` -> close this basket now (every close verified on
+        MT5); the same loop's entry pass then opens the opposite batch at once. A failed close leaves the legs
+        open, so the opposite side is never opened on top of them (no hedge, no blind resend)."""
+        cfg = self.cfg
+        if not cfg.reverse_enabled or not getattr(m, "ready", False) or st.side in ("NO TRADE", legs[0].side):
+            return None
+        held = st.buy if legs[0].side == "BUY" else st.sell
+        opp = st.sell if legs[0].side == "BUY" else st.buy
+        if opp - held < cfg.reverse_edge:
+            return None
+        self._reverse_to[legs[0].symbol] = st.side
+        return (f"REVERSAL: {st.side} momentum has the edge ({st.side} {opp:.2f} vs {legs[0].side} {held:.2f}) - "
+                f"close {legs[0].side}, verify, open {st.side}")
 
     def _group_pl(self, legs: list, live: dict, m, now_wall: float):
         """(executable P/L per unit in price, floating money) for a group, from the broker's prices."""
@@ -1872,7 +1893,7 @@ class Trader:
             if not self._tradable(s)[0]:
                 continue
             mt = self.mtf.setdefault(s, MTF())
-            for tf, every, hours in (("M1", cfg.candle_poll_m1_s, 2),):       # t30u: M1 only
+            for tf, every, hours in (("M1", cfg.candle_poll_m1_s, 2), ("M5", cfg.candle_poll_m5_s, 8)):   # t34u: M5 main
                 key = (s, tf)
                 job = self._candle_jobs.get(key)
                 if job is not None:
@@ -2060,7 +2081,8 @@ class Trader:
                           "(EMA + HH/HL-LH/LL swings) + M1 intrabar trigger + RSI/MACD/volume/candle/structure/velocity, "
                           "2-8 order baskets, pyramid adds after BE, spike exits, momentum hold, basket BE + trailing, "
                           "persistent learning)",
-                "min_agree": c.mb_min_agree, "candle_poll_s": {"M1": c.candle_poll_m1_s},
+                "min_agree": c.mb_min_agree, "candle_poll_s": {"M1": c.candle_poll_m1_s, "M5": c.candle_poll_m5_s},
+                "reverse_enabled": c.reverse_enabled, "reverse_edge": c.reverse_edge, "reversals": self.reversals,
                 "safe_dd_limit": round(self.risk.dd_limit(), 2) if self.risk.peak_equity else None,
                 "loss_streak_add": round(max((self.pacer.threshold_add(x) for x in self.selected), default=0.0), 2),
                 "risk_per_trade_pct": c.risk_per_trade_pct, "max_total_risk_pct": c.max_total_risk_pct,

@@ -591,7 +591,11 @@ def _mtf_scores(m: Micro, d: int) -> tuple:
     if v is None:
         return None, None, 0.0
     dd = v.timing(d) if v.m1.ready else None
-    e = _clip(d * v.bias / 0.6) if v.m1.ready else None        # E = M1 MAIN TREND (t30u: no M5)
+    # t34u: E = M5 MAIN MOMENTUM on the forming M5 bar (no close wait); before M5 bars exist, the M1 trend
+    if v.m5.ready:
+        e = v.m5_momentum(d)
+        return dd, e, d * v.m5_bias
+    e = _clip(d * v.bias / 0.6) if v.m1.ready else None
     return dd, e, d * v.bias
 
 
@@ -649,7 +653,7 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         c["m1_timing"] = dd
     if e is not None:
         num, den = num + W_TREND * e, den + W_TREND
-        c["m1_trend"] = e
+        c["m5_momentum"] = e
     iv = m.ind
     f = None
     if iv is not None and getattr(iv, "ready", False) and getattr(cfg, "ind_enabled", True):
@@ -662,25 +666,25 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         from .indicators import sr_block
         sr = sr_block(iv, d, m.mid, m.atr, cfg.ind_sr_near_atr)
         if sr:
-            vetoes.append(f"S/R: {sr} - no entry straight into a level")
+            s -= 0.06                                  # t34u: a nearby level is a penalty, not a lock
         if iv.chop and cfg.ind_chop_veto:
             vetoes.append(f"chop: {iv.chop_why}")
+        elif iv.chop:
+            s -= 0.04
         if f < cfg.ind_min_score:
             vetoes.append(f"indicator confluence {f:.2f} < {cfg.ind_min_score:.2f} against the side")
     v = m.mtf
     if v is not None and v.m1.ready:
-        if bias <= -cfg.m1_trend_veto and not (v.m1.sbreak == d or m.struct_break == d):
-            # trade WITH the M1 main trend; counter-trend only right after a confirmed structure break
-            vetoes.append(f"M1 main trend against ({v.bias_label}) - counter-trend needs a structure break")
-        elif bias < 0:
-            s -= 0.12 * min(1.0, -bias / 0.6)          # weak opposite trend only costs strength
+        # t34u: the higher-frame direction only WEIGHS (a reversal starts against it); the hard trend veto and the
+        # swing-break veto blocked every reversal entry
+        if bias < 0:
+            s -= 0.08 * min(1.0, -bias / 0.6)
         elif bias >= 0.3:
-            s += 0.05                                  # with the M1 main trend
+            s += 0.05
         if v.m1.exhaust == d:
             s -= 0.06
         if v.m1.sbreak == -d:
-            # t32u: the exit treats an M1 swing broken against the trade as invalidation - so never ENTER into it
-            vetoes.append("M1 swing structure broken against this side (the exit would invalidate it at once)")
+            s -= 0.05
     if m.early == d:
         s += 0.06                                     # early burst: acceleration starting out of compression
     chase = m.chase_up if d > 0 else m.chase_dn
@@ -703,8 +707,12 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         s -= 0.10
     if m.spread_target > cfg.mb_max_spread_target:
         vetoes.append(f"spread {m.spread_target:.2f}x the capture target (cost too high)")
-    if d * m.vel <= 0 or c["velocity"] < cfg.mb_min_velocity:
-        vetoes.append("no live force in that direction now")
+    # t34u: positive evidence for THIS side is required (absence of the other side is not a signal), but it may
+    # come from live tick force OR the forming M5/M1 bar momentum - not only from instantaneous tick velocity
+    if d * m.vel < 0:
+        vetoes.append("price moving against this side right now")
+    elif c["velocity"] < cfg.mb_min_velocity and max(dd or 0.0, e or 0.0) < cfg.mb_scan_support:
+        vetoes.append("no live force in that direction now (ticks, M1 and M5 momentum all weak)")
     fam = (round(a, 3), round(b, 3), round(cs, 3), None if dd is None else round(dd, 3),
            None if e is None else round(e, 3), None if f is None else round(f, 3))
     return _clip(s), c, fam, vetoes
@@ -745,7 +753,7 @@ def decide(m: Micro, cfg) -> Strength:
         agree = [f for f, x in zip(FAMILIES, sc) if x is not None and x >= lvl]
         need = max(2, min(cfg.mb_min_agree, len(avail)))
         # t32u: once M1 bars exist the M1 trigger (D) is REQUIRED; before that micro-structure (C) triggers
-        trig_fams = ("D",) if (cfg.mb_require_m1_trigger and "D" in avail) else ("C", "D")
+        trig_fams = ("D",) if (cfg.mb_require_m1_trigger and "D" in avail) else ("C", "D", "E")
         trigger = [f for f in agree if f in trig_fams]
         if len(agree) < need or not trigger:
             return None, (f"{side} {best:.2f} but only {len(agree)}/{len(avail)} families agree "
@@ -821,7 +829,9 @@ def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, t
     wick = m.rejection == -d
     v = m.mtf
     trend_with = v is not None and v.m1.ready and d * v.bias >= 0.25
-    m1_broke = v is not None and v.m1.ready and v.m1.sbreak == -d          # M1 swing (HL/LH) broken against us
+    # M1 swing (HL/LH) broken against us AFTER the entry (t34u: a reversal entry taken while the old swing was
+    # already broken is not "invalidated" by that same old break - its structure stop protects it)
+    m1_broke = v is not None and v.m1.ready and v.m1.sbreak == -d and g.get("sb0") != -d
     # t32u: structure intact = M1 trend with us (or not against) and no M1 swing break / micro structure failure
     intact = (not m1_broke) and not sig["structure-failure"] and (trend_with or v is None or not v.m1.ready
                                                                   or d * v.bias > -0.25)

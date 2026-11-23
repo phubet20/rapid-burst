@@ -93,7 +93,7 @@ def test_trader_journals_closed_baskets_by_setup(tmp_path):
     assert saved["total"] == tr.learner.total                       # survives an engine restart
 
 
-def test_trader_skips_a_disabled_bucket_with_visible_reason(tmp_path):
+def test_trader_trades_a_disabled_bucket_at_min_lot_only(tmp_path):
     cfg = EngineConfig()
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=1.0)
@@ -105,8 +105,10 @@ def test_trader_skips_a_disabled_bucket_with_visible_reason(tmp_path):
     tr.decisions = collections.deque(maxlen=10_000)
     _start(tr, br, T0 + 1)
     run(tr, br, T0 + 1, T0 + 200)
-    assert not [l for l in tr.logs if l["msg"].startswith("ENTRY")]
-    assert any("losing bucket" in d["outcome"] for d in tr.decisions)
+    # t34u: the learner sizes, it never locks entries - a losing setup only trades the minimum lot
+    entries = [l["msg"] for l in tr.logs if l["msg"].startswith("ENTRY")]
+    assert entries and all("ENTRY BUY 0.01 " in e or "ENTRY SELL 0.01 " in e for e in entries)
+    assert all("min lot" in e for e in entries)
 
 
 class _FakeKV:

@@ -50,6 +50,10 @@ def test_confluence_family_f_vetoes_against_and_requires_d():
     st2 = decide(_live(mtf=_view(0.7), ind=bad), cfg)
     assert st2.side == "NO TRADE" and "confluence" in st2.reason
     chop = ind.IndView(ready=True, votes={k: 0.5 for k in ind.NAMES}, chop=True, chop_why="ADX 12 < 18")
+    plain = ind.IndView(ready=True, votes={k: 0.5 for k in ind.NAMES})
+    # t34u: chop is a small penalty, not a veto (ind_chop_veto restores the veto)
+    assert decide(_live(mtf=_view(0.7), ind=chop), cfg).buy < decide(_live(mtf=_view(0.7), ind=plain), cfg).buy
+    cfg.ind_chop_veto = True
     assert "chop" in decide(_live(mtf=_view(0.7), ind=chop), cfg).reason
 
 

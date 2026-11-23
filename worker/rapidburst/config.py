@@ -30,7 +30,8 @@ INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE"
 # Only strategy/sizing knobs inside safe bounds. Never: live trading, broker SL on/off, magic, credentials.
 TUNABLE = {
     "sl_struct_buffer_atr": (0.0, 0.5), "sl_min_atr": (0.2, 2.0), "sl_max_atr": (0.5, 4.0),
-    "ind_min_score": (0.0, 0.6), "ind_sr_near_atr": (0.0, 1.0), "safe_flatten_pct": (0.0, 95.0), "exit_min_r": (0.0, 2.0),
+    "ind_min_score": (0.0, 0.6), "ind_sr_near_atr": (0.0, 1.0), "safe_flatten_pct": (0.0, 95.0), "exit_min_r": (0.0, 2.0), "reverse_enabled": (0, 1), "reverse_edge": (0.0, 0.5),
+    "candle_poll_m5_s": (5, 120),
     "ind_enabled": (0, 1), "ind_chop_veto": (0, 1), "mb_require_m1_trigger": (0, 1), "sl_structure": (0, 1),
     "mb_threshold": (0.35, 0.90), "mb_edge": (0.0, 0.40), "mb_min_agree": (2, 5), "mb_scan_support": (0.2, 0.7),
     "mb_max_chase_atr": (0.3, 4.0), "mb_max_bar_atr": (0.3, 5.0), "loss_streak_threshold_add": (0.0, 0.1),
@@ -106,13 +107,14 @@ class EngineConfig:
     mb_struct_seconds: float = 20.0   # micro high/low window (s)
     mb_swing_seconds: float = 20.0    # swing used for anti-chase and burst identity (s)
     mb_vel_ref_atr: float = 0.25      # velocity (ATR per window) that counts as full strength
-    mb_min_velocity: float = 0.15     # the chosen side needs at least this much live velocity component
+    mb_min_velocity: float = 0.08     # the chosen side needs at least this much live velocity component
     mb_threshold: float = 0.55        # base strength threshold (adapted to regime, spread and slippage risk)
     mb_edge: float = 0.08             # chosen side must beat the other side by this much (each side scored on its own)
     mb_scan_support: float = 0.35     # a family (A/B/C/D/E) supports a side when its score >= this
     mb_min_agree: int = 2             # families that must agree (of A tick, B activity/candle, C structure,
                                       # D M1 timing, E M5 bias), one of them C or D (structure / candle trigger):
                                       # speed+volume alone (A+B) never trades
+    candle_poll_m5_s: float = 20.0    # t34u: broker M5 candles (main momentum frame; forming bar = live ticks)
     candle_poll_m1_s: float = 8.0     # broker M1 candle refresh (the forming bar comes from live ticks)
     mb_max_chase_atr: float = 1.80    # RB_MB_MAX_CHASE_ATR: no entry if price is > x ATR from the recent swing
     mb_max_bar_atr: float = 2.20      # RB_MB_MAX_BAR_ATR: no entry if the live candle body is > x ATR in that direction
@@ -157,11 +159,13 @@ class EngineConfig:
     sl_max_atr: float = 1.6
     # t32u indicator confluence (family F) - indicators.py
     ind_enabled: bool = True
-    ind_min_score: float = 0.42       # confluence for the side below this (indicators lean against) => veto
+    ind_min_score: float = 0.30       # confluence for the side below this (indicators lean against) => veto
     ind_sr_near_atr: float = 0.20     # no entry into S/R closer than x ATR (unless breaking it)
-    ind_chop_veto: bool = True        # ADX < 18 with no breakout, or a squeeze without the break => no entry
+    ind_chop_veto: bool = False        # ADX < 18 with no breakout, or a squeeze without the break => no entry
+    reverse_enabled: bool = True      # t34u AUTO-REVERSAL: opposite side has the edge -> close, verify, open opposite
+    reverse_edge: float = 0.10        # opposite strength must beat the held side's strength by this much
     exit_min_r: float = 0.0           # discretionary profit exits only at net >= x * stop distance (0 = off)
-    mb_require_m1_trigger: bool = True  # once M1 bars exist, the M1 trigger family D must agree
+    mb_require_m1_trigger: bool = False  # once M1 bars exist, the M1 trigger family D must agree
     safe_flatten_pct: float = 60.0    # last resort: equity this % below the closed-balance peak => flatten all
     soft_stop_mult: float = 1.15      # engine mirror of the hard stop (if the broker SL fails)
     # batch: ONE batch per signal, opened at once, same lot per order, never added to later
@@ -193,8 +197,8 @@ class EngineConfig:
     group_loss_pct: float = 60.0      # RB_GROUP_LOSS_PCT: hard exit when one basket's floating loss >= x% equity
     # NO all-day daily-loss halt. Equity drawdown => SAFE MODE (flatten, pause new entries, resume reduced)
     equity_drawdown_pct: float = 30.0 # RB_MAX_DD_PCT: equity x% below the session peak => safe mode (0 = off)
-    safe_pause_s: float = 180.0       # first safe-mode pause; doubles on each repeat in a session ...
-    safe_pause_max_s: float = 1800.0  # ... up to this
+    safe_pause_s: float = 60.0        # first safe-mode pause; doubles on each repeat in a session ...
+    safe_pause_max_s: float = 900.0  # ... up to this
     safe_probe_batches: int = 0       # after a pause: this many single min-lot batches before normal sizing
     safe_min_stopouts: float = 1.5    # min-lot floor accounts: the safe-mode drawdown is never smaller than this
                                       # many full basket stop losses (one normal basket stop must not trip it) ...

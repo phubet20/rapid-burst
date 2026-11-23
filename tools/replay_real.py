@@ -81,12 +81,23 @@ def build(root: str):
             return price * vol * SPECS[s]["contract"] / 2000.0
 
         def candles(self, symbol, timeframe="M1", hours=0.5):
-            if timeframe != "M1" or symbol not in self.kl:
+            if timeframe not in ("M1", "M5") or symbol not in self.kl:
                 return []
-            i = bisect.bisect_right(self.kt[symbol], self.now - 60.0)       # closed bars only
+            step = 60 if timeframe == "M1" else 300
+            i = bisect.bisect_right(self.kt[symbol], self.now - 60.0)       # closed 1m bars only
             rows = self.kl[symbol][max(0, i - int(hours * 60)):i]
-            return [{"time": k[0], "open": k[1], "high": k[2], "low": k[3], "close": k[4],
-                     "tick_volume": k[5]} for k in rows]
+            out = {}
+            for k in rows:                                                  # M5 = aggregated real 1m klines
+                b0 = k[0] - k[0] % step
+                if b0 + step > self.now:
+                    continue                                                # only CLOSED bars of that frame
+                b = out.get(b0)
+                if b is None:
+                    out[b0] = {"time": b0, "open": k[1], "high": k[2], "low": k[3], "close": k[4], "tick_volume": k[5]}
+                else:
+                    b["high"], b["low"] = max(b["high"], k[2]), min(b["low"], k[3])
+                    b["close"], b["tick_volume"] = k[4], b["tick_volume"] + k[5]
+            return [out[x] for x in sorted(out)]
 
         def market_order(self, s, side, volume, sl, tp, deviation, magic, comment):
             self.sent_orders += 1

@@ -281,7 +281,13 @@ class TF:
 @dataclass
 class MTFView:
     """M1-ONLY view (t30u): `bias` = the M1 MAIN TREND (EMA + MACD + HH/HL-LH/LL swing structure), `m1_up/dn` =
-    the M1 intrabar trigger. t32u: the dead M5 alias is removed."""
+    the M1 intrabar trigger. t34u: `m5` = the M5 MAIN MOMENTUM frame (forming M5 bar, no close wait):
+    m5_up/m5_dn = M5 intrabar momentum per side, m5_bias = M5 direction."""
+    m5: TFState = field(default_factory=TFState)
+    m5_up: float = 0.0
+    m5_dn: float = 0.0
+    m5_bias: float = 0.0
+    m5_label: str = "unknown"
     m1: TFState = field(default_factory=TFState)
     bias: float = 0.0            # -1..1 M1 main-trend bias (signed)
     bias_label: str = "unknown"
@@ -292,10 +298,14 @@ class MTFView:
     def timing(self, d: int) -> float:
         return self.m1_up if d > 0 else self.m1_dn
 
+    def m5_momentum(self, d: int) -> float:
+        return self.m5_up if d > 0 else self.m5_dn
+
     def brief(self) -> dict:
         return {"bias": round(self.bias, 2), "label": self.bias_label, "supported": self.supported,
                 "m1_up": round(self.m1_up, 2), "m1_dn": round(self.m1_dn, 2),
-                "m1": self.m1.brief()}
+                "m1": self.m1.brief(), "m5": self.m5.brief(), "m5_up": round(self.m5_up, 2),
+                "m5_dn": round(self.m5_dn, 2), "m5_bias": round(self.m5_bias, 2), "m5_label": self.m5_label}
 
 
 def m1_trend(s: TFState) -> tuple[float, str, bool]:
@@ -353,17 +363,27 @@ class MTF:
 
     def __init__(self):
         self.m1 = TF(60, 300)
-        self.polled = {"M1": 0.0}
+        self.m5 = TF(300, 300)                  # t34u: M5 main momentum frame (forming bar from live ticks)
+        self.polled = {"M1": 0.0, "M5": 0.0}
         self.poll_err = ""
 
     def on_tick(self, t: float, price: float) -> None:
         self.m1.on_tick(t, price)
+        self.m5.on_tick(t, price)
 
     def view(self, now: float) -> MTFView:
         m1 = self.m1.state(now)
         v = MTFView(m1=m1)
         v.bias, v.bias_label, v.supported = m1_trend(m1)
         v.m1_up, v.m1_dn = m1_timing(v.m1, 1, v.bias), m1_timing(v.m1, -1, v.bias)
+        m5 = self.m5.state(now)
+        v.m5 = m5
+        if m5.ready:
+            b5, lab5, _ = m1_trend(m5)
+            v.m5_bias, v.m5_label = b5, lab5.replace("M1", "M5")
+            # M5 intrabar momentum: forming-bar body expansion, MACD histogram change, relative volume, RSI
+            # direction/slope (no cross, no close wait) - the same scorer as the M1 trigger, on the M5 bar
+            v.m5_up, v.m5_dn = m1_timing(m5, 1, b5), m1_timing(m5, -1, b5)
         return v
 
     def closed_m1(self) -> list:

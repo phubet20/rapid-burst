@@ -103,10 +103,11 @@ def test_m1_main_trend_filters_and_counter_trend_needs_a_structure_break():
     against = decide(_live(mtf=_view(-0.8, supported=True)), cfg)
     assert with_trend.side == "BUY" and "D" in with_trend.reason and "E" in with_trend.reason
     assert amb.buy < with_trend.buy                    # weak opposite M1 trend only costs strength
-    assert against.side == "NO TRADE" and "M1 main trend against" in against.reason
+    # t34u: the M1 trend is no longer a hard veto (it blocked reversals) - it only costs strength
+    assert against.buy < with_trend.buy and not any("M1 main trend" in x for x in against.vetoes)
     v = _view(-0.8, supported=True)
     v.m1.sbreak = 1                                    # price just broke the last M1 swing high
-    assert "M1 main trend against" not in decide(_live(mtf=v), cfg).reason
+    assert decide(_live(mtf=v), cfg).buy >= against.buy
 
 
 def test_exit_needs_combined_exhaustion_in_profit_not_one_signal():
@@ -137,7 +138,7 @@ def test_candles_polled_at_a_sensible_rate_not_every_loop(tmp_path):
     run(tr, br, T0 + 1, T0 + 121)                    # 400 loops
     m1 = [c for c in calls if c[1] == "M1"]
     m5 = [c for c in calls if c[1] == "M5"]
-    assert 12 <= len(m1) <= 17 and not m5, (len(m1), len(m5))       # t30u: M1 only, every ~8 s
+    assert 12 <= len(m1) <= 17 and 5 <= len(m5) <= 8, (len(m1), len(m5))   # t34u: M1 ~8 s, M5 ~20 s
     assert all(isinstance(h, int) for _, _, h in calls)   # integer look-back hours
 
 

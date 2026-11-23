@@ -374,3 +374,29 @@ The script prompts for the same password you use to unlock the app, enrolls the 
 `-WorkerSecret` is still accepted if you already have it. Then open the backend URL on the iPhone
 → unlock → CONNECT MT5 (demo login/password/server) → select symbols → START. STOP closes bot
 positions and shuts the engine + bot terminal down.
+
+## t34u — M5 momentum, auto-reversal, continuous re-entry
+
+The M5 forming bar is now the main frame (family E = M5 momentum/direction, no close wait); M1 + ticks time the entry.
+**Auto-reversal**: when the opposite side passes its own checks and beats the held side by `reverse_edge` (0.10),
+the basket is closed, every close is verified on MT5, and the opposite batch (2–8 orders, risk-sized) opens in the
+same loop. If a close fails, the opposite side is not opened (no hedge, no blind resend).
+After any close the engine is back in SCAN immediately: no cooldown, no candle lock, no same-burst lock (only a
+broker-rejected signal is blocked for 3 s), the learner sizes (min lot) instead of skipping, no post-safe-mode confirm.
+Hard vetoes on M1 trend, swing-break, S/R and chop became penalties; "no live force" only vetoes price moving against.
+Still no martingale/averaging; hard stop, BE, trailing, margin and safe-mode protection unchanged (safe pause 60 s).
+
+Root causes of slow/missing re-entry (at e3f6ea1): microburst.py:707 velocity veto (28–50 hits/min live, 25–40 s gaps),
+:672 M1 trend veto, :681 swing-break veto, :748 D-only trigger, trader.py:937 open basket ignored opposite signals,
+:973 losing-basket duplicate lock, :988 learner skip, :991 confirm gate, 180 s safe pause.
+
+REPLAY on real Binance 1m/tick data (simulated broker double, NOT live results), $56.60 start:
+
+| window | version | baskets | win % | PF | net | max DD % | re-entry p50 / p90 | reversals |
+|---|---|---|---|---|---|---|---|---|
+| BTCUSDT 4h | before | 114 | 65.8 | 1.28 | +50.63 | 26.9 | 14.8 s / 161.5 s | 0 |
+| BTCUSDT 4h | after | 224 | 51.8 | 1.10 | +16.90 | 34.7 | 8.3 s / 56.0 s | 37 |
+| PAXGUSDT 8h (gold proxy) | before | 35 | 54.3 | 0.65 | −23.49 | 48.3 | 313 s / 2650 s | 0 |
+| PAXGUSDT 8h (gold proxy) | after | 261 | 51.3 | 1.26 | +113.67 | 52.4 | 13.9 s / 132.8 s | 41 |
+
+More frequent trading also means more exposure; replay results are not a profit guarantee.

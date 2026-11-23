@@ -191,7 +191,7 @@ def test_one_batch_per_signal_capped_same_lot_no_adds_later(tmp_path):
     assert any(l["msg"].startswith("BATCH ") for l in tr.logs)
 
 
-def test_duplicate_burst_is_not_traded_twice(tmp_path):
+def test_reentry_after_a_basket_ends_is_not_locked_t34u(tmp_path):
     tr, br = make(tmp_path, {"BTCUSDm": series_up()})
     _small_account(br, balance=1000.0, margin_per_lot=100.0)
     _start(tr, br, T0 + 1)
@@ -207,9 +207,9 @@ def test_duplicate_burst_is_not_traded_twice(tmp_path):
     for t in list(br.positions_):                    # the group ends (e.g. broker SL) ...
         br.close_position(t, 50, tr.cfg.magic)
     n1 = len([l for l in tr.logs if l["msg"].startswith("ENTRY")])
-    run(tr, br, T0 + 101.3, T0 + 110)                 # ... the same burst must not be re-entered
-    assert not [l for l in tr.logs if l["msg"].startswith("ENTRY")][n1:]
-    assert tr.skip_counts["BTCUSDm"]["duplicate burst"] >= 1
+    run(tr, br, T0 + 101.3, T0 + 110)                 # ... t34u: momentum still there -> re-enter, no lock
+    assert [l for l in tr.logs if l["msg"].startswith("ENTRY")][n1:]
+    assert not tr.skip_counts["BTCUSDm"].get("duplicate burst")
 
 
 def test_hard_risk_exit_overrides_the_micro_exit(tmp_path):
@@ -220,11 +220,12 @@ def test_hard_risk_exit_overrides_the_micro_exit(tmp_path):
     _force_signal(tr, "BUY", origin=T0 + 99.0)
     run(tr, br, T0 + 100.3, T0 + 101)
     assert br.positions_
+    held = set(br.positions_)
     calls = []
     tr._hard_risk_exit = lambda *a, **k: "hard group loss (test)"
     tr._micro_exit = lambda *a, **k: calls.append(1) or "micro exit"
     run(tr, br, T0 + 101.3, T0 + 102)
-    assert not br.positions_ and not calls
+    assert not (held & set(br.positions_)) and not calls     # (t34u: a fresh batch may re-enter at once)
     assert any(l["msg"].startswith("EXIT GROUP") and "hard group loss" in l["msg"] for l in tr.logs)
 
 

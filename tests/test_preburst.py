@@ -84,7 +84,7 @@ def _decide_with(a, b, c, d=None, e=None):
 
 
 def test_agreement_rule_no_single_indicator_speed_only_or_volume_only():
-    for fam in ((0.9, 0.1, 0.1), (0.1, 0.9, 0.1), (0.9, 0.6, 0.1, 0.1, 0.1), (0.1, 0.9, 0.1, 0.1, 0.9)):
+    for fam in ((0.9, 0.1, 0.1), (0.1, 0.9, 0.1), (0.9, 0.6, 0.1, 0.1, 0.1), (0.1, 0.1, 0.1, 0.1, 0.9)):
         st = _decide_with(*fam)
         assert st.side == "NO TRADE" and "families agree" in st.reason, (fam, st.reason)
     assert _decide_with(0.9, 0.6, 0.1).side == "NO TRADE"            # t29u: speed + activity alone, no trigger
@@ -92,7 +92,7 @@ def test_agreement_rule_no_single_indicator_speed_only_or_volume_only():
     st = _decide_with(0.9, 0.6, 0.1, 0.5, 0.1)                       # 3 of 5 incl. M1 timing
     assert st.side == "BUY" and "agree ABD" in st.reason
     assert _decide_with(0.2, 0.2, 0.2, 0.6, 0.6).side == "BUY"       # t29u: 2 families incl. the M1 trigger
-    assert _decide_with(0.2, 0.6, 0.2, 0.2, 0.6).side == "NO TRADE"  # volume + M5 bias without a trigger
+    assert _decide_with(0.2, 0.6, 0.2, 0.2, 0.6).side == "BUY"       # t34u: volume + M5 momentum (E is a trigger)
     assert _decide_with(0.6, 0.2, 0.2, 0.6, 0.6).side == "BUY"       # tick + M1 + M5 agree, no volume needed
 
 
@@ -130,6 +130,8 @@ def test_batch_size_caps_latency_and_cancel_if_price_ran(tmp_path):
     run(tr, br, T0 + 100.9, T0 + 101.5)
     tr.pacer = type(tr.pacer)(tr.cfg)
     tr.last_burst.clear()
+    for t in list(br.positions_):                  # t34u: it may have re-entered already - flatten again
+        br.close_position(t, 50, tr.cfg.magic)
     real_lt, real_mo = br.last_tick, br.market_order
     sent = []
 
