@@ -326,3 +326,17 @@ def test_modify_sl_soft_skip_closed_position_and_retcode_logged(fake, tmp_path):
     r = b.modify_sl(t, bid - 1.0, 0.0)
     assert not r["ok"] and r["retcode"] == 10016 and r["code"] == "BROKER_REJECTED" and "sent SL" in r["msg"]
     b.shutdown()
+
+
+def test_modify_sl_is_verified_on_the_real_position(fake, tmp_path):
+    b = mk(fake, tmp_path)
+    assert b.connect(DEMO["login"], DEMO["password"], DEMO["server"])[0]
+    assert b.select_symbol("XAUUSD")
+    bid, ask = fake.quotes["XAUUSD"]
+    t = fake.add_position("XAUUSD", "BUY", 0.05, "x", sl=bid - 20.0)
+    r = b.modify_sl(t, bid - 5.0, 0.0)
+    assert r["ok"] and r.get("verified"), r
+    fake.modify_ignore = True                    # broker answers 200 but the position keeps the old SL
+    r = b.modify_sl(t, bid - 2.0, 0.0)
+    assert not r["ok"] and r.get("unverified") and "position shows SL" in r["msg"], r
+    b.shutdown()

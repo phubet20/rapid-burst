@@ -96,38 +96,44 @@ def _g(**kw):
     return g
 
 
-def test_exit_profit_capture_and_giveback():
+def test_momentum_hold_no_fixed_tp_and_small_retracement_is_held():
     cfg = EngineConfig()
-    m = _live()
-    assert "2x target" in exit_reason(_g(), m, 1, 0.7, 2, 0.0, 0.5, 0.8, 0.0, cfg)
-    r = exit_reason(_g(), _live(vel=0.05), 1, 0.35, 2, 0.0, 0.5, 0.8, 0.0, cfg)          # target + velocity decay
-    assert r and r.startswith("profit capture"), r
-    # momentum still running: a 50% pullback from the peak is NOT closed (no exit on tiny pullbacks)...
-    assert exit_reason(_g(peak_pl=0.5), m, 1, 0.25, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None
-    # ...but the same pullback with momentum fading is protected (give-back)
-    r = exit_reason(_g(peak_pl=0.5), _live(vel=0.1, vel_prev=0.3, accel=-0.2), 1, 0.25, 2, 0.0, 0.5, 0.8, 0.0, cfg)
-    assert r and "give-back" in r, r
-    # a deep give-back closes even while running
-    r = exit_reason(_g(peak_pl=0.5), m, 1, 0.18, 2, 0.0, 0.5, 0.8, 0.0, cfg)
-    assert r and "give-back" in r, r
-    assert exit_reason(_g(), m, 1, 0.2, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None              # running, below target
+    m = _live()                                                   # momentum running
+    # far beyond the old "2x target" fixed capture: still held while momentum continues (no fixed TP)
+    assert exit_reason(_g(peak_pl=0.7), m, 1, 0.7, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None
+    # small retracement (< ATR/spread noise floor) while running: held
+    assert exit_reason(_g(peak_pl=0.7), m, 1, 0.62, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None
+    # a meaningful retracement alone (no exhaustion evidence) is still held: the BE/trailing stop protects it
+    assert exit_reason(_g(peak_pl=0.7), m, 1, 0.35, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None
+
+
+def test_meaningful_retracement_with_exhaustion_protects_profit():
+    cfg = EngineConfig()
+    fading = _live(vel=0.05, vel_prev=0.3, accel=-0.25, t=110.0)            # decayed + stalled (no new high 10 s)
+    r = exit_reason(_g(peak_pl=0.7), fading, 1, 0.35, 12, 0.0, 0.5, 0.8, 0.0, cfg)
+    assert r and ("profit protection: retraced" in r or "momentum exhausted" in r), r
 
 
 def test_exit_costs_are_netted():
     cfg = EngineConfig()
-    assert exit_reason(_g(), _live(), 1, 0.7, 2, 0.0, 0.5, 0.8, 0.0, cfg)
-    assert exit_reason(_g(), _live(), 1, 0.7, 2, 0.0, 0.5, 0.8, 0.45, cfg) is None or \
-        "2x target" not in exit_reason(_g(), _live(), 1, 0.7, 2, 0.0, 0.5, 0.8, 0.45, cfg)
+    fading = _live(vel=0.05, vel_prev=0.3, accel=-0.25, t=110.0, failed=-1, imbalance=-0.7)
+    assert "in profit" in exit_reason(_g(peak_pl=0.6), fading, 1, 0.2, 12, 0.0, 0.5, 0.8, 0.0, cfg) or \
+        "profit protection" in exit_reason(_g(peak_pl=0.6), fading, 1, 0.2, 12, 0.0, 0.5, 0.8, 0.0, cfg)
+    r = exit_reason(_g(peak_pl=0.6), fading, 1, 0.2, 12, 0.0, 0.5, 0.8, 0.19, cfg)   # cost eats the profit
+    assert r is None or "in profit" not in r
 
 
-def test_exit_micro_reversal_failed_breakout_and_no_follow_through():
+def test_losing_basket_is_held_inside_the_hard_stop_until_the_move_clearly_turns():
     cfg = EngineConfig()
-    assert "failed breakout" in exit_reason(_g(), _live(failed=-1), 1, -0.05, 2, 0.0, 0.5, 0.8, 0.0, cfg)
-    assert "structure break" in exit_reason(_g(), _live(struct_break=-1), 1, -0.05, 2, 0.0, 0.5, 0.8, 0.0, cfg)
-    assert "opposite strength" in exit_reason(_g(), _live(), 1, -0.05, 2, 0.6, 0.5, 0.8, 0.0, cfg)
-    r = exit_reason(_g(), _live(vel=-0.01, regime="normal"), 1, -0.05, 5, 0.0, 0.5, 0.8, 0.0, cfg)
-    assert r and "no follow-through" in r, r
-    r = exit_reason(_g(), _live(vel=-0.2, imbalance=-0.7, regime="normal"), 1, -0.45, 1, 0.0, 0.5, 0.8, 0.0, cfg)
+    # a small loss on noise is NOT cut (the old 4 s "no follow-through" cut is gone)
+    assert exit_reason(_g(), _live(vel=-0.01, regime="normal"), 1, -0.05, 5, 0.0, 0.5, 0.8, 0.0, cfg) is None
+    # one structure failure alone: held
+    assert exit_reason(_g(), _live(failed=-1), 1, -0.05, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None
+    # reversal + structure failure + more evidence: closed
+    r = exit_reason(_g(), _live(failed=-1, vel=-0.2, imbalance=-0.7, t=110.0), 1, -0.05, 2, 0.6, 0.5, 0.8, 0.0, cfg)
+    assert r and "directional reversal" in r, r
+    # deep against with momentum against: cut before the hard stop
+    r = exit_reason(_g(), _live(vel=-0.2, imbalance=-0.7, t=110.0, regime="normal"), 1, -0.45, 1, 0.0, 0.5, 0.8, 0.0, cfg)
     assert r and "momentum against" in r, r
 
 
@@ -158,7 +164,7 @@ def test_loop_enters_the_burst_with_sl_no_tp_and_exits_the_group(tmp_path):
     assert all(o["sl"] and o["tp"] == 0.0 for o in orders)                # broker SL, engine-driven exits
     assert inv.adds_into_loser == 0 and inv.opposite_while_open == 0
     exits = [l["msg"] for l in tr.logs if l["msg"].startswith("EXIT GROUP")]
-    assert exits and not br.positions_
+    assert exits and all(p["sl"] for p in br.positions_.values())     # anything still held has its hard stop
 
 
 def test_one_batch_per_signal_capped_same_lot_no_adds_later(tmp_path):
@@ -222,7 +228,7 @@ def test_no_daily_loss_halt_and_safe_mode_defaults(monkeypatch):
     c = EngineConfig.load()
     assert not hasattr(c, "daily_loss_limit_pct") and c.equity_drawdown_pct == 8.0
     assert c.max_margin_use_pct == 50.0 and c.risk_per_trade_pct == 0.5 and c.max_total_risk_pct == 3.0
-    assert c.max_orders_per_batch == 3 and c.risk_per_batch_pct == 1.0
+    assert c.max_orders_per_batch == 8 and c.risk_per_batch_pct == 1.0
 
 
 def test_safe_mode_flattens_pauses_entries_and_keeps_running(tmp_path):
@@ -281,7 +287,7 @@ def test_snapshot_has_one_engine_view(tmp_path):
     e = tr.get_snapshot()["engine"]
     assert "groups" in e and "baskets" not in e and "scalp" not in e
     rc = e["risk_config"]
-    assert rc["engine"].startswith("Continuous Directional") and rc["broker_sl"] == "ON"
+    assert rc["engine"].startswith("Fast Candle Momentum Batch Scalper") and rc["broker_sl"] == "ON"
     assert "daily_loss_limit_pct" not in rc and "latency" in e and "performance" in e
     assert e["performance"]["source"] == "real broker deals"
     st = e["symbols"]["BTCUSDm"]
@@ -294,10 +300,14 @@ def test_config_json_env_override_ignores_unknown_and_old_keys(monkeypatch):
     assert c.mb_threshold == 0.6 and not hasattr(c, "basket_enabled")
 
 
-def test_no_rsi_and_mtf_is_part_of_the_single_decision():
+def test_rsi_is_a_soft_feature_never_a_gate_and_mtf_is_part_of_the_single_decision():
     import inspect
     import rapidburst.microburst as mb
-    import re
-    src = inspect.getsource(mb)
-    assert not re.search(r"\brsi\b", src.lower())
+    import rapidburst.mtf as mtf
+    from rapidburst.mtf import TFState, rsi_score
+    src = inspect.getsource(mb.decide)
+    assert "rsi" not in src.lower()                           # no RSI condition / cross wait in the decision
+    assert "rsi_score" in inspect.getsource(mtf.m1_timing)     # only a weighted part of M1 timing
+    s = TFState(ready=True, rsi_ready=True, rsi=45.0, rsi_slope=-1.0)
+    assert 0.0 <= rsi_score(s, 1) <= 1.0
     assert "_mtf_scores" in inspect.getsource(mb.side_strength)

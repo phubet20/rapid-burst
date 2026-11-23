@@ -1,4 +1,4 @@
-"""Continuous Directional Short Scalping Engine: scanners, decision and the basket exit (pure logic).
+"""Fast Candle Momentum Batch Scalper: scanners, decision and the basket exit (pure logic).
 
 ONE engine. Five families are scored on the same moment and feed ONE decision:
   A. tick velocity & acceleration  - tick rate, velocity, acceleration/deceleration, direction sequence,
@@ -9,8 +9,8 @@ ONE engine. Five families are scored on the same moment and feed ONE decision:
   C. micro-structure trigger        - micro high/low, compression -> expansion, micro breakout, failed
                                      breakout, structure break, pullback recovery, short rebound, anti-chase
   D. M1 entry timing (mtf.py)       - forming-bar direction/body expansion, MACD histogram expansion and slope
-                                     change (no full cross needed), tick-volume expansion, continuation with M5
-  E. M5 direction bias (mtf.py)     - EMA trend, body/range expansion, MACD direction/histogram/momentum change,
+                                     change (no full cross needed), RSI level/slope (soft), tick-volume expansion,\n                                     continuation with M5
+  E. M5 direction bias (mtf.py)     - EMA trend, body/range expansion, MACD direction/histogram/momentum change, RSI,
                                      tick-volume activity, HH/HL vs LH/LL, supported vs exhausting
 The decision scores how well they AGREE; no single family is mandatory, activity alone never trades, M5 is a
 filter (soft penalty when ambiguous/weak against, veto only when clearly against and supported).
@@ -23,7 +23,7 @@ Honesty notes (also shown in the UI):
   * "tick volume"/"activity" = number of price updates the broker counted/sent. It is NOT exchange volume.
   * "flow"/"imbalance" = up- vs down-ticks and bid/ask changes: a PROXY for pressure, not real order flow.
   * Market depth is not used: neither TickerAll nor this MT5 bridge exposes a reliable book.
-No lagging oscillator gate, no fixed confirmation steps, no waiting for the candle close.
+RSI(14) is a SOFT feature inside D (level, slope, momentum change) - never a gate, never a cross wait.\nNo fixed confirmation steps, no waiting for the candle close.
 """
 from __future__ import annotations
 
@@ -729,70 +729,72 @@ def decide(m: Micro, cfg) -> Strength:
     return st
 
 
-# ================================================================== ONE basket exit
-def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, thr: float,
-                stop_dist: float, cost: float, cfg) -> Optional[str]:
-    """Basket short profit capture (pl = executable P/L per unit in price after the spread; cost = other per-unit
-    costs such as commission). Hard risk exits are checked by the trader BEFORE this and always win."""
-    if not m.ready:
-        return None
-    net = pl - cost
-    atr = m.atr
-    min_net = cfg.mb_min_net_spread * m.spread
-    target = max(g.get("target", 0.0), m.target * 0.5) or m.target
+# ================================================================== ONE basket exit (momentum hold)
+def exit_signals(g: dict, m: Micro, d: int, opp: float, thr: float, cfg) -> dict:
+    """The exhaustion / reversal evidence for a basket in direction d (each True/False). Read together - no
+    single one closes a basket that still has momentum."""
+    atr = m.atr or 1e-9
     vel = d * m.vel
-    flip = vel <= -max(cfg.mb_flip_atr, 0.5 * m.spread / atr if atr else 0.0)
+    flip = vel <= -max(cfg.mb_flip_atr, 0.5 * m.spread / atr)
     pk_v = float(g.get("peak_vel", 0.0))
     decay = pk_v > 0 and vel < cfg.mb_decay_frac * pk_v
     opp_press = d * m.imbalance <= -cfg.mb_opp_pressure or d * m.bidask <= -cfg.mb_opp_pressure
     stall = (m.t - float(g.get("last_ext_t", m.t))) >= cfg.mb_stall_seconds * (0.6 if m.regime == "fast" else 1.0)
-    exhausted = m.exhaustion == d
-    # M1 momentum (MACD histogram slope on the forming bar) and tick-volume activity, when bars exist
     v1 = m.mtf.m1 if m.mtf is not None and m.mtf.m1.ready else None
-    m1_turn = v1 is not None and d * v1.hist_slope < -0.03 and d * v1.hist_accel < 0
-    vol_fade = v1 is not None and v1.vol_x is not None and v1.vol_x < 0.7
-    m5_exh = m.mtf is not None and m.mtf.m5.ready and m.mtf.m5.exhaust == d
-    continuing = (vel > 0 and not decay and not opp_press and not exhausted and not m1_turn
-                  and d * m.accel > -0.5 * cfg.mb_vel_ref_atr)
+    v5 = m.mtf.m5 if m.mtf is not None and m.mtf.m5.ready else None
+    rsi_turn = (v1 is not None and v1.rsi_ready and d * v1.rsi_slope < -cfg.exit_rsi_turn
+                and (d * v1.rsi_accel < 0 or d * (v1.rsi - 50.0) > 20.0))
+    macd_turn = v1 is not None and d * v1.hist_slope < -0.03 and d * v1.hist_accel < 0
+    candle_loss = (decay and stall) or (v1 is not None and d * v1.body < -0.15)
+    vol_fade = v1 is not None and v1.vol_x is not None and v1.vol_x < 0.7 and (decay or stall)
+    reversal = (flip and opp_press) or opp >= cfg.exit_opp_frac * thr
+    struct_fail = m.failed == -d or m.struct_break == -d or (m.rejection == -d and flip)
+    exhaustion = m.exhaustion == d or (v5 is not None and v5.exhaust == d)
+    return {"RSI-turn": rsi_turn, "MACD-hist-turn": macd_turn, "candle-momentum-loss": candle_loss,
+            "volume-weakening": vol_fade, "reversal": reversal, "structure-failure": struct_fail,
+            "exhaustion": exhaustion, "_continuing": (vel > 0 and not decay and not opp_press and not macd_turn
+                                                      and d * m.accel > -0.5 * cfg.mb_vel_ref_atr)}
+
+
+def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, thr: float,
+                stop_dist: float, cost: float, cfg) -> Optional[str]:
+    """Momentum hold + intelligent exit on NET basket P/L (pl = executable P/L per unit in price after the
+    spread; cost = other per-unit costs such as commission). There is NO fixed take-profit: the basket is held
+    while the main momentum continues; profit is protected by the break-even / dynamic trailing stop (trader)
+    and closed here when the exhaustion evidence AGREES. Hard risk exits (hard stop, safe mode, exposure,
+    emergency) are checked by the trader BEFORE this and always win."""
+    if not m.ready:
+        return None
+    net = pl - cost
+    atr = m.atr or 1e-9
+    min_net = cfg.mb_min_net_spread * m.spread
+    sig = exit_signals(g, m, d, opp, thr, cfg)
+    continuing = sig.pop("_continuing")
+    hits = [k for k, v in sig.items() if v]
+    score = len(hits)
+    tags = "+".join(hits) or "none"
     peak = float(g.get("peak_pl", 0.0))
-    tags = "+".join(k for k, v in (("velocity-decay", decay), ("tick-flip", flip), ("opposing-pressure", opp_press),
-                                   ("stall", stall), ("exhaustion", exhausted), ("M1-MACD-turn", m1_turn),
-                                   ("volume-fade", vol_fade), ("M5-exhausting", m5_exh)) if v)
-    # 1. profit capture on NET basket P/L
-    if net >= target * cfg.mb_full_target_mult:
-        return f"profit capture: {net:+.4g} >= {cfg.mb_full_target_mult:g}x target (short capture, no long hold)"
-    if net >= target and not continuing:
-        return f"profit capture: {net:+.4g} (target {target:.4g}) {tags or 'momentum fading'}"
-    if peak >= 0.6 * target:
-        gb = cfg.mb_giveback if not continuing else cfg.mb_giveback_running
-        if net <= peak * (1.0 - gb) and net >= min_net:
-            return (f"profit protection (give-back): {net:+.4g} gave back {1 - net / peak:.0%} of peak {peak:+.4g} "
-                    f"(limit {gb:.0%}{' while running' if continuing else ''})")
-        if peak >= target and net < min_net:
-            return f"profit protection: back to {net:+.4g} after peak {peak:+.4g}"
-    if net >= min_net and exhausted:
-        return f"momentum exhaustion in profit: {net:+.4g}"
-    if net >= min_net and flip and opp_press:
-        return f"tick reversal in profit: {net:+.4g} {tags}"
-    if net >= min_net and m1_turn and (decay or vol_fade or vel <= 0):
-        return f"M1 momentum turned in profit (MACD histogram against, {tags}): {net:+.4g}"
-    if net >= min_net and m5_exh and not continuing:
-        return f"M5 move exhausting, momentum fading: {net:+.4g}"
-    # 2. micro-structure failure / reversal (any P/L)
-    if m.failed == -d:
-        return f"failed breakout against the basket ({net:+.4g})"
-    if m.struct_break == -d:
-        return f"micro structure break against the basket ({net:+.4g})"
-    if m.rejection == -d and flip:
-        return f"wick rejection + tick flip ({net:+.4g})"
-    if opp >= thr:
-        return f"micro-reversal: opposite strength {opp:.2f} >= {thr:.2f} ({net:+.4g})"
-    # 3. no follow-through / momentum against / stale
-    ft = cfg.mb_follow_seconds * {"fast": 0.6, "normal": 1.0, "quiet": 1.5, "chop": 0.8}[m.regime]
-    if held >= ft and peak < min_net and (vel <= 0 or opp_press):
-        return f"no follow-through in {held:.1f}s (best {peak:+.4g}, now {net:+.4g})"
-    if stop_dist > 0 and net <= -cfg.mb_cut_frac * stop_dist and (flip or opp_press):
+    # meaningful retracement: noise-aware (ATR and spread based), never a few points
+    retr = peak - net
+    retr_min = max(cfg.exit_retrace_atr * atr, cfg.exit_retrace_spread * m.spread)
+    retrace = peak > min_net and retr >= retr_min and retr >= cfg.exit_retrace_frac * peak
+    # 1. in profit: hold while momentum continues; close when the evidence agrees
+    if net >= min_net:
+        if score >= cfg.exit_min_signals and not continuing:
+            return f"momentum exhausted in profit ({score} signals: {tags}): {net:+.4g}"
+        if retrace and (score >= cfg.exit_min_signals - 1 or (score >= 1 and not continuing)):
+            return (f"profit protection: retraced {retr:.4g} from peak {peak:+.4g} with {tags} "
+                    f"(noise floor {retr_min:.4g}): {net:+.4g}")
+        if sig["reversal"] and sig["structure-failure"]:
+            return f"directional reversal in profit ({tags}): {net:+.4g}"
+        return None
+    # 2. not (yet) in net profit: hold inside the hard stop unless the move clearly turned
+    if peak >= min_net and retrace and score >= 1:
+        return f"profit gone: peak {peak:+.4g} -> {net:+.4g} ({tags})"
+    if sig["reversal"] and sig["structure-failure"] and score >= 3:
+        return f"directional reversal against the basket ({score} signals: {tags}): {net:+.4g}"
+    if stop_dist > 0 and net <= -cfg.mb_cut_frac * stop_dist and score >= 2 and not continuing:
         return f"momentum against: {net:+.4g} (>= {cfg.mb_cut_frac:g} of stop) {tags}"
-    if cfg.mb_max_hold_seconds > 0 and held >= cfg.mb_max_hold_seconds and net < min_net:
-        return f"stale: {held:.0f}s without net profit ({net:+.4g})"
+    if cfg.mb_max_hold_seconds > 0 and held >= cfg.mb_max_hold_seconds and not continuing and score >= 1:
+        return f"stale: {held:.0f}s without net profit ({net:+.4g}, {tags})"
     return None

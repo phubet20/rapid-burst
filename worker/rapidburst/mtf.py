@@ -3,7 +3,7 @@
 * Closed bars come from the broker (TickerAll GET /candles: OHLC bid + tickVolume); the forming bar is built
   from live ticks between polls (no candle-close wait). Nothing is synthesised: when the broker sends no
   bars, only bars observed live from ticks are used and the source says so.
-* EMA(8/21) and MACD(12,26,9) are incremental: committed state advances once per CLOSED bar; the forming
+* EMA(8/21), MACD(12,26,9) and RSI(14, Wilder) are incremental: committed state advances once per CLOSED bar; the forming
   bar is evaluated with an O(1) "peek" on every call. A broker refresh that changes history recomputes
   at most `maxlen` bars once per poll (not per tick).
 * tickVolume = number of price changes the broker counted (tick volume), NOT exchange volume. The live
@@ -34,15 +34,31 @@ class _St:
     e12: float = 0.0
     e26: float = 0.0
     sig: float = 0.0
+    c: float = 0.0               # last close (RSI change reference)
+    ag: float = 0.0              # Wilder average gain / loss (RSI 14)
+    al: float = 0.0
 
     def step(self, c: float) -> "_St":
         if self.n == 0:
-            return _St(1, c, c, c, c, 0.0)
+            return _St(1, c, c, c, c, 0.0, c, 0.0, 0.0)
         e12 = self.e12 + _a(12) * (c - self.e12)
         e26 = self.e26 + _a(26) * (c - self.e26)
         m = e12 - e26
         sig = m if self.n == 1 else self.sig + _a(9) * (m - self.sig)
-        return _St(self.n + 1, self.e8 + _a(8) * (c - self.e8), self.e21 + _a(21) * (c - self.e21), e12, e26, sig)
+        ch = c - self.c
+        k = min(self.n, 14)                      # SMA seed for the first 14 changes, then Wilder smoothing
+        ag = self.ag + (max(ch, 0.0) - self.ag) / k
+        al = self.al + (max(-ch, 0.0) - self.al) / k
+        return _St(self.n + 1, self.e8 + _a(8) * (c - self.e8), self.e21 + _a(21) * (c - self.e21), e12, e26, sig,
+                   c, ag, al)
+
+    @property
+    def rsi(self) -> float:
+        if self.n < 2:
+            return 50.0
+        if self.al <= 0:
+            return 100.0 if self.ag > 0 else 50.0
+        return 100.0 - 100.0 / (1.0 + self.ag / self.al)
 
     @property
     def macd(self) -> float:
@@ -73,13 +89,18 @@ class TFState:
     structure: int = 0           # +1 HH/HL, -1 LH/LL, 0 mixed (last closed bars)
     exhaust: int = 0             # +1 up move exhausting, -1 down move exhausting
     avg_range: float = 0.0
+    rsi: float = 50.0            # RSI(14) with the forming bar (soft feature only - never a gate or a cross wait)
+    rsi_slope: float = 0.0       # forming RSI - last closed RSI
+    rsi_accel: float = 0.0       # change of that slope vs the previous bar (momentum change)
+    rsi_ready: bool = False
 
     def brief(self) -> dict:
         r = lambda x, n=2: None if x is None else round(x, n)   # noqa: E731
         return {"ready": self.ready, "src": self.src, "bars": self.bars, "dir": self.dir, "trend": r(self.trend),
                 "body": r(self.body), "range_x": r(self.range_x), "macd": r(self.macd, 3), "hist": r(self.hist, 3),
                 "hist_slope": r(self.hist_slope, 3), "macd_ready": self.macd_ready, "vol_x": r(self.vol_x),
-                "vol_src": self.vol_src, "structure": self.structure, "exhaust": self.exhaust}
+                "vol_src": self.vol_src, "structure": self.structure, "exhaust": self.exhaust,
+                "rsi": r(self.rsi, 1), "rsi_slope": r(self.rsi_slope, 1), "rsi_ready": self.rsi_ready}
 
 
 class TF:
@@ -90,6 +111,7 @@ class TF:
         self.st = _St()
         self.hists: deque = deque(maxlen=4)         # committed hist values (last closed bars)
         self.e21s: deque = deque(maxlen=4)
+        self.rsis: deque = deque(maxlen=4)
         self.live: Optional[dict] = None
         self.own: dict = {}                          # bar time -> own live tick count (bars observed live)
         self.broker_ok = False
@@ -100,12 +122,14 @@ class TF:
         self.st = self.st.step(b["close"])
         self.hists.append(self.st.hist)
         self.e21s.append(self.st.e21)
+        self.rsis.append(self.st.rsi)
 
     def _rebuild(self, closed: list) -> None:
         self.bars = deque(maxlen=self.maxlen)
         self.st = _St()
         self.hists.clear()
         self.e21s.clear()
+        self.rsis.clear()
         for b in closed[-self.maxlen:]:
             self._commit(b)
 
@@ -197,6 +221,12 @@ class TF:
         h2 = self.hists[-2] if len(self.hists) >= 2 else h1
         out.hist_slope = (p.hist - h1) / ar
         out.hist_accel = ((p.hist - h1) - (h1 - h2)) / ar
+        out.rsi_ready = self.st.n >= 15
+        out.rsi = p.rsi
+        r1 = self.rsis[-1] if self.rsis else p.rsi
+        r2 = self.rsis[-2] if len(self.rsis) >= 2 else r1
+        out.rsi_slope = p.rsi - r1
+        out.rsi_accel = (p.rsi - r1) - (r1 - r2)
         slope = (p.e21 - (self.e21s[-2] if len(self.e21s) >= 2 else p.e21)) / ar
         pos = (lv["close"] - p.e21) / ar
         out.trend = _clip(0.6 * _clip(slope / 0.3) + 0.4 * _clip(pos / 1.5) + 0.3 * _clip((p.e8 - p.e21) / ar))
@@ -252,7 +282,8 @@ def m5_bias(s: TFState) -> tuple[float, str, bool]:
     mom = _clip(s.hist_slope / 0.15) * (1.0 if s.macd_ready else 0.5)
     body = _clip(s.body / 0.6) * min(1.0, s.range_x)
     vol = 0.0 if s.vol_x is None else _clip(s.vol_x - 1.0)
-    b = 0.35 * s.trend + 0.2 * macd + 0.15 * mom + 0.15 * body + 0.15 * s.structure
+    rsi = _clip((s.rsi - 50.0) / 20.0) * (1.0 if s.rsi_ready else 0.0)        # soft: level/direction only
+    b = 0.32 * s.trend + 0.18 * macd + 0.14 * mom + 0.13 * body + 0.13 * s.structure + 0.1 * rsi
     b *= 1.0 + 0.25 * max(0.0, vol) * (1 if b * body > 0 else 0)        # activity supporting the move
     exhausting = s.exhaust != 0 and s.exhaust * b > 0
     if exhausting:
@@ -264,6 +295,21 @@ def m5_bias(s: TFState) -> tuple[float, str, bool]:
     return b, lab, supported
 
 
+def rsi_score(s: TFState, d: int) -> float:
+    """RSI as a SOFT feature (0..1 for direction d): level on our side of 50, slope and momentum change our
+    way; fading when stretched (>75 for BUY, <25 for SELL) and turning back. Never a gate, never a cross wait."""
+    if not s.ready or not s.rsi_ready:
+        return 0.0
+    lvl = _clip(d * (s.rsi - 50.0) / 15.0, 0.0, 1.0)
+    slope = _clip(d * s.rsi_slope / 6.0, 0.0, 1.0)
+    chg = 1.0 if d * s.rsi_accel > 0 and d * s.rsi_slope > 0 else 0.0
+    x = 0.35 * lvl + 0.45 * slope + 0.2 * chg
+    stretched = d * (s.rsi - 50.0) > 25.0
+    if stretched and d * s.rsi_slope < 0:
+        x *= 0.3                                  # overextended and turning back
+    return _clip(x, 0.0, 1.0)
+
+
 def m1_timing(s: TFState, d: int, bias: float) -> float:
     if not s.ready:
         return 0.0
@@ -273,7 +319,7 @@ def m1_timing(s: TFState, d: int, bias: float) -> float:
     vol = 0.0 if s.vol_x is None else _clip((s.vol_x - 1.0) / 1.0, 0.0, 1.0)
     trend = _clip(d * s.trend, 0.0, 1.0)
     cont = _clip(d * bias / 0.5, 0.0, 1.0)
-    x = 0.28 * body + 0.24 * hist_exp + 0.1 * turn + 0.14 * vol + 0.1 * trend + 0.14 * cont
+    x = 0.25 * body + 0.21 * hist_exp + 0.08 * turn + 0.13 * vol + 0.09 * trend + 0.12 * cont + 0.12 * rsi_score(s, d)
     if s.exhaust == d:
         x -= 0.2
     return _clip(x, 0.0, 1.0)

@@ -1,4 +1,4 @@
-"""Engine / risk configuration (one engine: the Rapid Micro-Burst scalper).
+"""Engine / risk configuration (one engine: the Fast Candle Momentum Batch Scalper).
 
 All values are conservative defaults intended for a DEMO account.  They can be
 overridden with a JSON file (``RB_CONFIG_FILE``) on the worker machine.  The
@@ -67,20 +67,23 @@ class EngineConfig:
     mb_absorb_activity: float = 1.6   # activity >= x baseline while price stalls = absorption
     mb_max_gap_s: float = 5.0         # feed considered unstable above this gap
     mb_max_spread_target: float = 0.6 # spread must be < x * the capture target
-    # exits (one basket mechanism)
-    mb_target_atr: float = 0.20       # adaptive capture target = max(x * ATR * regime factor, mb_target_spread * spread)
+    # expected short move (NOT a take-profit: used for the spread/cost gate and anti-chase only)
+    mb_target_atr: float = 0.20       # = max(x * ATR * regime factor, mb_target_spread * spread)
     mb_target_spread: float = 2.0
-    mb_min_net_spread: float = 0.3    # profit exits need >= x * spread of NET profit
-    mb_full_target_mult: float = 2.0  # close at once at x * target
-    mb_giveback: float = 0.40         # profit protection: close after giving back x of the peak (peak >= 0.6 target)
-    mb_giveback_running: float = 0.60 # ... while momentum is still running (no close on tiny pullbacks)
+    # exits: momentum hold + combined exhaustion (one basket mechanism, no fixed TP)
+    mb_min_net_spread: float = 0.3    # "in profit" = NET basket P/L >= x * spread
+    exit_min_signals: int = 3         # exhaustion signals that must agree to close a basket in profit
+    exit_rsi_turn: float = 4.0        # M1 RSI points per bar against the basket = RSI momentum change
+    exit_opp_frac: float = 0.9        # opposite-side strength >= x * threshold = directional reversal
+    exit_retrace_atr: float = 0.25    # meaningful retracement from the basket peak >= max(x * ATR, ...
+    exit_retrace_spread: float = 2.0  # ... x * spread) and >= exit_retrace_frac of the peak (noise-aware)
+    exit_retrace_frac: float = 0.35
     mb_flip_atr: float = 0.02         # tick flip = velocity against >= x ATR (or half a spread)
     mb_decay_frac: float = 0.30       # velocity below x * its peak since entry = decay
     mb_opp_pressure: float = 0.40     # opposing tick / bid-ask proxy >= x
     mb_stall_seconds: float = 3.0     # no new favourable extreme for x s = stall
-    mb_follow_seconds: float = 4.0    # no follow-through within x s (scaled by regime) => cut
-    mb_cut_frac: float = 0.50         # losing >= x of the stop distance with momentum against => cut
-    mb_max_hold_seconds: float = 120.0  # stale guard: still not in net profit after x s => close (0 = off)
+    mb_cut_frac: float = 0.50         # losing >= x of the stop distance with >= 2 reversal signals => cut
+    mb_max_hold_seconds: float = 180.0  # stale guard: not in net profit after x s AND momentum gone => close
     commission_per_lot: float = 0.0   # round-trip commission per lot in account currency (cost in net P/L)
 
     # --- orders, batch & exposure (risk-based; no martingale, no averaging down, no grid) ---
@@ -88,15 +91,16 @@ class EngineConfig:
     sl_atr: float = 0.8               # hard stop distance = max(x * M1 ATR, sl_spread_mult * spread, stops level)
     sl_spread_mult: float = 4.0
     soft_stop_mult: float = 1.15      # engine mirror of the hard stop (if the broker SL fails)
-    # burst batch: ONE batch per signal, opened at once, same lot per order, never added to later
-    max_orders_per_batch: int = 3     # RB_MAX_ORDERS_PER_BATCH: orders in one batch (more only for stronger signals)
-    batch_step_strength: float = 0.08 # +1 order per x strength above the threshold (up to the cap)
+    # batch: ONE batch per signal, opened at once, same lot per order, never added to later
+    max_orders_per_batch: int = 8     # RB_MAX_ORDERS_PER_BATCH: orders in one batch (a CAP, never forced: the count
+                                      # follows momentum quality, then equity/lot/margin/exposure limits cut it)
+    batch_step_strength: float = 0.05 # +1 order per x strength above the threshold (up to the cap)
     risk_per_batch_pct: float = 1.0   # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
     max_batch_lots: float = 1.0       # lots in one batch
     batch_run_cancel_frac: float = 0.5  # cancel the rest of a batch if price ran > x * target from the decision
     max_lot_per_order: float = 1.0
-    max_positions_total: int = 6
-    max_positions_per_symbol: int = 3
+    max_positions_total: int = 10
+    max_positions_per_symbol: int = 8
     max_total_lots: float = 2.0
     max_total_notional_x: float = 500.0  # sum of open notional <= x * equity
     max_total_risk_pct: float = 3.0   # RB_MAX_TOTAL_RISK_PCT: sum of open stop risk <= x% of equity
@@ -118,12 +122,17 @@ class EngineConfig:
     exec_fail_pause_s: float = 60.0
     close_fail_halt: int = 5          # close attempts failing this many times => halt entries
 
-    # --- broker stop management ---
+    # --- broker stop management: hard stop always, then BASKET break-even and dynamic trailing ---
     broker_sl: bool = True            # real broker SL on every order (RB_BROKER_SL=0 to disable)
-    be_lock_spread_mult: float = 0.3  # BE+ lock = open + x * spread
-    trail_atr_frac: float = 0.15      # trailing hard stop distance >= x * M1 ATR
-    trail_spread_mult: float = 1.0
+    be_trigger_atr: float = 0.35      # break-even only after NET basket profit >= max(x * M1 ATR, ...
+    be_trigger_spread: float = 3.0    # ... x * spread, stops level + lock) - not so early that noise takes it
+    be_lock_spread_mult: float = 0.3  # BE+ level = basket average + costs + x * spread (net profit after costs)
+    trail_atr_frac: float = 0.25      # trailing distance = x * M1 ATR (normal momentum) ...
+    trail_atr_strong: float = 0.40    # ... wider while momentum is strong (let it run) ...
+    trail_atr_fade: float = 0.12      # ... tighter once momentum fades
+    trail_spread_mult: float = 1.5    # never closer than x * spread (or the broker stops/freeze level)
     sl_modify_min_interval: float = 1.0
+    protect_fail_max: int = 3         # consecutive failed/unverified SL modifies before the basket is closed
 
     # --- continuous entry / re-entry (no fixed cooldowns; the same unchanged setup is never re-entered) ---
     max_entries_per_minute: int = 30  # API/abuse guard only (TickerAll allows 300 order writes/min per key)

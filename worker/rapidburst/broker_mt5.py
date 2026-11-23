@@ -329,4 +329,15 @@ class MT5Broker:
         res = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": int(ticket),
                               "symbol": pos["symbol"], "sl": sl, "tp": tp})
         ok = res is not None and res.retcode in OK_CODES
-        return {"ok": ok, "msg": getattr(res, "comment", self.last_error())}
+        if not ok:
+            return {"ok": False, "msg": getattr(res, "comment", self.last_error()),
+                    "retcode": getattr(res, "retcode", None)}
+        now_pos = self.position(ticket)          # verify on the real position
+        if now_pos is None:
+            return {"ok": False, "closed": True, "msg": "position closed while modifying"}
+        info = mt5.symbol_info(pos["symbol"])
+        tick = float(getattr(info, "trade_tick_size", 0) or getattr(info, "point", 0) or 1e-9)
+        if abs(float(now_pos.get("sl") or 0.0) - float(sl)) > tick:
+            return {"ok": False, "unverified": True, "sl": sl, "live_sl": float(now_pos.get("sl") or 0.0),
+                    "msg": "SL modify accepted but the position shows a different SL"}
+        return {"ok": True, "verified": True, "sl": sl, "msg": "modified (verified on the position)"}

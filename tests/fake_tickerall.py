@@ -313,6 +313,8 @@ class FakeTickerAll:
         self.modify_calls = getattr(self, "modify_calls", []) + [(t, dict(b))]
         if getattr(self, "modify_error", None):
             return self.err(422, "BROKER_REJECTED", self.modify_error)
+        if getattr(self, "modify_ignore", False):          # accepted but not applied (verification test)
+            return web.json_response({"ticket": t, "stopLoss": b.get("stopLoss"), "takeProfit": p["takeProfit"]})
         if "stopLoss" in b:
             p["stopLoss"] = b["stopLoss"]
         if "takeProfit" in b:

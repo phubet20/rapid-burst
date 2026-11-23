@@ -106,12 +106,18 @@ def test_m5_is_a_filter_not_a_gate():
     assert against.side == "NO TRADE" and "M5 clearly against" in against.reason
 
 
-def test_exit_on_m1_macd_turn_in_profit_but_not_while_momentum_continues():
+def test_exit_needs_combined_exhaustion_in_profit_not_one_signal():
     cfg = EngineConfig()
     g = {"target": 0.3, "peak_pl": 0.12, "peak_vel": 0.5, "last_ext_t": 100.0}
-    turned = _live(vel=0.1, vel_prev=0.4, accel=-0.3, mtf=_view(0.5, slope=-0.1, accel=-0.05, vol=0.6))
-    r = exit_reason(g, turned, 1, 0.1, 3, 0.0, 0.5, 0.8, 0.0, cfg)
-    assert r and ("M1 momentum turned" in r or "give-back" in r or "capture" in r), r
+    # MACD histogram turn + volume weakening only (2 signals): momentum hold, no close on that alone
+    two = _live(vel=0.1, vel_prev=0.4, accel=-0.3, mtf=_view(0.5, slope=-0.1, accel=-0.05, vol=0.6))
+    assert exit_reason(g, two, 1, 0.1, 3, 0.0, 0.5, 0.8, 0.0, cfg) is None
+    # + the M1 candle turning against (3 signals agree) -> close in profit
+    v = _view(0.5, slope=-0.1, accel=-0.05, vol=0.6)
+    v.m1.body = -0.3
+    three = _live(vel=0.1, vel_prev=0.4, accel=-0.3, mtf=v)
+    r = exit_reason(g, three, 1, 0.1, 3, 0.0, 0.5, 0.8, 0.0, cfg)
+    assert r and "momentum exhausted in profit" in r and "MACD-hist-turn" in r, r
     running = _live(mtf=_view(0.5, slope=0.1, accel=0.05))
     assert exit_reason(g, running, 1, 0.1, 3, 0.0, 0.5, 0.8, 0.0, cfg) is None
 

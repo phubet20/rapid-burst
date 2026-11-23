@@ -4,8 +4,9 @@ Hard rules enforced here:
   * every order has a protective stop; size is derived from the stop distance
   * never add to a losing position (no martingale / averaging / grid)
   * bounded positions per symbol and in total, bounded lots and open risk
-  * daily loss limit and equity drawdown stop halt the bot for the day
-  * cooldowns, per-minute entry caps and consecutive-loss pauses
+  * NO all-day daily-loss halt: equity drawdown => SAFE MODE (flatten, pause new entries, resume reduced)
+  * NO cooldowns / candle locks: an in-flight lock, an entries/minute API guard and a loss streak that only
+    raises the signal threshold (never the size)
 """
 from __future__ import annotations
 

@@ -47,86 +47,82 @@ Oracle Cloud Always Free and Google Cloud free tiers have no free Windows. AWS/A
 Windows VM for a limited period with a card on file (1 GB RAM is tight for MT5) – the same installer works
 there; nothing in this repo buys or starts cloud resources.
 
-## Trading engine: ONE Continuous Directional Short Scalping Engine (microburst.py + mtf.py)
+## Trading engine: ONE Fast Candle Momentum Batch Scalper (microburst.py + mtf.py + trader.py)
 
-**M5 direction + M1 timing (mtf.py)** from REAL broker candles (TickerAll `GET /candles`, bid OHLC +
-tickVolume; MT5 `copy_rates`), polled M1 every 20 s / M5 every 60 s in a background thread (integer
-look-back hours; TickerAll allows 600 candle calls/min), with the forming bar built from live ticks between
-polls - no candle-close wait. EMA(8/21) and MACD(12,26,9) are incremental (advance once per closed bar, O(1)
-peek for the forming bar).
-* **E. M5 bias** (-1..1): EMA trend, body/range expansion, MACD direction + histogram + momentum change,
-  tick-volume vs previous bars, HH/HL vs LH/LL, supported vs exhausting. A filter, not a gate: ambiguous or
-  weak-opposite M5 only lowers the score; only a clear, supported opposite M5 vetoes.
-* **D. M1 timing** (0..1 per side): forming-bar direction and body expansion, MACD histogram expansion and
-  slope change (no full cross needed), tick-volume expansion, continuation in the M5 direction.
-Tick volume is compared like-for-like (own live tick counts with own counts, broker tickVolume with broker
-tickVolume) and is never called exchange volume.
+One engine, refactored in place (Rapid Micro-Burst -> Pre-Burst -> Continuous Directional -> this). Loop
+(~0.1 s, per selected symbol): new ticks -> scanners (updated per tick) -> ONE decision -> risk & execution
+checks -> one batch -> basket managed tick by tick (momentum hold, break-even, dynamic trailing) -> verified
+exit -> immediate re-evaluation.
 
-**Decision = agreement**: strength = regime-weighted mean of A/B/C/D/E (families without bars drop out);
-trade when strength >= adaptive threshold, it beats the other side, and >= 3 families agree (2 while M1/M5
-have no bars), at least one of them a price family - no single-indicator, speed-only or volume-only entry.
+**Inputs, all read on the FORMING bar (no candle-close wait, no RSI/MACD cross wait):**
+* **M5 direction (E)** and **M1 intrabar trigger (D)** from REAL broker candles (TickerAll `GET /candles`,
+  bid OHLC + tickVolume; MT5 `copy_rates`), polled M1 every 20 s / M5 every 60 s in a background thread,
+  the forming bar built from live ticks between polls. EMA(8/21), MACD(12,26,9) and **RSI(14, Wilder)** are
+  incremental (advance once per closed bar, O(1) peek for the forming bar).
+  * E, M5 bias (-1..1): EMA trend, body/range expansion, MACD direction + histogram + momentum change, RSI
+    level, tick-volume, HH/HL vs LH/LL, supported vs exhausting. A filter, not a gate: ambiguous or weak
+    opposite M5 only lowers the score; only a clear, supported opposite M5 vetoes.
+  * D, M1 trigger (0..1 per side): forming-bar direction and body expansion, MACD histogram expansion and
+    slope change, **RSI as a soft feature** (level vs 50, slope, momentum change; damped when stretched and
+    turning back), tick-volume expansion (relative volume), continuation in the M5 direction.
+* **A, price velocity & acceleration** (ticks): tick rate, velocity/acceleration in ATR, runs, directional
+  efficiency, early acceleration, exhaustion.
+* **B, activity & candle pressure**: tick activity (= number of quotes, **not** exchange volume) counted
+  only when price responds, up/down-tick and bid/ask **proxies**, body/range, wick rejection, absorption.
+* **C, micro-structure**: micro high/low, compression -> expansion, breakout, failed breakout, structure
+  break, pullback recovery, rebound / re-acceleration, anti-chase distance from the swing.
+Tick volume is compared like-for-like and never called exchange volume. Market depth is not used.
 
-**Continuous entry / re-entry**: scanning never stops; there are NO fixed cooldowns (group cooldown, 1 s
-entry cooldown, loss cooldown and loss-streak pause were removed). A closed basket is booked immediately and
-the same loop may open a new batch on a FRESH setup that passes risk checks; the same unchanged setup (same
-burst origin/side, or a setup the broker rejected) is never re-entered. A losing streak raises the threshold
-(+0.03 per losing basket, max +0.09) - never the size. Entries/minute cap 30 is only an API guard.
-Measured re-entry latency (basket close -> next entry) is logged and shown.
+**Decision = agreement**: strength = regime-weighted mean of A/B/C/D/E (families without data drop out);
+trade when strength >= adaptive threshold (0.55 base; higher in quiet/chop, wide spread, bad slippage), it
+beats the other side, >= 3 families agree (2 while M1/M5 have no bars) with at least one price family, and
+no veto (anti-chase, exhaustion, candle already travelled, spread vs expected move, M5 clearly against). No
+single mandatory indicator, no speed-only or volume-only entry.
 
-There is exactly one signal/entry/exit system (the earlier Rapid Micro-Burst engine refactored in place;
-old momentum score, impulse detectors, basket/scalp modes, persistence timers, later adds and fixed TPs are
-gone). No RSI or lagging oscillator, no candle-close wait, no fixed steps, no multi-step confirmation.
+**Continuous intrabar entry / re-entry**: unlimited entry/exit cycles per M1 bar. There is NO cooldown, NO
+candle lock, NO one-trade-per-candle rule and NO re-entry delay. A closed basket is booked in the same loop
+(`_adopt_positions` right after the verified close) and the next loop (~0.1 s) re-evaluates; a new basket can
+open in the same bar. Only these are blocked: an order in flight (in-flight lock), the exact same signal
+(same side + same swing origin + same trigger level, or the same tick), a setup the broker just rejected,
+and an unverified execution (the engine stops). A losing streak raises the threshold (+0.03 per losing
+basket, max +0.09) - never the size. 30 baskets/min is only an API guard. Re-entry delay and entries per
+M1 bar are measured and shown.
 
-Loop (every ~0.1 s, per selected symbol): new ticks -> three scanners (updated per tick) -> ONE decision ->
-risk & execution checks -> one burst batch -> basket managed tick by tick -> verified exit.
+**Batch entry (max 8 orders)**: n = 1 + 1 per 0.05 of strength above the threshold, capped at 8 (2 in
+quiet/chop, 1 during safe-mode probing); then cut by the batch risk budget (1 % of equity, per order
+min(0.5 %, 1 %/n)), batch lots <= 1.0, total open risk <= 3 %, margin use <= 50 %, exposure, positions per
+symbol (8) and in total (10) - every order is validated up front including the batch's own orders. Same lot
+per order; orders sent in parallel (one round trip), each fill verified; never added to later (no
+martingale, no averaging down, no adding to a losing basket, no size-up after a loss).
+*Tiny accounts:* on a ~$13-15 account the broker minimum lot (0.01) already risks more than 0.5 %/order
+(BTCUSDm ~3.8 % per stop, XAUUSDm ~18-20 %). Such accounts trade **one min-lot order per basket** ("min-lot
+floor"), one basket at a time - an 8-order basket appears only when equity is large enough that 8 orders fit
+inside the 1 % batch budget.
 
-**Three scanners on the same tick stream, incremental O(1) per tick** (rolling sums + monotonic deques;
-no rescans of long history per tick):
-* **A, tick velocity & acceleration**: tick rate vs baseline, velocity/acceleration in M1-ATR units,
-  same-direction tick runs, directional efficiency, short burst size, early acceleration, exhaustion
-  (extended move that is decelerating);
-* **B, activity & candle pressure**: tick activity (= number of quotes, **not** exchange volume), activity
-  expansion counted only when price responds, up/down-tick and bid/ask **proxies**, live M1 body expansion,
-  body/range, wick rejection, consecutive pressure, absorption (activity without price response);
-* **C, micro-structure pre-burst trigger**: micro high/low, compression -> expansion, micro breakout, failed
-  breakout, structure break, pullback recovery, short rebound, anti-chase distance from the swing.
-Market depth is not used (no reliable book from TickerAll / the MT5 bridge).
+**Momentum hold & exit** (net basket P/L after spread and commission; NO fixed take-profit):
+1. hard risk first (always wins): safe mode, broker/engine stop mirror, hard stop, basket loss cap, exposure
+   breach, emergency (no fresh price), failed protection (below);
+2. in profit: held while momentum continues; closed when >= 3 exhaustion signals agree - RSI momentum turn,
+   MACD histogram turn, candle momentum loss, volume weakening, directional reversal, micro-structure
+   failure, tick/M5 exhaustion - or on a **meaningful** retracement (>= max(0.25 ATR, 2 x spread) and >= 35 %
+   of the peak) with fading momentum, or reversal + structure failure. Small retracements are held;
+3. not in profit: held inside the hard stop (the old 4 s "no follow-through" cut is gone) unless the move
+   clearly turned (reversal + structure failure + 1 more signal, or >= 0.5 of the stop with >= 2 signals),
+   or stale after 180 s with momentum gone.
 
-**Decision**: BUY and SELL strength (regime-weighted A/B/C) vs an adaptive threshold (0.55 base; higher in
-quiet/chop, wide spread or bad slippage; lower in fast markets). A side trades only when strength >=
-threshold, it beats the other side, **scanner A >= 0.35 and scanner B or C >= 0.35** (no speed-only and no
-volume-only entries), the feed is stable and there is no veto (anti-chase, exhaustion, candle already
-travelled, spread vs target). A move that is just starting (compressed, velocity and acceleration aligned,
-little travelled) gets a small bonus. Otherwise NO TRADE. Trend is display-only context.
+**Break-even & dynamic trailing (basket level)**: once NET basket profit >= max(0.35 x M1 ATR, 3 x spread,
+stops level + lock + spread) the stop of EVERY order in the basket moves to the basket average + costs +
+0.3 x spread (net profit after costs). Then it trails at 0.40 / 0.25 / 0.12 x ATR (strong / normal / fading
+momentum), never closer than 1.5 x spread or the broker stops/freeze level, only forward, in steps >= 0.3 x
+the distance, at most one basket update every max(1 s, 0.25 s x orders) (TickerAll write budget). Each change
+uses the clamped PATCH and is **verified on the live MT5 position** (re-read after the PATCH, and again from
+the positions feed). Until verified the order counts as unprotected at the broker: the engine enforces the
+same level on the broker price and retries; 3 failed/unconfirmed changes in a row close the basket. The
+initial hard stop (max(0.8 x M1 ATR, 4 x spread, stops level)) is always on the order.
 
-**Burst batch entry** (one batch per signal): 1 order, +1 per 0.08 of strength above the threshold, max 3
-(1 in quiet/chop and during safe-mode probing); every order the same lot; batch risk <= 1 % of equity
-(per order min(0.5 %, 1 %/n)), batch lots <= 1.0, all global caps still apply. Spread, slippage and
-margin are checked before each order; the remaining orders are cancelled if price has run more than half
-the target past the decision price, moved against it, or the spread widened. Each fill is verified.
-The basket is never added to later: no martingale, no averaging down, no size-up after a loss.
-
-**Basket exit** (net P/L after spread and commission, tick by tick):
-1. hard risk first (always wins): safe mode, broker-stop / locked-stop mirror, hard stop mirror, basket loss
-   cap, exposure breach, emergency (no fresh price);
-2. short profit capture: target = max(0.20 x M1 ATR, 2 x spread); at 2x target close at once; at target
-   close unless momentum is still continuing (velocity on, no decay, no opposing pressure, no exhaustion);
-3. give-back protection once the peak reached 0.6x target: 40 % give-back, or 60 % while momentum continues
-   (so small pullbacks inside a running move are not closed);
-4. exhaustion / tick reversal in profit, M1 MACD histogram turned against with fading momentum or volume,
-   M5 move exhausting, failed breakout, structure break, opposite strength, no
-   follow-through within ~4 s, momentum against, stale after 120 s.
-Each close is verified on the broker; a verified-closed ticket is never closed or adopted again and only the
-bot's own live tickets of that basket (same symbol/side/magic) are touched.
-
-**Latency** is measured on real clocks for every order and shown in the UI (p50/p90): tick receipt ->
-decision, decision -> send, send -> broker ack, send -> fill verified, tick -> fill, broker -> worker feed
-delay (TickerAll timestamp, only when plausible) and close round trip. Limits: TickerAll WebSocket tick
-frequency is set by TickerAll/broker; account/positions REST cache 1 s; fill verification polls positions
-(up to 6 x 0.4 s); Render free plan latency to the broker API. Nothing is reported as faster unless measured.
-
-Broker SL on every order: max(0.8 x M1 ATR, 4 x spread, broker stop level); no broker TP; the SL moves to
-breakeven+ and trails while in profit.
+**Latency** is measured on real clocks for every order and shown in the UI (p50/p90). Limits: TickerAll
+tick frequency is set by TickerAll/broker; account/positions REST cache 1 s; fill verification polls
+positions; Render free plan latency to the broker API.
 
 ## Risk & execution (risk.py, trader.py, broker_mt5.py / broker_tickerall.py)
 Defaults (all in `worker/rapidburst/config.py`, overridable by env / `RB_CONFIG_JSON`):
@@ -135,8 +131,8 @@ Defaults (all in `worker/rapidburst/config.py`, overridable by env / `RB_CONFIG_
 * total open risk <= 3 % of equity (`RB_MAX_TOTAL_RISK_PCT`); 1.5x breach closes the newest group;
 * **margin use cap 50 % of equity** (`RB_MAX_MARGIN_USE_PCT`) and min margin level 200 % – the earlier
   100 % margin setting was replaced by this risk-based cap;
-* batch: max 3 orders (`RB_MAX_ORDERS_PER_BATCH`), batch risk 1 % (`RB_RISK_PER_BATCH_PCT`), 1.0 lots per
-  batch; 3 per symbol, 6 in total, 2.0 lots total, max 1.0 lot per order, exposure <= 500x equity notional;
+* batch: max 8 orders (`RB_MAX_ORDERS_PER_BATCH`, a cap, never forced), batch risk 1 %
+  (`RB_RISK_PER_BATCH_PCT`), 1.0 lots per batch; 8 per symbol, 10 in total, 2.0 lots total, max 1.0 lot per order, exposure <= 500x equity notional;
 * basket loss cap 2 % of equity (`RB_GROUP_LOSS_PCT`, never inside 3x the spread cost);
 * **no daily-loss all-day stop** (removed; `RB_DAILY_LOSS_PCT` is ignored). **Equity drawdown 8 %** from the
   session peak (`RB_MAX_DD_PCT`) -> **SAFE MODE**: bot positions flattened, new entries paused 5 min
@@ -144,8 +140,8 @@ Defaults (all in `worker/rapidburst/config.py`, overridable by env / `RB_CONFIG_
   3 single min-lot batches. The bot keeps running after START;
 * execution protection: 3 rejected opens within 60 s pause the symbol 60 s; 5 failed close attempts halt new entries;
   15 s without a fresh price = emergency exit (REST quote used first when the stream lags);
-* pacing: no fixed cooldowns (continuous re-entry on fresh setups); 30 entries/min API guard; a loss
-  streak raises the signal threshold, never the size; never size up after a losing basket.
+* pacing: no cooldowns or candle locks (continuous intrabar re-entry on fresh signals); 30 baskets/min API
+  guard; a loss streak raises the signal threshold, never the size; never size up after a losing basket.
 * **min-lot floor accounts** (the broker minimum lot already risks more than the % caps, e.g. XAUUSDm 0.01
   lot on a ~$13 account = ~18-20 % per stop): one min-lot position at a time (no multi-order batch), that
   position is not "exposure-breach" closed (which only paid the spread in the first real demo run), and

@@ -224,16 +224,18 @@ def test_verified_closed_ticket_is_never_closed_twice(tmp_path):
         return real_close(t, dev, magic)
     br.close_position = close
     stale = {t: dict(p) for t, p in br.positions_.items()}
+    real_hard = tr._hard_risk_exit
     tr._hard_risk_exit = lambda *a, **k: "hard group loss (test)"
     run(tr, br, T0 + 100.9, T0 + 101.0)
-    assert calls and not br.positions_
+    tr._hard_risk_exit = real_hard
+    # the basket is closed; the engine may already have re-entered on a fresh signal (continuous re-entry)
+    assert calls and not (set(stale) & set(br.positions_))
     # a stale cached broker list still showing the closed tickets must not trigger a second close
     real_pos = br.positions
-    br.positions = lambda *a, **k: list(stale.values()) + real_pos()
-    n = len(calls)
+    br.positions = lambda *a, **k: list(stale.values()) + [p for p in real_pos() if p["ticket"] not in stale]
     run(tr, br, T0 + 101.3, T0 + 102.5)
     br.positions = real_pos
-    assert len(calls) == n and len(set(calls)) == len(calls)
+    assert all(calls.count(t) == 1 for t in stale), calls
     assert tr.lat_exits and "close_ms" in tr.lat_exits[-1]
 
 

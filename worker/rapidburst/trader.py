@@ -26,7 +26,7 @@ from .engine import MomentumEngine, PositionState
 from .risk import AccountView, EntryPacer, OpenPos, RiskGuard, size_position
 from .mtf import MTF
 from concurrent.futures import ThreadPoolExecutor
-from .microburst import Micro, Strength, decide, exit_reason
+from .microburst import Micro, Strength, decide, exit_reason, exit_signals
 from .learner import Learner, regime as vol_regime
 from .risk import normalize_volume
 from .engine import Signal
@@ -99,6 +99,10 @@ class Trader:
         self.perf: list = []                         # closed batches with real broker P/L (after costs)
         self._closed_tickets: dict[int, float] = {}  # verified-closed tickets: never closed twice
         self._floor_tickets: set = set()             # opened at the broker minimum lot (risk above the % caps)
+        # basket protection events (real modifies verified on the MT5 position) and intrabar cycles per M1 bar
+        self.prot_stats = {"be": 0, "trail": 0, "modify_ok": 0, "verified": 0, "modify_fail": 0, "unverified": 0,
+                           "protect_close": 0}
+        self.bar_cycles: dict = {}                   # symbol -> {"bar": M1 bar time, "opened": n, "closed": n}
         self._deals_cache: tuple = (0.0, [])
         self.exec_fails: dict[str, deque] = {}
         self.exec_pause: dict[str, float] = {}
@@ -594,9 +598,14 @@ class Trader:
                 self._learn_from(ps, b, now)
                 self.perf.append({"ts": now, "symbol": ps.symbol, "side": b["side"], "pl": round(b["realized"], 2),
                                   "legs": b.get("legs"), "hold_s": round(now - float(b.get("opened", now)), 1),
-                                  "exit": b.get("exit_reason", "broker SL/close"), "attr": b.get("attr") or {},
+                                  "exit": b.get("exit_reason") or (f"broker {b['prot']} stop" if b.get("prot") else "broker SL/close"), "attr": b.get("attr") or {},
                                   "spread_pts": b.get("spread_pts"), "slip_pts": b.get("slip_pts") or [],
-                                  "reentry_s": b.get("reentry_s"), "tickets": b.get("tickets") or []})
+                                  "reentry_s": b.get("reentry_s"), "tickets": b.get("tickets") or [],
+                                  "m1_bar": b.get("m1_bar"), "planned": b.get("planned"),
+                                  "protect": b.get("prot") or "none", "trail_moves": int(b.get("trail_moves", 0))})
+                c = self.bar_cycles.get(ps.symbol)
+                if c is not None and b.get("m1_bar") == c.get("bar"):
+                    c["closed"] += 1
                 self.add_log("INFO", f"GROUP {ps.batch_id} {b['side']} {ps.symbol} fully closed: "
                                      f"P/L {b['realized']:+.2f} over {b.get('legs', '?')} order(s) "
                                      f"[{b.get('exit_reason', 'broker SL/close')}]")
@@ -784,7 +793,20 @@ class Trader:
                              "comps": st.comps},
                 "spread_pts": round(m.spread / float(info["point"]), 1) if info.get("point") and m.spread else None,
                 "tick_age": round(now_wall - self.last_receipt[s], 1) if s in self.last_receipt else None,
-                "mtf": m.mtf.brief() if getattr(m, "mtf", None) is not None else None}
+                "mtf": m.mtf.brief() if getattr(m, "mtf", None) is not None else None,
+                "m1_cycles": self._cycles(s, now_wall)}
+
+    def _m1_bar(self, s: str, now_wall: float) -> float:
+        t = self._server_now(s, now_wall) - self._candle_off()
+        return t - (t % 60.0)
+
+    def _cycles(self, s: str, now_wall: float) -> dict:
+        """Entry/exit cycles in the CURRENT M1 bar (no per-candle limit: shown, never used as a gate)."""
+        bar = self._m1_bar(s, now_wall)
+        c = self.bar_cycles.get(s)
+        if not c or c["bar"] != bar:
+            c = self.bar_cycles[s] = {"bar": bar, "opened": 0, "closed": 0}
+        return c
 
     def _acct(self) -> AccountView:
         return AccountView(float(self.account.get("balance", 0)), float(self.account.get("equity", 0)),
@@ -805,11 +827,13 @@ class Trader:
             t_dec = time.time()
             status = self._status(s, m, st, now_wall)
             self.sym_status[s] = status
-            mine = [ps for ps in self.pos_state.values() if ps.symbol == s]
+            mine = [ps for ps in self.pos_state.values() if ps.symbol == s and ps.ticket not in self._closed_tickets]
             if mine:
                 g = self.bursts.get(mine[0].batch_id) or {}
                 status["reason"] = (f"managing {mine[0].side} basket {mine[0].batch_id} ({len(mine)} order(s), "
-                                    f"net {g.get('net_px', 0.0):+.5g}) - no adds: one batch per signal")
+                                    f"net {g.get('net_px', 0.0):+.5g}, protection {g.get('prot') or 'hard stop'}, "
+                                    f"momentum {g.get('momentum', '-')}) - no adds: one batch per signal; a new "
+                                    f"basket can open right after it closes, also in the same M1 bar")
                 continue
             if st.side == "NO TRADE":
                 self._skip(s, status, st.reason, now_wall)
@@ -835,8 +859,11 @@ class Trader:
                 self._skip(s, status, "paused: poor execution quality (slippage)", now_wall, sig)
                 continue
             last = self.last_burst.get(s)
-            if last and last.get("side") == side and abs(float(last.get("origin", 0.0)) - st.origin) < 0.5:
-                self._skip(s, status, f"{side} skipped: duplicate - this burst was already traded", now_wall, sig)
+            lvl = m.micro_hi if side == "BUY" else m.micro_lo
+            if (last and last.get("side") == side and abs(float(last.get("origin", 0.0)) - st.origin) < 0.5
+                    and abs(float(last.get("level", lvl)) - lvl) <= 0.1 * max(m.atr, 1e-12)):
+                self._skip(s, status, f"{side} skipped: duplicate - this exact signal (same swing and trigger level) "
+                                      f"was already traded", now_wall, sig)
                 continue
             if last and float(last.get("tick_t", -1.0)) == m.t:
                 self._skip(s, status, f"{side} skipped: duplicate - same tick", now_wall, sig)
@@ -877,7 +904,7 @@ class Trader:
         n = 1 + int(max(0.0, strength - st.threshold) / max(cfg.batch_step_strength, 1e-6))
         n = max(1, min(n, cfg.max_orders_per_batch, cfg.max_positions_per_symbol))
         if m.regime in ("quiet", "chop"):
-            n = 1
+            n = min(n, 2)                           # weak tape: small baskets only
         probe = self.risk.probe_left > 0
         if probe:
             n = 1
@@ -966,11 +993,13 @@ class Trader:
         self.pacer.on_entry(s, now_wall)
         if opened == 0:
             # the broker rejected this setup: never resend the SAME unchanged signal (no retry loop)
-            self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t}
+            self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t,
+                             "level": m.micro_hi if side == "BUY" else m.micro_lo}
             return False
         g = self.bursts[gid]
         g["planned"] = n
-        self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t}
+        self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t,
+                             "level": m.micro_hi if side == "BUY" else m.micro_lo}
         if probe:
             self.risk.probe_left -= 1
         if floor:
@@ -989,6 +1018,8 @@ class Trader:
             "agree": "".join(k for k, x in fam.items() if x is not None and x >= cfg.mb_scan_support),
             "regime": m.regime}
         g["spread_pts"] = round(m.spread / point, 1) if point else None
+        g["m1_bar"] = self._m1_bar(s, now_wall)
+        self._cycles(s, now_wall)["opened"] += 1
         last_close = self._last_close_wall.pop(s, None)
         if last_close is not None:
             g["reentry_s"] = round(now_wall - last_close, 2)
@@ -1136,7 +1167,6 @@ class Trader:
                 self._flatten("UNPROTECTED (no SL, engine not running)")
             return            # exits are managed only while STARTed (broker SL protects otherwise)
         self._check_price_sync(live, now_wall)
-        self._manage_stops(live, now_wall)
         groups: dict[str, list[PositionState]] = {}
         self._closed_tickets = {k: v for k, v in self._closed_tickets.items() if now_wall - v < 60.0}
         for t, ps in self.pos_state.items():
@@ -1150,6 +1180,8 @@ class Trader:
             sym = legs[0].symbol
             m, st = self._micro(sym, now_wall)
             reason = self._hard_risk_exit(key, legs, live, m, now_wall)       # hard risk ALWAYS first
+            if not reason and self.running:
+                reason = self._protect_basket(key, legs, live, m, st, now_wall)   # BE / dynamic trailing
             if not reason and self.running:
                 reason = self._micro_exit(key, legs, live, m, st, now_wall)
             if not reason:
@@ -1356,65 +1388,139 @@ class Trader:
             return None
         return min(prices) if d > 0 else max(prices)
 
-    def _manage_stops(self, live: dict, now_wall: float) -> None:
-        """Breakeven+ then trailing: move the broker SL forward as the bar continues in our favour.
-        A software mirror (vsl) is always kept, so if the broker refuses a modify the same level is
-        still enforced by the engine."""
+    def _protect_basket(self, key: str, legs: list, live: dict, m, st, now_wall: float) -> Optional[str]:
+        """BASKET break-even + dynamic trailing, one stop level for every order of the basket.
+        * BE: only after NET basket profit >= max(be_trigger_atr x M1 ATR, be_trigger_spread x spread, stops level
+          + lock + spread) - late enough that noise does not take it; the BE level is the basket average price +
+          costs (commission) + a small lock, i.e. net profit after costs.
+        * Trail: price - d x distance, distance = ATR x (wide while momentum is strong, normal, tight once it fades),
+          never closer than trail_spread_mult x spread or the broker stops/freeze level; only ever moves forward.
+        * Every modify goes through the broker's clamped PATCH and is VERIFIED on the live MT5 position. Until it
+          is, the leg counts as unprotected at the broker: the engine enforces the same level itself (vsl mirror,
+          checked in _hard_risk_exit) and retries; after protect_fail_max failures in a row the basket is closed.
+        The initial hard stop always stays in place (stops only move forward)."""
         cfg = self.cfg
-        for t, ps in self.pos_state.items():
-            p = live.get(t)
-            if p is None:
-                continue
-            eng = self.engines.get(ps.symbol)
-            f = eng.features(self._server_now(ps.symbol, now_wall)) if eng is not None else None
-            px = self._exec_px(ps, p, f, now_wall)
-            if px is None:
-                continue
-            d = 1 if ps.side == "BUY" else -1
-            pl = (px - ps.open_price) * d
-            ps.peak_pl = max(ps.peak_pl, pl)
-            info = self.sym_info.get(ps.symbol) or {}
-            point = float(info.get("point", 0.0)) or 1e-9
-            spread = (f.spread if f is not None and f.spread else 0.0) or abs(float(p.get("price_current", px)) - px)
-            stops = (int(info.get("trade_stops_level", 0)) + 3) * point
-            atr, _ = self._atr(ps.symbol)
-            trail = max(cfg.trail_atr_frac * atr,
-                        cfg.trail_spread_mult * spread, stops)
-            be_lock = max(cfg.be_lock_spread_mult * spread, 2 * point)
-            cur = float(p.get("sl", 0.0)) or ps.sl
-            new, state = None, ps.sl_state
-            if ps.sl_state == "initial":
-                if pl >= be_lock + trail:             # room to lock BE+ while staying >= trail behind price
-                    new, state = ps.open_price + d * be_lock, "BE+"
+        g = self.bursts.get(key)
+        if g is None:
+            return None
+        sym, side = legs[0].symbol, legs[0].side
+        d = 1 if side == "BUY" else -1
+        info = self.sym_info.get(sym) or {}
+        point = float(info.get("point", 0.0)) or 1e-9
+        pl, _ = self._group_pl(legs, live, m, now_wall)
+        if pl is None:
+            return None
+        vol = sum(p.volume for p in legs)
+        avg = sum(p.open_price * p.volume for p in legs) / vol
+        px = avg + d * pl                                        # worst executable exit price of the basket
+        ts, tv = self._tv(sym)
+        cost = cfg.commission_per_lot / (tv / ts) if (cfg.commission_per_lot and ts and tv) else 0.0
+        net = pl - cost
+        spread = float(getattr(m, "spread", 0.0) or 0.0)
+        atr, _ = self._atr(sym)
+        atr = atr or float(getattr(m, "atr", 0.0) or 0.0)
+        if atr <= 0:
+            return None
+        stops = (max(int(info.get("trade_stops_level", 0)), int(info.get("trade_freeze_level", 0))) + 3) * point
+        lock = cost + max(cfg.be_lock_spread_mult * spread, 2 * point)
+        trigger = max(cfg.be_trigger_atr * atr, cfg.be_trigger_spread * spread, stops + lock + spread)
+        mom = "normal"
+        if getattr(m, "ready", False):
+            sig = exit_signals(g, m, d, st.sell if d > 0 else st.buy, st.threshold, cfg)
+            cont = sig.pop("_continuing")
+            nsig = sum(1 for v in sig.values() if v)
+            mom = "strong" if cont and nsig == 0 else "fading" if (nsig >= 2 or not cont) else "normal"
+        k = {"strong": cfg.trail_atr_strong, "fading": cfg.trail_atr_fade}.get(mom, cfg.trail_atr_frac)
+        trail = max(k * atr, cfg.trail_spread_mult * spread, stops)
+        level = float(g.get("prot_level") or 0.0)
+        state = str(g.get("prot") or "")
+        g["prot_trigger"], g["trail_dist"], g["momentum"] = trigger, trail, mom
+        new = None
+        if not state:
+            if net >= trigger:
+                new, state = avg + d * lock, "BE"
+        else:
+            cand = px - d * trail
+            if (cand - level) * d >= max(0.3 * trail, 5 * point):
+                new, state = cand, "trail"
+        if new is not None:
+            if level and (new - level) * d <= 0:
+                new = None
             else:
-                cand = px - d * trail
-                step = max(0.25 * trail, 5 * point)
-                if (cand - (cur or ps.vsl)) * d >= step:
-                    new, state = cand, "trail"
-            if new is None:
-                continue
-            if cur and (new - cur) * d <= 0:
-                continue                               # never move a stop backwards
-            ps.vsl = new if not ps.vsl else (max(ps.vsl, new) if d > 0 else min(ps.vsl, new))
+                was = g.get("prot")
+                g["prot"], g["prot_level"] = state, new
+                if state == "BE" and not was:
+                    g["be_at"] = now_wall
+                    self.prot_stats["be"] += 1
+                    self.add_log("INFO", f"BREAK-EVEN basket {key} {side} {sym}: net {net:+.5g} >= trigger {trigger:.5g} "
+                                         f"-> stop {new:.{int(info.get('digits', 5))}f} for all {len(legs)} order(s)")
+                elif state == "trail":
+                    g["trail_moves"] = int(g.get("trail_moves", 0)) + 1
+                    self.prot_stats["trail"] += 1
+        level = float(g.get("prot_level") or 0.0)
+        if not level:
+            return None
+        digits = int(info.get("digits", 5))
+        tol = 0.5 * float(info.get("trade_tick_size") or point)
+        todo = []
+        # write budget: TickerAll allows 300 order writes/min per key -> one basket update at most every
+        # max(sl_modify_min_interval, 0.25 s x legs) (8 legs: every 2 s)
+        gap = max(cfg.sl_modify_min_interval, 0.25 * len(legs))
+        for ps in legs:
+            p = live.get(ps.ticket) or {}
+            ps.vsl = level if not ps.vsl else (max(ps.vsl, level) if d > 0 else min(ps.vsl, level))  # engine mirror
             ps.sl_state = state
-            digits = int(info.get("digits", 5))
-            if not cfg.broker_sl or now_wall - ps.last_mod < cfg.sl_modify_min_interval:
+            live_sl = float(p.get("sl", 0.0) or 0.0)
+            if live_sl and (live_sl - level) * d >= -tol:            # the REAL position shows the stop
+                if not ps.sl_verified:
+                    self.prot_stats["verified"] += 1
+                ps.sl_verified, ps.prot_fail, ps.sl = True, 0, live_sl
                 continue
-            ps.last_mod = now_wall
-            r = self.broker.modify_sl(t, new, float(p.get("tp", 0.0)) or ps.tp)
-            if r.get("ok"):
-                sent = float(r.get("sl") or new)
+            ps.sl_verified = False
+            if cfg.broker_sl and now_wall - ps.last_mod >= gap:
+                ps.last_mod = now_wall
+                todo.append((ps, float(p.get("tp", 0.0)) or ps.tp))
+        if not todo:
+            return None
+
+        def _mod(ps, tp):
+            try:
+                return self.broker.modify_sl(ps.ticket, level, tp)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "msg": f"{type(exc).__name__}: {exc}"}
+        if bool(getattr(self.broker, "concurrent_io", False)) and len(todo) > 1:
+            res = [f.result() for f in [self._io.submit(_mod, ps, tp) for ps, tp in todo]]   # one round trip
+        else:
+            res = [_mod(ps, tp) for ps, tp in todo]
+        for (ps, _), r in zip(todo, res):
+            sent = float(r.get("sl") or level)
+            if r.get("ok") and (r.get("verified") or abs(sent - level) <= tol or (sent - level) * d > 0):
                 ps.sl = sent
-                self.add_log("INFO", f"SL #{t} {ps.side} {ps.symbol} -> {sent:.{digits}f} ({state}, wanted "
-                                     f"{new:.{digits}f}, P/L {pl:+.{digits}f} px, trail {trail:.{digits}f})")
+                ps.sl_verified, ps.prot_fail = bool(r.get("verified", True)), 0
+                self.prot_stats["modify_ok"] += 1
+                if r.get("verified"):
+                    self.prot_stats["verified"] += 1
+                self.add_log("INFO", f"SL #{ps.ticket} {side} {sym} -> {ps.sl:.{digits}f} ({state}, basket {key}, "
+                                     f"momentum {mom}, trail {trail:.{digits}f}){' verified on MT5' if r.get('verified') else ''}")
             elif r.get("closed"):
-                self.add_log("INFO", f"SL #{t}: position already closed - modify skipped")
-            elif r.get("soft"):
-                log.debug("SL #%s not placeable yet: %s", t, r.get("msg"))   # software stop still enforced
+                continue
+            elif r.get("soft") or r.get("ok"):
+                # the broker's nearest placeable level is behind the wanted one (stops/freeze level): the broker
+                # keeps the best placeable stop, the engine enforces the wanted level on the broker price
+                log.debug("SL #%s %s not placeable yet: %s", ps.ticket, level, r.get("msg"))
+                if r.get("ok"):
+                    ps.sl = sent
             else:
-                self.add_log("WARNING", f"SL modify #{t} refused (retcode {r.get('retcode')}, {r.get('code')}: "
-                                        f"{r.get('msg')}) - software {state} stop {new:.{digits}f} enforced by the "
-                                        f"engine on the BROKER price")
+                ps.prot_fail += 1
+                self.prot_stats["modify_fail" if not r.get("unverified") else "unverified"] += 1
+                self.add_log("WARNING", f"SL modify #{ps.ticket} {state} {level:.{digits}f} NOT confirmed "
+                                        f"({ps.prot_fail}/{cfg.protect_fail_max}): {r.get('msg')} - treated as "
+                                        f"unprotected at the broker; the engine enforces the level and retries")
+                if ps.prot_fail >= cfg.protect_fail_max:
+                    self.prot_stats["protect_close"] += 1
+                    return (f"protection failed: {state} stop for #{ps.ticket} not confirmed by MT5 "
+                            f"{ps.prot_fail}x - closing the basket ({net:+.5g})")
+        return None
 
     def _tv(self, s: str) -> tuple[float, float]:
         info = self.sym_info.get(s) or {}
@@ -1525,12 +1631,12 @@ class Trader:
                  ("thin tick", "thin tick flow"), ("tick rate", "thin tick flow"), ("anti-chase", "anti-chase"),
                  ("no live force", "no live force"), ("no edge", "below threshold"), ("two-sided", "two-sided"),
                  ("supporting signal", "weak support"), ("spread", "spread / cost filter"),
-                 ("group cooldown", "group cooldown"), ("cooldown", "cooldown"), ("per minute", "entry rate cap"),
+                 ("per minute", "entry rate cap"),
                  ("/min", "entry rate cap"), ("min lot", "sizing refused"), ("averaging", "no adding to losers"),
                  ("not in net profit", "no adding to losers"), ("margin", "margin"),
                  ("execution failure", "execution failures"), ("slippage", "execution quality"),
-                 ("halt", "execution protection"), ("netting", "netting position"), ("loss streak", "loss-streak pause"),
-                 ("pause", "loss-streak pause"), ("learning", "learner"), ("risk", "risk cap"), ("max ", "risk cap"),
+                 ("halt", "execution protection"), ("netting", "netting position"), ("loss streak", "loss streak raises the bar"),
+                 ("paused", "execution pause"), ("learning", "learner"), ("risk", "risk cap"), ("max ", "risk cap"),
                  ("opposite", "no hedge vs open")]
         for k, v in table:
             if k in r:
@@ -1649,7 +1755,8 @@ class Trader:
         c = self.cfg
         eq = float(self.account.get("equity", 0) or 0) if self.conn_state == "CONNECTED" else 0.0
         used = self._margin_used() if eq else 0.0
-        return {"engine": "Continuous Directional Short Scalping (single engine: M5 bias + M1 timing + tick A/B/C)",
+        return {"engine": "Fast Candle Momentum Batch Scalper (single engine: M5 direction + M1 intrabar trigger + "
+                          "RSI/MACD/volume/candle/structure/velocity, momentum hold, basket BE + dynamic trailing)",
                 "min_agree": c.mb_min_agree, "candle_poll_s": {"M1": c.candle_poll_m1_s, "M5": c.candle_poll_m5_s},
                 "safe_dd_limit": round(self.risk.dd_limit(), 2) if self.risk.peak_equity else None,
                 "loss_streak_add": round(max((self.pacer.threshold_add(x) for x in self.selected), default=0.0), 2),
@@ -1667,11 +1774,16 @@ class Trader:
                 "max_spread_bps": c.max_spread_bps, "min_tick_rate": c.min_tick_rate,
                 "threshold": c.mb_threshold, "scan_support": c.mb_scan_support, "max_chase_atr": c.mb_max_chase_atr,
                 "max_bar_atr": c.mb_max_bar_atr, "target_atr": c.mb_target_atr, "target_spread": c.mb_target_spread,
-                "follow_s": c.mb_follow_seconds, "max_hold_s": c.mb_max_hold_seconds,
+                "max_hold_s": c.mb_max_hold_seconds, "exit_min_signals": c.exit_min_signals,
+                "be_trigger": f"max({c.be_trigger_atr:g}x ATR, {c.be_trigger_spread:g}x spread)",
+                "trail_atr": {"strong": c.trail_atr_strong, "normal": c.trail_atr_frac, "fading": c.trail_atr_fade},
+                "protect_fail_max": c.protect_fail_max,
                 "broker_sl": "ON" if c.broker_sl else "OFF", "exec_halt": self.exec_halt,
-                "sl_rule": f"hard stop max({c.sl_atr:g}x M1 ATR, {c.sl_spread_mult:g}x spread) at the broker -> BE+ "
-                           f"{c.be_lock_spread_mult:g}x spread -> trail max({c.trail_atr_frac:g}x ATR, "
-                           f"{c.trail_spread_mult:g}x spread); engine mirror {c.soft_stop_mult:g}x"}
+                "sl_rule": f"hard stop max({c.sl_atr:g}x M1 ATR, {c.sl_spread_mult:g}x spread) at the broker -> basket BE "
+                           f"(avg + costs + {c.be_lock_spread_mult:g}x spread) once net >= max({c.be_trigger_atr:g}x ATR, "
+                           f"{c.be_trigger_spread:g}x spread) -> dynamic trail {c.trail_atr_strong:g}/{c.trail_atr_frac:g}/"
+                           f"{c.trail_atr_fade:g}x ATR (strong/normal/fading momentum, >= {c.trail_spread_mult:g}x spread); "
+                           f"every modify verified on MT5; engine mirror {c.soft_stop_mult:g}x"}
 
     def _groups_view(self) -> dict:
         live = {int(p["ticket"]): p for p in self.own_positions} if self.conn_state == "CONNECTED" else {}
@@ -1686,6 +1798,11 @@ class Trader:
                                          for ps in legs), 2),
                       "net_px": g.get("net_px"), "peak_px": g.get("peak_pl"), "target_px": g.get("target"),
                       "stop_px": g.get("stop_dist"), "regime": g.get("regime"), "adds": g.get("adds", 0),
+                      "planned": g.get("planned"), "protect": g.get("prot") or "hard stop only",
+                      "protect_level": g.get("prot_level"), "be_trigger_px": g.get("prot_trigger"),
+                      "trail_px": g.get("trail_dist"), "momentum": g.get("momentum"),
+                      "trail_moves": int(g.get("trail_moves", 0)),
+                      "sl_verified": all(ps.sl_verified for ps in legs),
                       "age_s": round((getattr(self, "now_wall", 0) or time.time()) - min(ps.open_time for ps in legs))}
         return out
 
@@ -1754,7 +1871,34 @@ class Trader:
                 "avg_spread_pts": round(sum(spreads) / len(spreads), 1) if spreads else None,
                 "avg_slip_pts": round(sum(slips) / len(slips), 1) if slips else None,
                 "attribution": {k: group(k) for k in ("m5", "macd", "volume", "tick")},
+                "orders_per_basket": round(sum(int(r.get("legs") or 0) for r in rows) / n, 2),
+                "entries_per_m1_bar": self._per_bar(rows),
+                "protection": dict(self.prot_stats, baskets_with_be=sum(1 for r in rows if r.get("protect") in ("BE", "trail")),
+                                   baskets_trailed=sum(1 for r in rows if r.get("protect") == "trail"),
+                                   net_be_or_trail=round(sum(float(r["pl"]) for r in rows if r.get("protect") in ("BE", "trail")), 2)),
+                "exits": self._exit_mix(rows),
                 "last": rows[-5:]}
+
+    @staticmethod
+    def _per_bar(rows: list) -> dict:
+        bars: dict = {}
+        for r in rows:
+            if r.get("m1_bar") is not None:
+                k = (r.get("symbol"), r["m1_bar"])
+                bars[k] = bars.get(k, 0) + 1
+        if not bars:
+            return {"bars": 0}
+        v = list(bars.values())
+        return {"bars": len(v), "avg": round(sum(v) / len(v), 2), "max": max(v), "bars_with_2plus": sum(1 for x in v if x >= 2)}
+
+    @staticmethod
+    def _exit_mix(rows: list) -> dict:
+        out: dict = {}
+        for r in rows:
+            e = str(r.get("exit") or "")
+            k = e.split(":")[0].split(" (")[0][:40] or "other"
+            out[k] = out.get(k, 0) + 1
+        return out
 
     def _build_snapshot(self, now_wall: float) -> None:
         acct = self.account if self.conn_state == "CONNECTED" else {}
