@@ -101,7 +101,6 @@ class RiskGuard:
         self.halt_reason = ""
         self.safe_until = 0.0
         self.safe_count = 0
-        self.need_confirm = False      # t32u: after safe mode, the next entry needs fresh M1 structure
         self.session_peak = 0.0
         self.catastrophic = False      # equity below safe_flatten_pct of the peak -> flatten (last resort)
         self.probe_left = 0            # batches still forced to one min-lot order after a safe-mode pause
@@ -111,7 +110,7 @@ class RiskGuard:
         self.peak_equity = equity
         self.halted, self.halt_reason = False, ""
         self.safe_until, self.safe_count, self.probe_left = 0.0, 0, 0
-        self.need_confirm, self.catastrophic = False, False
+        self.catastrophic = False
         self.session_peak = equity
         self.floor_risk = 0.0
 
@@ -129,10 +128,10 @@ class RiskGuard:
         """Returns ("safe", msg) when safe mode starts, ("resume", msg) when it ends, else None.
         t32u: the reference peak is the CLOSED-equity peak (balance), never a floating spike - an open basket's
         unrealised profit cannot set a peak that the same basket's normal pullback then "loses". Safe mode only
-        PAUSES NEW ENTRIES (each open basket keeps its own structure stop / trail); after the pause the first
-        entry needs a fresh M1 structure confirmation (`need_confirm`). `catastrophic` (flatten) is only set when
+        PAUSES NEW ENTRIES (each open basket keeps its own structure stop / trail); `catastrophic` (flatten) is only set when
         equity falls `safe_flatten_pct` below the peak."""
-        if acct.equity <= 0:
+        if acct.equity <= 0 or getattr(self.cfg, "no_stop_mode", False):
+            self.halted = self.catastrophic = False     # t42u: owner mode - no safe mode, no drawdown halt, no pause
             return None
         # closed equity: the balance, but never above current equity (an open loss is not a "peak")
         bal = min(acct.balance, acct.equity) if acct.balance > 0 else acct.equity
@@ -157,9 +156,7 @@ class RiskGuard:
             self.halted, self.halt_reason = False, ""
             self.peak_equity = bal                          # new reference: no instant re-trigger
             self.probe_left = self.cfg.safe_probe_batches
-            self.need_confirm = True
-            return "resume", (f"SAFE MODE ended - entries resume after a FRESH M1 structure confirmation "
-                              f"(swing break / HH-HL or LH-LL with the trade), new reference {bal:.2f}")
+            return "resume", f"SAFE MODE ended - entries resume, new reference {bal:.2f}"
         dd = self.cfg.equity_drawdown_pct
         lim = self.dd_limit()
         if dd > 0 and self.peak_equity > 0 and acct.equity < self.peak_equity - lim:
@@ -178,7 +175,8 @@ class RiskGuard:
                     new_notional: float = 0.0, batch_leg: bool = False,
                     floor_mode: bool = False) -> tuple[bool, str]:
         cfg = self.cfg
-        if self.halted:
+        nostop = bool(getattr(cfg, "no_stop_mode", False))
+        if self.halted and not nostop:                 # t40u: no-stop mode never stops entering (recovery needs it)
             return False, f"safe mode: {self.halt_reason}"
         pos = list(positions)
         if len(pos) >= cfg.max_positions_total:
@@ -186,9 +184,10 @@ class RiskGuard:
         mine = [p for p in pos if p.symbol == symbol]
         if len(mine) >= cfg.max_positions_per_symbol:
             return False, f"max {cfg.max_positions_per_symbol} positions on {symbol}"
-        if any(p.side != side for p in mine):
+        if any(p.side != side for p in mine) and not getattr(self, "allow_opposite", False):
             return False, "opposite position open on symbol (no hedging)"
-        if mine and not batch_leg:
+        mine = [p for p in mine if p.side == side]
+        if mine and not batch_leg and not getattr(self, "allow_averaging", False):
             # adding is allowed only into strength: every existing leg must be in profit
             # (batch_leg = the 2nd..Nth order of a burst batch being opened right now on one signal)
             if any(p.profit <= 0 for p in mine):

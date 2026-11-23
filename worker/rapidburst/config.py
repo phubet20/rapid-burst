@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass, asdict, fields
 
 
-RISK_ENV = (("RB_BROKER_SL", "broker_sl"), ("RB_SAFE_PAUSE_S", "safe_pause_s"),
+RISK_ENV = (("RB_SAFE_PAUSE_S", "safe_pause_s"),
             ("RB_MAX_DD_PCT", "equity_drawdown_pct"), ("RB_LEARNING_ENABLED", "learning_enabled"),
             ("RB_RISK_PER_TRADE_PCT", "risk_per_trade_pct"), ("RB_MAX_TOTAL_RISK_PCT", "max_total_risk_pct"),
             ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"), ("RB_MAX_ORDERS_PER_GROUP", "max_orders_per_batch"),
@@ -31,8 +31,14 @@ INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE"
 TUNABLE = {
     "sl_struct_buffer_atr": (0.0, 0.5), "sl_min_atr": (0.2, 2.0), "sl_max_atr": (0.5, 4.0),
     "ind_min_score": (0.0, 0.6), "ind_sr_near_atr": (0.0, 1.0), "safe_flatten_pct": (0.0, 95.0), "exit_min_r": (0.0, 2.0), "reverse_enabled": (0, 1), "reverse_edge": (0.0, 0.5),
-    "no_stop_mode": (0, 1), "nostop_margin_use_pct": (5.0, 90.0), "emergency_margin_level_pct": (50.0, 1000.0),
-    "zone_target_exit": (0, 1), "broker_sl": (0, 1), "full_batch": (0, 1), "zones_enabled": (0, 1), "zone_weight": (0.0, 0.3), "zone_impulse_atr": (0.5, 3.0),
+    "nostop_margin_use_pct": (5.0, 90.0), "batch_margin_pct": (1.0, 60.0), "emergency_margin_level_pct": (50.0, 1000.0),
+    "zone_target_exit": (0, 1), "full_batch": (0, 1),
+    "regime_enabled": (0, 1), "regime_pivot_k": (1, 5), "regime_max_phase": (3, 12), "regime_adx_min": (0.0, 40.0),
+    "regime_chase_atr": (0.5, 6.0), "regime_bonus": (0.0, 0.3), "hedge_enabled": (0, 1), "recovery_after_s": (5.0, 3600.0),
+    "recovery_loss_pct": (0.2, 50.0), "avg_enabled": (0, 1), "avg_spacing_atr": (0.2, 10.0), "avg_max_layers": (0, 10),
+    "avg_lot_mult": (1.0, 3.0), "cycle_tp_pct": (0.01, 10.0), "tp_min_money": (0.0, 100.0),
+    "profit_lock_min_money": (0.0, 100.0), "profit_lock_spread_x": (0.5, 10.0), "profit_lock_giveback": (0.1, 0.9),
+    "profit_lock_floor_frac": (0.0, 0.9), "profit_lock_confirm_s": (0.0, 3.0), "zones_enabled": (0, 1), "zone_weight": (0.0, 0.3), "zone_impulse_atr": (0.5, 3.0),
     "pullback_hold": (0, 1), "exit_confirm_s": (0.0, 5.0), "exit_confirm_ticks": (1, 20), "exit_outlier_atr": (0.2, 5.0), "exit_stale_s": (0.5, 10.0),
     "candle_poll_m5_s": (5, 120),
     "ind_enabled": (0, 1), "ind_chop_veto": (0, 1), "mb_require_m1_trigger": (0, 1), "sl_structure": (0, 1),
@@ -41,7 +47,7 @@ TUNABLE = {
     "mb_min_velocity": (0.05, 0.8), "m1_trend_veto": (0.2, 1.0), "min_orders_per_batch": (1, 8),
     "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
-    "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 64), "max_positions_per_symbol": (1, 64),
+    "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 200), "max_positions_per_symbol": (1, 100),
     "max_lot_per_order": (0.01, 100.0), "max_batch_lots": (0.01, 500.0), "max_total_lots": (0.01, 1000.0),
     "min_margin_level_pct": (50.0, 1000.0), "margin_use_max_pct": (10.0, 100.0), "safe_probe_batches": (0, 5),
     "exit_min_signals": (2, 6), "exit_retrace_atr": (0.05, 1.0), "exit_retrace_spread": (0.5, 6.0),
@@ -176,9 +182,35 @@ class EngineConfig:
     # confirmed pullback/reversal (volume + momentum + indicators, anti-jitter). The ONLY emergency guards are the
     # margin level (< emergency_margin_level_pct closes the bot's positions) and data-feed loss. BE/trail on winners
     # stays as engine-side profit protection. Set no_stop_mode=0 to restore stop-based sizing + broker SL.
-    no_stop_mode: bool = True
-    nostop_margin_use_pct: float = 50.0     # margin used by ALL bot positions after the batch <= x% of equity
-    emergency_margin_level_pct: float = 150.0
+    no_stop_mode: bool = True         # t40u: LOCKED ON - not tunable, not in the env overrides (owner: never set SL)
+    nostop_margin_use_pct: float = 75.0     # t41u: TOTAL margin of all bot positions (batches+hedge+layers) <= x%
+    batch_margin_pct: float = 10.0          # t40u: margin of ONE batch / hedge / recovery layer <= x% of equity
+    # t40u market state: UP / DOWN / SIDEWAYS + trend phase counter (M5 forming bars, swings, ADX)
+    regime_enabled: bool = True
+    regime_pivot_k: int = 2
+    regime_max_phase: int = 5
+    regime_adx_min: float = 15.0
+    regime_chase_atr: float = 2.0     # no entry once price is > x ATR (M5) beyond the pullback origin (already spiked)
+    regime_bonus: float = 0.10        # strength bonus for a pullback-wick entry with the trend / a range-edge fade
+    # t40u recovery (OWNER-REQUESTED): hedge basket and averaging layers instead of loss stops
+    hedge_enabled: bool = True        # basket not green after recovery_after_s or red beyond recovery_loss_pct AND the
+    recovery_after_s: float = 20.0    # t41u: 20 s; opposite side has a valid signal -> open the opposite basket (hedging account)
+    recovery_loss_pct: float = 2.0
+    avg_enabled: bool = True          # add layers to a LOSING basket at better prices (owner-requested averaging)
+    avg_spacing_atr: float = 1.0      # each layer >= x M1 ATR beyond the previous worst entry
+    avg_max_layers: int = 4
+    avg_lot_mult: float = 1.0         # lot multiplier per layer (1.0 = no martingale; tunable up by the owner)
+    cycle_tp_pct: float = 0.3         # hedged/recovery cycle closes when the symbol's combined net >= x% of equity
+    tp_min_money: float = 0.0         # close only when the basket net > this (account currency)
+    # t41u fast PROFIT LOCK: once a basket's net > max(profit_lock_min_money, profit_lock_spread_x x its spread cost)
+    # the profit is locked; it closes at once (short anti-jitter confirm) when the net gives back
+    # profit_lock_giveback of its peak or falls to the floor (profit_lock_floor_frac x the lock level) - before red
+    profit_lock_min_money: float = 0.03
+    profit_lock_spread_x: float = 2.0
+    profit_lock_giveback: float = 0.4
+    profit_lock_floor_frac: float = 0.25
+    profit_lock_confirm_s: float = 0.3
+    emergency_margin_level_pct: float = 110.0   # t41u: < 1/0.75 = 133% so a full 75% load does not trip it
     zone_target_exit: bool = True     # take profit when price reaches an opposing zone / FVG / S-R level
     full_batch: bool = True
     zones_enabled: bool = True
@@ -203,8 +235,8 @@ class EngineConfig:
     max_batch_lots: float = 100.0      # lots in one batch
     batch_run_cancel_frac: float = 1.0  # cancel the rest of a batch if price ran > x * target from the decision
     max_lot_per_order: float = 50.0
-    max_positions_total: int = 40
-    max_positions_per_symbol: int = 24
+    max_positions_total: int = 128
+    max_positions_per_symbol: int = 64   # t40u: batch 16 + 4 recovery layers x 4 + a hedge basket and its layers
     min_orders_per_batch: int = 1     # t35u: 1 (a 2-lot minimum skipped small accounts entirely); never a single order (unless the stop-risk cap cannot fit two min lots)
     # pyramid ADD into a basket that already has its break-even stop: shallow pullback, then price resumes in the
     # trade direction with the signal still valid; same lot (no multiplier), total legs <= max_orders_per_batch

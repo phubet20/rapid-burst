@@ -22,7 +22,8 @@ from dataclasses import replace as dc_replace
 from typing import Optional
 
 from . import __version__
-from . import zones
+from . import regime, zones
+from .guardian import LossGuardian
 from .config import TUNABLE, EngineConfig, validate_tune
 from .engine import MomentumEngine, PositionState
 from .risk import AccountView, EntryPacer, OpenPos, RiskGuard, SizeResult, size_position
@@ -102,6 +103,9 @@ class Trader:
         self._mid_hist: dict = {}         # t36u: symbol -> recent (tick time, mid) for the outlier filter
         self._exit_held_log: dict = {}
         self.exits_filtered = 0
+        self._regime_last: dict = {}      # t40u: symbol -> (state, phase) for the REGIME change log
+        self.recoveries = {"hedges": 0, "layers": 0, "cycle_tp": 0}
+        self.guardian = LossGuardian(self)
         self.last_burst: dict[str, dict] = {}        # duplicate prevention: last traded burst per symbol
         self._recv_wall: dict[str, float] = {}       # real wall time the latest tick of a symbol reached the worker
         self._feed_ms: dict[str, float] = {}         # broker tick time -> worker receipt (when the API provides it)
@@ -885,6 +889,16 @@ class Trader:
                                                 m.mid, m.atr, cfg)
                     except Exception:  # noqa: BLE001 - context only, never blocks the engine
                         m.zones = None
+                if cfg.regime_enabled:
+                    try:
+                        adx = float(getattr(m.ind, "adx", 0.0) or 0.0) if getattr(m, "ind", None) is not None else 0.0
+                        m.trend = regime.analyze(list(mt.m5.bars), getattr(mt.m5, "live", None), adx, cfg)
+                        key = (m.trend.state, m.trend.phase)
+                        if m.trend.ready and self._regime_last.get(s) != key:
+                            self._regime_last[s] = key
+                            self.add_log("INFO", f"REGIME {s}: {m.trend.label()} [{m.trend.why}]")
+                    except Exception:  # noqa: BLE001
+                        m.trend = None
             st = decide(m, cfg)
             add = self.pacer.threshold_add(s)
             if add and st.side != "NO TRADE":
@@ -915,6 +929,7 @@ class Trader:
                 "mtf": m.mtf.brief() if getattr(m, "mtf", None) is not None else None,
                 "ind": m.ind.brief() if getattr(m, "ind", None) is not None else None,
                 "zones": m.zones.brief() if getattr(m, "zones", None) is not None else None,
+                "trend": m.trend.brief() if getattr(m, "trend", None) is not None else None,
                 "m1_cycles": self._cycles(s, now_wall)}
 
     def _m1_bar(self, s: str, now_wall: float) -> float:
@@ -949,6 +964,14 @@ class Trader:
             status = self._status(s, m, st, now_wall)
             self.sym_status[s] = status
             mine = [ps for ps in self.pos_state.values() if ps.symbol == s and ps.ticket not in self._closed_tickets]
+            if mine and cfg.no_stop_mode and self._net(mine, {int(p["ticket"]): p for p in self.own_positions}) < 0:
+                g0 = self.guardian.view.get(s) or {}
+                status["reason"] = f"LOSS GUARDIAN: {g0.get('action', 'watching')} (net {g0.get('total', 0):+.2f})"
+                continue                                   # t42u: the guardian manages red baskets
+            if mine and cfg.no_stop_mode and len({ps.side for ps in mine}) > 1:
+                status["reason"] = (f"recovery cycle: {len(mine)} legs on both sides - closes together once the "
+                                    f"combined net is in profit")
+                continue
             if mine:
                 g = self.bursts.get(mine[0].batch_id) or {}
                 why_not = self._add_check(s, mine, g, m, st, now_wall)
@@ -1010,7 +1033,6 @@ class Trader:
                     learn.why += " -> min lot (no skip)"
             rev = self._reverse_to.pop(s, None)
             if self._open_batch(s, side, m, st, info, status, now_wall, t_dec, learn):
-                self.risk.need_confirm = False
                 if rev:
                     g = self.bursts.get(self.last_burst.get(s, {}).get("gid", ""), {})
                     g["reversal"] = True
@@ -1193,9 +1215,12 @@ class Trader:
             m_min = self.broker.calc_margin(side, s, vmin, price0)
             if not m_min:
                 return refuse("margin calc unavailable")
-            room = acct.equity * cfg.nostop_margin_use_pct / 100.0 - self._margin_used()
-            room = min(room, float(acct.margin_free) * 0.95) if acct.margin_free else room
+            tot_room = acct.equity * cfg.nostop_margin_use_pct / 100.0 - self._margin_used()
+            tot_room = min(tot_room, float(acct.margin_free) * 0.95) if acct.margin_free else tot_room
+            room = min(tot_room, acct.equity * cfg.batch_margin_pct / 100.0)     # t40u: one batch = a share
             units = int(max(0.0, room) // m_min + 1e-9)
+            if units < 1 and tot_room >= m_min:
+                units, room = 1, tot_room                  # small account: one min lot if the TOTAL cap allows it
             if units < 1:
                 return refuse(f"no-stop mode: margin room {room:.2f} < one min-lot margin {m_min:.2f} "
                               f"({cfg.nostop_margin_use_pct:g}% margin-use cap keeps a buffer)")
@@ -1363,7 +1388,9 @@ class Trader:
         if iv is not None and getattr(iv, "ready", False):
             g["ind_votes"] = {k: round(d * x, 3) for k, x in iv.votes.items()}      # toward the trade side
         g["sl_src"] = sl_src
-        msg = (f"BATCH {gid} {side} {s}: {opened}/{n} order(s) filled, {opened * size.volume:g} lots | M5 {g['attr']['trend']}, "
+        tv_ = getattr(m, "trend", None)
+        g["regime"] = tv_.label() if tv_ is not None else "-"
+        msg = (f"BATCH {gid} {side} {s}: {opened}/{n} order(s) filled, {opened * size.volume:g} lots | {g['regime']} | M5 {g['attr']['trend']}, "
                f"M1 MACD {g['attr']['macd']}, volume {g['attr']['volume']}, agree {g['attr']['agree']}"
                + (f" | re-entry {g['reentry_s']:.2f}s after the last basket closed" if "reentry_s" in g else ""))
         if opened < n:
@@ -1418,11 +1445,11 @@ class Trader:
             recent = [x for x in q if now_wall - x <= 60.0]
             self.add_log("WARNING", f"ENTRY {side} {size.volume} {s} rejected: {r.get('msg')} "
                                     f"({len(recent)} failure(s) in 60s, {(t_fill - t_send) * 1000:.0f}ms)")
-            if len(recent) >= cfg.exec_fail_max:
+            if len(recent) >= cfg.exec_fail_max and not cfg.no_stop_mode:     # t42u: no auto-pause in owner mode
                 self.exec_pause[s] = now_wall + cfg.exec_fail_pause_s
                 self.add_log("ERROR", f"EXECUTION PROTECTION {s}: {len(recent)} rejected orders in 60s - entries on "
                                       f"{s} paused {cfg.exec_fail_pause_s:.0f}s")
-            if "not found" in str(r.get("msg")):
+            if "not found" in str(r.get("msg")) and not cfg.no_stop_mode:   # t42u: owner mode never self-stops
                 self.unverified_entry = r["msg"]
                 self.running = False
                 self._save_state()
@@ -1511,13 +1538,22 @@ class Trader:
                 continue
             groups.setdefault(ps.batch_id or f"#{t}", []).append(ps)
         for key, legs in groups.items():
+            legs = [ps for ps in legs if ps.ticket not in self._closed_tickets]
+            if not legs:
+                continue
             sym = legs[0].symbol
             m, st = self._micro(sym, now_wall)
             reason = self._hard_risk_exit(key, legs, live, m, now_wall)       # hard risk ALWAYS first
-            if not reason and self.running:
+            if not reason and cfg.no_stop_mode and self.running:
+                reason, legs = self._profit_only_exits(key, legs, live, m, st, now_wall)
+                if reason or legs is None:
+                    legs = legs or []
+                    if not reason:
+                        continue
+            if not reason and self.running and not cfg.no_stop_mode:
                 # BE / trailing; its only exit is "protection failed" (stop not confirmed by MT5) = a RISK exit, never delayed
                 reason = self._protect_basket(key, legs, live, m, st, now_wall)
-            if not reason and self.running:
+            if not reason and self.running and not cfg.no_stop_mode:
                 soft = self._zone_target(legs, live, m) or self._micro_exit(key, legs, live, m, st, now_wall)
                 if not soft:
                     soft = self._reversal_check(legs, m, st)
@@ -1554,7 +1590,7 @@ class Trader:
                                            "decision_to_close_ms": round((t1 - t_dec) * 1000, 1)})
                 if not ok:
                     ps.closing_attempts += 1
-                    if ps.closing_attempts >= cfg.close_fail_halt and not self.exec_halt:
+                    if ps.closing_attempts >= cfg.close_fail_halt and not self.exec_halt and not cfg.no_stop_mode:
                         self.exec_halt = True
                         self.add_log("ERROR", f"EXECUTION PROTECTION: #{ps.ticket} could not be closed "
                                               f"{ps.closing_attempts}x - new entries halted, still retrying the close")
@@ -1611,7 +1647,8 @@ class Trader:
                 return f"outlier tick ({abs(mid - med) / atr:.2f} ATR from the median)"
         return None
 
-    def _confirm_soft_exit(self, key: str, sym: str, soft: Optional[str], m, now_wall: float) -> Optional[str]:
+    def _confirm_soft_exit(self, key: str, sym: str, soft: Optional[str], m, now_wall: float,
+                           confirm_s: Optional[float] = None, ticks: Optional[int] = None) -> Optional[str]:
         """t36u: a soft exit fires only when it PERSISTS: >= exit_confirm_s and >= exit_confirm_ticks distinct clean
         ticks. A flicker that disappears resets it; glitch ticks (gap, stale, spread spike, outlier) never count."""
         cfg = self.cfg
@@ -1619,7 +1656,9 @@ class Trader:
             if self._exit_pending.pop(key, None):
                 self.exits_filtered += 1                  # the signal vanished before confirmation = jitter avoided
             return None
-        if cfg.exit_confirm_s <= 0 and cfg.exit_confirm_ticks <= 1:
+        need_s = cfg.exit_confirm_s if confirm_s is None else confirm_s
+        need_n = cfg.exit_confirm_ticks if ticks is None else ticks
+        if need_s <= 0 and need_n <= 1:
             return soft
         noise = self._exit_noise(sym, m)
         c = self._exit_pending.get(key)
@@ -1635,7 +1674,7 @@ class Trader:
             if tick != c["tick"]:
                 c["n"], c["tick"] = c["n"] + 1, tick
         age = now_wall - c["t0"]
-        if age >= cfg.exit_confirm_s and c["n"] >= cfg.exit_confirm_ticks:
+        if age >= need_s and c["n"] >= need_n:
             self._exit_pending.pop(key, None)
             return f"{soft} [confirmed {age:.1f}s / {c['n']} clean ticks]"
         if soft.startswith("REVERSAL"):
@@ -1724,6 +1763,175 @@ class Trader:
                 return f"emergency: no fresh price for {age:.0f}s"
         return None
 
+    def _net(self, legs: list, live: dict) -> float:
+        return sum(float((live.get(ps.ticket) or {}).get("profit", 0.0)) + float((live.get(ps.ticket) or {}).get("swap", 0.0))
+                   for ps in legs)
+
+    def _profit_only_exits(self, key: str, legs: list, live: dict, m, st, now_wall: float):
+        """t40u (owner): CLOSE ONLY IN PROFIT. Returns (reason, legs_to_close) / (None, None) = nothing to do.
+        1. hedged / recovery cycle on the symbol: combined net of ALL bot legs >= cycle_tp_pct of equity -> close all;
+        2. this basket's own exits (BE/trail level, zone target, momentum/structure/reversal, anti-jitter confirmed)
+           only while its net > tp_min_money. A losing basket is never closed here (recovery handles it)."""
+        cfg = self.cfg
+        sym = legs[0].symbol
+        allsym = [ps for ps in self.pos_state.values() if ps.symbol == sym and ps.ticket in live
+                  and ps.ticket not in self._closed_tickets]
+        sides = {ps.side for ps in allsym}
+        multi = len({ps.batch_id for ps in allsym}) > 1
+        eq = float(self.account.get("equity", 0.0) or 0.0)
+        if multi and (len(sides) > 1 or any(int((self.bursts.get(ps.batch_id) or {}).get("layers", 0)) for ps in allsym)):
+            tot = self._net(allsym, live)
+            tgt = max(cfg.tp_min_money, eq * cfg.cycle_tp_pct / 100.0)
+            if tot > tgt:
+                self.recoveries["cycle_tp"] += 1
+                return (f"CYCLE TAKE PROFIT {sym}: hedge + recovery legs net {tot:+.2f} >= {tgt:.2f} "
+                        f"({len(allsym)} legs, sides {'/'.join(sorted(sides))})"), allsym
+        money = self._net(legs, live)
+        green = money > cfg.tp_min_money
+        d = 1 if legs[0].side == "BUY" else -1
+        soft = None
+        # t41u fast PROFIT LOCK: take the profit as soon as it starts to fade, before the basket turns red
+        g = self.bursts.get(legs[0].batch_id)
+        if g is not None:
+            ts, tv = self._tv(sym)
+            cost = (m.spread / ts * tv * sum(ps.volume for ps in legs)) if ts and tv and getattr(m, "spread", 0) else 0.0
+            lock = max(cfg.profit_lock_min_money, cfg.profit_lock_spread_x * cost)
+            if money > lock:
+                g["lock_peak"] = max(float(g.get("lock_peak", 0.0)), money)
+            peak = float(g.get("lock_peak", 0.0))
+            if peak > 0 and green:
+                floor = max(cfg.tp_min_money, cfg.profit_lock_floor_frac * lock)
+                if money <= max(floor, peak * (1.0 - cfg.profit_lock_giveback)):
+                    lk = (f"PROFIT LOCK: basket net {money:+.2f} fell from its peak {peak:+.2f} (lock {lock:.2f}) - "
+                          f"taking the profit before it turns red")
+                    reason = self._confirm_soft_exit(key, sym, lk, m, now_wall, cfg.profit_lock_confirm_s, 1)
+                    if reason and self._net(legs, live) > cfg.tp_min_money:
+                        return reason, legs
+                    return None, None
+        if green:
+            self._protect_basket(key, legs, live, m, st, now_wall)          # engine-side BE/trail level (no broker SL)
+            for ps in legs:
+                px = self._exec_px(ps, live.get(ps.ticket) or {}, m if getattr(m, "bid", 0) else None, now_wall)
+                if px is not None and ps.vsl and (px - ps.vsl) * d <= 0:
+                    soft = f"{ps.sl_state} profit-protection level hit at {px} (engine trail, basket {money:+.2f})"
+                    break
+            soft = soft or self._zone_target(legs, live, m) or self._micro_exit(key, legs, live, m, st, now_wall)
+            if not soft:
+                soft = self._reversal_check(legs, m, st)
+            if soft and self._pullback_hold(legs, soft, m, now_wall, key):
+                soft = None
+        else:
+            self._reverse_to.pop(sym, None)
+        reason = self._confirm_soft_exit(key, sym, soft, m, now_wall)
+        if reason and self._net(legs, live) <= cfg.tp_min_money:
+            return None, None                                               # turned red while confirming: hold
+        return (reason, legs) if reason else (None, None)
+
+    def _recovery(self, s: str, mine: list, m, st, info: dict, status: dict, now_wall: float, t_dec: float,
+                  hedging: bool) -> bool:
+        """t40u OWNER-REQUESTED recovery instead of loss stops:
+        * HEDGE: a basket not green after recovery_after_s, or red beyond recovery_loss_pct of equity, while the
+          OPPOSITE side has a valid signal -> open the opposite basket now (hedging accounts only);
+        * AVERAGING LAYERS: a losing basket gets a layer at a better price every avg_spacing_atr ATR, up to
+          avg_max_layers, lot x avg_lot_mult per layer (1.0 = same lot). Margin caps always apply."""
+        cfg = self.cfg
+        if not getattr(m, "ready", False) or not m.atr:
+            return False
+        live = {int(p["ticket"]): p for p in self.own_positions}
+        eq = float(self.account.get("equity", 0.0) or 0.0)
+        by_side: dict = {}
+        for ps in mine:
+            by_side.setdefault(ps.side, []).append(ps)
+        if cfg.hedge_enabled and hedging and len(by_side) == 1:
+            side = mine[0].side
+            opp = "SELL" if side == "BUY" else "BUY"
+            g = self.bursts.get(mine[0].batch_id) or {}
+            net = self._net(mine, live)
+            age = now_wall - float(g.get("opened", now_wall))
+            red_long = net < 0 and age >= cfg.recovery_after_s
+            red_deep = eq > 0 and net <= -eq * cfg.recovery_loss_pct / 100.0
+            if (red_long or red_deep) and st.side == opp:
+                self.risk.allow_opposite = True
+                try:
+                    ok = self._open_batch(s, opp, m, st, info, status, now_wall, t_dec, None)
+                finally:
+                    self.risk.allow_opposite = False
+                if ok:
+                    self.recoveries["hedges"] += 1
+                    self.add_log("WARNING", f"RECOVERY HEDGE {s}: {side} basket {net:+.2f} "
+                                            f"({'not green after %.0fs' % age if red_long else 'red beyond %g%% equity' % cfg.recovery_loss_pct})"
+                                            f" and {opp} has the signal -> opposite basket opened (owner-requested, no loss close)")
+                    return True
+        if not cfg.avg_enabled or cfg.avg_max_layers <= 0:
+            return False
+        for side, legs in by_side.items():
+            net = self._net(legs, live)
+            if net >= 0:
+                continue
+            gid = legs[0].batch_id
+            g = self.bursts.get(gid)
+            if g is None:
+                continue
+            layers = int(g.get("layers", 0))
+            if layers >= cfg.avg_max_layers or now_wall - float(g.get("last_layer", 0.0)) < 1.0:
+                continue
+            d = 1 if side == "BUY" else -1
+            worst = min(ps.open_price for ps in legs) if d > 0 else max(ps.open_price for ps in legs)
+            px = m.ask if d > 0 else m.bid
+            if d * (worst - px) < cfg.avg_spacing_atr * m.atr:
+                continue
+            base = [ps for ps in legs if "-a" not in (getattr(ps, "comment", "") or "")] or legs
+            n0 = max(1, int(g.get("planned") or len(base)))
+            vmin = float(info.get("volume_min", 0.01) or 0.01)
+            vmax = float(info.get("volume_max", 100.0) or 100.0)
+            vstep = float(info.get("volume_step", vmin) or vmin)
+            k = min(n0, 4)                                 # a layer = the batch's total lots in <= 4 orders
+            lot = normalize_volume(float(g.get("lot") or legs[0].volume) * n0 / k * cfg.avg_lot_mult ** (layers + 1),
+                                   vmin, vmax, vstep)
+            n0 = k
+            size = SizeResult(lot, 0.0, f"recovery layer {layers + 1}/{cfg.avg_max_layers} (owner-requested averaging)")
+            plans: list = []
+            self.risk.allow_averaging = True
+            try:
+                for i in range(n0):
+                    ok, why, margin = self._check_order(s, side, len(legs) + i, size, m, False, plans, add=True)
+                    if not ok:
+                        break
+                    plans.append((i, margin))
+            finally:
+                self.risk.allow_averaging = False
+            if not plans:
+                status["reason"] = f"recovery layer blocked: {why}"
+                continue
+            room = eq * cfg.batch_margin_pct / 100.0
+            while len(plans) > 1 and sum(mg for _, mg in plans) > room + 1e-9:
+                plans.pop()
+            dev = self._deviation(s, m.spread, m.vu)
+            opened = 0
+            g["last_layer"] = now_wall
+            self.pacer.inflight.add(s)
+            try:
+                for i, _ in plans:
+                    r, t_send, t_fill = self._send_raw(s, side, lot, 0.0, dev, f"{cfg.comment_prefix}-{gid}-r{layers + 1}{i + 1}")
+                    if self._book_fill(s, side, len(legs) + i, len(legs) + len(plans), gid, size, 0.0, cfg.sl_atr * m.atr,
+                                       m, st, info, now_wall, t_dec, r, t_send, t_fill, False):
+                        opened += 1
+                    else:
+                        break
+            finally:
+                self.pacer.inflight.discard(s)
+            if opened:
+                g["layers"] = layers + 1
+                g["peak_pl"] = 0.0
+                self.recoveries["layers"] += 1
+                self.add_log("WARNING", f"RECOVERY ADD {s} basket {gid} {side}: layer {layers + 1}/{cfg.avg_max_layers} "
+                                        f"+{opened} x {lot:g} at {px} ({d * (worst - px) / m.atr:.1f} ATR better than the "
+                                        f"worst entry; basket {net:+.2f}) - owner-requested averaging, no loss close")
+                self._refresh_account()
+                self._save_state()
+                return True
+        return False
+
     def _nostop_emergency(self, legs: list, live: dict, m, now_wall: float) -> Optional[str]:
         """t38u no-stop mode: the ONLY hard exits - margin level near stop-out, data-feed loss, and the engine-side
         BE/trail level of a winning basket (profit protection, never a loss stop)."""
@@ -1732,12 +1940,6 @@ class Trader:
         ml = float(self.account.get("margin_level", 0.0) or 0.0)
         if ml and ml < cfg.emergency_margin_level_pct:
             return f"EMERGENCY margin level {ml:.0f}% < {cfg.emergency_margin_level_pct:g}% - close bot positions"
-        for ps in legs:
-            p = live.get(ps.ticket) or {}
-            d = 1 if ps.side == "BUY" else -1
-            px = self._exec_px(ps, p, m if getattr(m, "bid", 0) else None, now_wall)
-            if px is not None and ps.vsl and (px - ps.vsl) * d <= 0:
-                return f"{ps.sl_state} profit-protection level hit #{ps.ticket} at {px} (engine BE/trail)"
         age = now_wall - self.last_receipt.get(sym, now_wall)
         if age > cfg.emergency_stale_s:
             xq = self._exec_quote(sym, now_wall)
@@ -1965,7 +2167,7 @@ class Trader:
                 ps.sl_verified, ps.prot_fail, ps.sl = True, 0, live_sl
                 continue
             ps.sl_verified = False
-            if cfg.broker_sl and now_wall - ps.last_mod >= gap:
+            if cfg.broker_sl and not cfg.no_stop_mode and now_wall - ps.last_mod >= gap:
                 ps.last_mod = now_wall
                 todo.append((ps, float(p.get("tp", 0.0)) or ps.tp))
         if not todo:
@@ -2193,11 +2395,14 @@ class Trader:
             self._manage_exits(now_wall)
             if self.running:
                 self._log_why(now_wall)
-            if self.risk.catastrophic and self.own_positions:
-                self._flatten("CATASTROPHIC DRAWDOWN")
+            if self.risk.catastrophic and self.own_positions and not self.cfg.no_stop_mode:
+                self._flatten("CATASTROPHIC DRAWDOWN")      # t40u: no loss close in owner no-stop mode
             if self.flatten_pending:
                 self.flatten_pending = not self._flatten("STOP retry")["ok"]
-            if self.running and not self.stopping and self.validation.get("ok") and not self.risk.halted:
+            if self.running and not self.stopping and self.cfg.no_stop_mode:
+                self.guardian.scan(now_wall)                # t42u: loss guardian, every loop
+            if self.running and not self.stopping and self.validation.get("ok") and (not self.risk.halted
+                                                                                    or self.cfg.no_stop_mode):
                 self._try_entries(now_wall)
             elif self.running and self.risk.halted:
                 for s in list(self.engines):
@@ -2277,7 +2482,7 @@ class Trader:
                 "sl_structure": c.sl_structure, "sl_atr_range": [c.sl_min_atr, c.sl_max_atr],
                 "ind_enabled": c.ind_enabled, "ind_min_score": c.ind_min_score, "ind_sr_near_atr": c.ind_sr_near_atr,
                 "ind_chop_veto": c.ind_chop_veto, "require_m1_trigger": c.mb_require_m1_trigger,
-                "safe_flatten_pct": c.safe_flatten_pct, "need_confirm": self.risk.need_confirm,
+                "safe_flatten_pct": c.safe_flatten_pct,
                 "mb_cut_frac": c.mb_cut_frac,
                 "small_account_batch_risk_pct": c.small_account_batch_risk_pct, "mb_edge": c.mb_edge,
                 "runtime_tuning": dict(self.tune), "tunable": sorted(TUNABLE),
@@ -2286,7 +2491,12 @@ class Trader:
                               f"< {c.emergency_margin_level_pct:g}% or data-feed loss)") if c.no_stop_mode
                              else ("ON" if c.broker_sl else "OFF"), "exec_halt": self.exec_halt,
                 "no_stop_mode": c.no_stop_mode, "nostop_margin_use_pct": c.nostop_margin_use_pct,
+                "batch_margin_pct": c.batch_margin_pct, "avg_max_layers": c.avg_max_layers, "avg_lot_mult": c.avg_lot_mult,
+                "avg_spacing_atr": c.avg_spacing_atr, "hedge_enabled": c.hedge_enabled, "recovery_after_s": c.recovery_after_s,
+                "recovery_loss_pct": c.recovery_loss_pct, "cycle_tp_pct": c.cycle_tp_pct, "recoveries": dict(self.recoveries),
+                "guardian": dict(self.guardian.view),
                 "emergency_margin_level_pct": c.emergency_margin_level_pct, "learning_enabled": c.learning_enabled,
+                "profit_lock_min_money": c.profit_lock_min_money, "profit_lock_giveback": c.profit_lock_giveback,
                 "sl_rule": f"hard stop max({c.sl_atr:g}x M1 ATR, {c.sl_spread_mult:g}x spread) at the broker -> basket BE "
                            f"(avg + costs + {c.be_lock_spread_mult:g}x spread) once net >= max({c.be_trigger_atr:g}x ATR, "
                            f"{c.be_trigger_spread:g}x spread) -> dynamic trail {c.trail_atr_strong:g}/{c.trail_atr_frac:g}/"

@@ -122,6 +122,7 @@ class Micro:
     ind: Optional[object] = None    # indicators.IndView (t32u confluence layer, family F)
     ind_w: Optional[dict] = None    # learned indicator weights for this symbol
     zones: Optional[object] = None  # zones.ZoneView (t37u: DM/SP zones, FVG, confirmation candle, wick tip)
+    trend: Optional[object] = None  # regime.RegimeView (t40u: UP / DOWN / SIDEWAYS + phase)
 
     def brief(self) -> dict:
         r = lambda x, n=3: round(x, n)   # noqa: E731
@@ -668,6 +669,30 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         s += getattr(cfg, "zone_weight", 0.10) * (z - 0.5) * 2.0
         c["zones"] = z
     vetoes = []
+    rv = m.trend
+    if rv is not None and getattr(rv, "ready", False) and getattr(cfg, "regime_enabled", True):
+        zv2 = m.zones if (m.zones is not None and getattr(m.zones, "ready", False)) else None
+        wick = zv2 is not None and zv2.wick == d
+        in_zone = zv2 is not None and zv2.holds(d)
+        bonus = getattr(cfg, "regime_bonus", 0.10)
+        if rv.dir == -d:
+            s -= 0.15                                  # against the remembered state (a structure break flips it first)
+        elif rv.dir == d:
+            ext = d * (m.mid - rv.origin) / max(rv.atr, 1e-12) if rv.origin else 0.0
+            if ext > getattr(cfg, "regime_chase_atr", 2.0) and not wick and not in_zone:
+                vetoes.append(f"already spiked {ext:.1f} ATR from the pullback origin - wait for the next pullback wick "
+                              f"({rv.state} phase {rv.phase})")
+            elif rv.leg == "pullback" or wick or in_zone:
+                s += bonus                             # pullback wick / zone in the trend: enter at the wick tip
+        else:
+            rng = max(rv.range_hi - rv.range_lo, 1e-12)
+            pos = (m.mid - rv.range_lo) / rng
+            edge = pos <= 0.3 if d > 0 else pos >= 0.7
+            if edge and (wick or in_zone):
+                s += bonus                             # sideways: fade the range edge at a wick
+            elif 0.35 < pos < 0.65:
+                s -= 0.06                              # middle of the range: weak
+        c["regime"] = rv.dir * d
     if f is not None:
         from .indicators import sr_block
         sr = sr_block(iv, d, m.mid, m.atr, cfg.ind_sr_near_atr)

@@ -407,7 +407,7 @@ More frequent trading also means more exposure; replay results are not a profit 
 * at a signal ONE full batch goes in at once (up to `max_orders_per_batch` = 16, tunable to 40), same lot, sized by
   MARGIN: all bot positions together use <= `nostop_margin_use_pct` (50%) of equity, with a 5% free-margin buffer;
 * no broker SL, no hard-stop mirror, no group-loss cut. The ONLY emergency guards: margin level below
-  `emergency_margin_level_pct` (150%) closes the bot's positions, and data-feed loss (`emergency_stale_s`).
+  `emergency_margin_level_pct` (110% since t41u) closes the bot's positions, and data-feed loss (`emergency_stale_s`).
   BE/trail on winning baskets stays as engine-side profit protection; never martingale or averaging losers
   (adds only into winning baskets);
 * exits: ZONE TARGET (price reaches an opposing supply/demand zone, FVG or S/R in profit) or a confirmed
@@ -429,3 +429,44 @@ from real M5/M1 candles add up to ±0.10 strength (never decide alone).
 
 Learner (t39u): `learning_enabled=0` - closed trades are still recorded, but the learner no longer skips,
 resizes, reweights or exits anything.
+
+## t40u — owner mode: no stop loss (locked), UP/DOWN/SIDEWAYS + phases, recovery hedge + averaging, profit-only exits
+
+All of this is the **account owner's explicit request on a DEMO account, risk accepted after a stop-out warning.**
+
+* **Per-order stop loss is permanently off**: `no_stop_mode` is locked on - removed from the runtime TUNE list and from
+  the env overrides (`RB_BROKER_SL` no longer exists); no broker SL is ever sent or modified (BE/trail are
+  engine-side profit levels only).
+* **Market state** (`regime.py`): only UP / DOWN / SIDEWAYS from M5 swings (HH+HL / LH+LL) on the forming bar,
+  ADX + range for sideways; a structure break flips it at once. **Phase counter**: legs since the trend started
+  (odd = impulse, even = pullback) with the expected next phase (impulse -> pullback -> continuation; phase >=
+  `regime_max_phase` (5) = exhaustion / reversal risk). Shown in the UI and logged as `REGIME ...` on every change.
+* **Entries**: with the trend at the pullback wick / zone / FVG (+`regime_bonus`); **anti-chase** veto when price is
+  more than `regime_chase_atr` (2.0) M5 ATR beyond the pullback origin without a wick; SIDEWAYS fades the range edges
+  at wicks. Scanning never stops.
+* **Recovery (owner-requested)**: a basket not green after `recovery_after_s` (60 s) or red beyond
+  `recovery_loss_pct` (2% equity) while the opposite side has a valid signal opens the **opposite basket** (hedging
+  account). A losing basket gets **averaging layers** every `avg_spacing_atr` (1.0) ATR at better prices, at most
+  `avg_max_layers` (4), each layer = the batch's lots in <= 4 orders x `avg_lot_mult`^layer (default 1.0 = no
+  martingale; the owner may raise it to 3.0).
+* **Exits: close only in profit** - a basket closes on its trail level / zone target / confirmed momentum or reversal
+  only while its net is > `tp_min_money`; a hedged/recovery cycle closes ALL its legs once the combined net >=
+  `cycle_tp_pct` (0.3%) of equity. No loss close except the emergency guards: margin level < 110% and data-feed loss.
+* **Margin budget** (t41u): one batch / hedge / layer <= `batch_margin_pct` (10%) of equity; ALL bot positions <=
+  `nostop_margin_use_pct` (75%) -> at zero P/L the margin level stays >= ~133%, above the 110% emergency close.
+  Worst case: total margin 75% of equity (cap); the emergency close then fires after a ~17.5% equity drop at full
+  load (~89% drop with a single 10% batch).
+
+## t41u / t42u — fast profit lock, never self-stopping, loss guardian
+
+* **PROFIT LOCK**: once a basket's net > max(`profit_lock_min_money` 0.03, 2x its spread cost) the profit is locked;
+  when the net gives back 40% of its peak or falls to 25% of the lock level it closes at once (0.3 s confirm) -
+  before it turns red. A basket that never goes green is handed to the loss guardian after `recovery_after_s` (20 s).
+* **No auto-stop / pause in owner mode**: no safe mode, no drawdown halt, no catastrophic flatten, no execution
+  pauses after rejects or close failures, no self-stop on an unverified entry. Only the user's STOP and the
+  margin-level / data-feed emergency closes act, and scanning continues after an emergency close.
+* **Loss guardian** (`guardian.py`): every loop it watches each symbol's red baskets (net per side, combined net),
+  opens the opposite basket / recovery layers per t40u and logs `GUARD ...` every 15 s; the combined net is closed
+  in profit (`CYCLE TAKE PROFIT`).
+* REPLAY on real Binance data (simulated broker, t40u settings before the t41u lock): BTCUSDT 4h - 75 baskets, 90.7%
+  winners but profit factor 0.22 and equity 56.60 -> 0.42 (-99%): small wins, a few huge losses with no stop.

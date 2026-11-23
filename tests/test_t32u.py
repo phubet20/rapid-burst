@@ -58,7 +58,7 @@ def test_confluence_family_f_vetoes_against_and_requires_d():
 
 
 def test_safe_mode_peak_is_closed_balance_not_a_floating_spike():
-    g = RiskGuard(EngineConfig(equity_drawdown_pct=30.0))
+    g = RiskGuard(EngineConfig(equity_drawdown_pct=30.0, no_stop_mode=False))   # legacy safe mode (owner mode has none)
     g.reset_session(50.0)
     assert g.update(0, AccountView(50.0, 90.0, 80, 0)) is None     # +40 floating: NOT a new peak
     assert g.peak_equity == 50.0
@@ -66,7 +66,7 @@ def test_safe_mode_peak_is_closed_balance_not_a_floating_spike():
     ev = g.update(2, AccountView(50.0, 34.0, 30, 0))               # 32 % below the closed peak 50
     assert ev[0] == "safe" and "NEW entries paused" in ev[1] and not g.catastrophic
     ev = g.update(10_000, AccountView(50.0, 45.0, 40, 0))
-    assert ev[0] == "resume" and g.need_confirm
+    assert ev[0] == "resume"
     ev = g.update(10_001, AccountView(50.0, 19.0, 10, 0))          # > 60 % below the session peak 50
     assert ev[0] == "safe" and "CATASTROPHIC" in ev[1] and g.catastrophic and g.halted
     assert not g.check_entry("BTCUSDm", "BUY", [], AccountView(50.0, 19.0, 10, 0), 0.01, 1, 1, True)[0]

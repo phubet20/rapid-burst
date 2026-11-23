@@ -14,7 +14,7 @@ def _bar(t, o, h, l, c):
 def test_owner_defaults():
     c = EngineConfig()
     assert c.no_stop_mode and c.full_batch and c.max_orders_per_batch == 16 and not c.learning_enabled
-    assert c.emergency_margin_level_pct == 150.0 and 0 < c.nostop_margin_use_pct < 100
+    assert c.emergency_margin_level_pct == 110.0 and c.nostop_margin_use_pct == 75.0
 
 
 def test_full_batch_at_once_by_margin_without_sl(tmp_path):
@@ -46,7 +46,7 @@ def test_only_emergency_guards_close_in_no_stop_mode(tmp_path):
     live = {int(p["ticket"]): p for p in tr.own_positions}
     m, _ = tr._micro("BTCUSDm", T0 + 3)
     assert tr._hard_risk_exit("k", legs, live, m, T0 + 3) is None
-    tr.account["margin_level"] = 120.0
+    tr.account["margin_level"] = 100.0
     assert "EMERGENCY margin level" in tr._hard_risk_exit("k", legs, live, m, T0 + 3)
 
 

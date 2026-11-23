@@ -19,12 +19,14 @@ CONSERVATIVE = dict(risk_per_trade_pct=0.5, risk_per_batch_pct=1.0, small_accoun
                     # t37u/t38u owner-mode features off for the mechanism tests (stop-based sizing + broker SL);
                     # tests/test_t38u.py covers the no-stop full-margin mode
                     no_stop_mode=False, full_batch=False, max_orders_per_batch=8, max_positions_per_symbol=8,
-                    zones_enabled=False, pullback_hold=False, zone_target_exit=False, learning_enabled=True)
+                    zones_enabled=False, pullback_hold=False, zone_target_exit=False, learning_enabled=True,
+                    regime_enabled=False, hedge_enabled=False, avg_enabled=False)
 
 
 # t37u/t38u owner-mode features OFF (stop-based sizing, broker SL, <=8 orders) for the pre-t38u mechanism tests
 LEGACY_OWNER_OFF = dict(no_stop_mode=False, full_batch=False, max_orders_per_batch=8, max_positions_per_symbol=8,
-                        zones_enabled=False, pullback_hold=False, zone_target_exit=False, learning_enabled=True)
+                        zones_enabled=False, pullback_hold=False, zone_target_exit=False, learning_enabled=True,
+                    regime_enabled=False, hedge_enabled=False, avg_enabled=False)
 
 
 def legacy(**kw) -> EngineConfig:

@@ -161,7 +161,7 @@ def test_disconnect_pauses_and_reconnects(tmp_path):
 
 def test_equity_drawdown_enters_safe_mode_but_keeps_running(tmp_path):
     from tests.paths import _force_signal
-    cfg = EngineConfig(equity_drawdown_pct=0.01)   # $1 on a $10k test account
+    cfg = legacy(equity_drawdown_pct=0.01)   # $1 on a $10k test account (legacy: owner mode has no safe mode)
     # pure noise + slippage and a FORCED entry signal (test only): losses must trip SAFE MODE (no all-day halt)
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 1800, burst_every=1e9)}, cfg, slippage_pts=5)
     assert connect_and_start(tr, br, T0 + 1)["ok"]
