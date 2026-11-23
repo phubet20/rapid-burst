@@ -24,7 +24,7 @@ from .config import EngineConfig
 from .engine import MomentumEngine, PositionState
 from .risk import AccountView, EntryPacer, OpenPos, RiskGuard, size_position
 from .trend import Trend, compute_trend, relation
-from .impulse import Impulse, detect as detect_impulse
+from .impulse import Impulse, detect as detect_impulse, detect_early, detect_reversal
 from .learner import Learner, regime as vol_regime
 from .risk import normalize_volume
 from .engine import Signal
@@ -112,6 +112,7 @@ class Trader:
         self.server_offset: float = float(st.get("server_offset", 0.0))
         self.saved_pos_meta: dict = st.get("positions", {})
         self.bursts = st.get("bursts", {}) or {}
+        self.scalp_rev: dict = {}
         self.skip_counts = {k: Counter(v) for k, v in (st.get("skip_counts") or {}).items()}
         self.decisions.extend(st.get("decisions") or [])
         self._validate()
@@ -724,6 +725,10 @@ class Trader:
             reason = None
             if self.risk.halted:
                 reason = f"risk halt: {self.risk.halt_reason}"
+            elif self._is_scalp(key):
+                reason = self._hard_close(legs, live, f)          # far SL mirror / locked-stop mirror / group loss stop
+                if not reason and self.running and eng is not None:
+                    reason = self._scalp_exit(key, legs, live, f, now_wall)
             elif self._is_basket(key):
                 reason = self._basket_exit(key, legs, live)       # whole basket together: target+trail / loss stop
             else:
@@ -842,7 +847,8 @@ class Trader:
             spread = (f.spread if f is not None and f.spread else 0.0) or abs(float(p.get("price_current", px)) - px)
             stops = (int(info.get("trade_stops_level", 0)) + 3) * point
             atr, _ = self._atr(ps.symbol)
-            trail = max(cfg.trail_atr_frac * atr, cfg.trail_spread_mult * spread, stops)
+            trail = max((cfg.scalp_trail_atr if self._is_scalp(ps.batch_id) else cfg.trail_atr_frac) * atr,
+                        cfg.trail_spread_mult * spread, stops)
             be_lock = max(cfg.be_lock_spread_mult * spread, 2 * point)
             cur = float(p.get("sl", 0.0)) or ps.sl
             new, state = None, ps.sl_state
@@ -901,7 +907,8 @@ class Trader:
                 return (f"hard close: #{ps.ticket} adverse {adverse:.2f} >= {hd:.2f} px "
                         f"(software backup, broker SL {'on' if cfg.broker_sl else 'OFF'})")
         eq = float(self.account.get("equity", 0.0))
-        limit = eq * cfg.batch_max_loss_pct / 100.0
+        loss_pct = cfg.scalp_group_loss_pct if legs and self._is_scalp(legs[0].batch_id) else cfg.batch_max_loss_pct
+        limit = eq * loss_pct / 100.0
         if f is not None and f.spread and legs:
             info = self.sym_info.get(legs[0].symbol) or {}
             ts = float(info.get("trade_tick_size", 0))
@@ -909,7 +916,7 @@ class Trader:
             if ts and tv:       # never let the % cap sit inside the round-trip spread cost (tiny accounts)
                 limit = max(limit, 4.0 * f.spread / ts * tv * sum(p.volume for p in legs))
         if eq > 0 and total <= -limit and not any(ps.sl_state != "initial" for ps in legs):
-            return f"hard close: group loss {total:+.2f} <= -{limit:.2f} ({cfg.batch_max_loss_pct:g}% of equity {eq:.2f})"
+            return f"hard close: group loss {total:+.2f} <= -{limit:.2f} ({loss_pct:g}% of equity {eq:.2f})"
         return None
 
     def _group_exit(self, key: str, legs: list, f, now_wall: float) -> Optional[str]:
@@ -979,6 +986,8 @@ class Trader:
             self.sym_status[s] = status
             tr = self.trends.get(s)
             status["trend"] = tr.brief() if tr else None
+            if self._scalp_mode() and self._scalp_step(s, eng, info, sig, status, now_wall):
+                continue
             if cfg.basket_enabled and self._basket_step(s, eng, info, sig, status, now_wall):
                 continue
             if sig.action == "HOLD":
@@ -1029,7 +1038,8 @@ class Trader:
                     continue
                 n, mode = 1, "pyramid"
             elif is_imp:
-                if rel == "counter" and abs(sig.score) < cfg.impulse_counter_min:
+                if (rel == "counter" and abs(sig.score) < cfg.impulse_counter_min
+                        and (not self._scalp_mode() or cfg.scalp_trend_filter)):
                     self._skip(s, status, f"{sig.action} skipped: counter-trend impulse ({tr.label}) needs "
                                           f"strength >= {cfg.impulse_counter_min:.2f}", now_wall, sig)
                     continue
@@ -1053,10 +1063,251 @@ class Trader:
                 if not learn.allow and mode != "pyramid":      # adds to an SL-locked winner are never gated
                     self._skip(s, status, learn.why, now_wall, sig)
                     continue
+            if self._scalp_mode():
+                self._scalp_order(s, sig.action, "open", sig, info, now_wall, status, batch_id, learn)
+                continue
             if cfg.basket_enabled:
                 self._basket_order(s, sig.action, "open", sig, info, now_wall, status, batch_id, learn)
                 continue
             self._enter_batch(s, sig, info, acct, open_pos, now_wall, status, n, risk_mult, batch_id, mode, learn)
+
+    # -------------------------------------------------------------- SCALP mode
+    def _scalp_mode(self) -> bool:
+        return bool(self.cfg.scalp_enabled and not self.cfg.basket_enabled)
+
+    def _is_scalp(self, key: str) -> bool:
+        return bool((self.bursts.get(key) or {}).get("scalp"))
+
+    def _scalp_signal(self, s: str, eng, now: float, sig):
+        """Early-impulse entry only (the momentum-score fallback is too late for scalps)."""
+        cfg = self.cfg
+        f = sig.features
+        hold = lambda why: Signal("HOLD", 0.0, why, f)      # noqa: E731
+        if not f.ready:
+            return hold(f.reason)
+        if f.tick_rate < cfg.min_tick_rate:
+            return hold(f"tick rate {f.tick_rate:.2f}/s < {cfg.min_tick_rate}")
+        ok, why = eng.spread_ok(f)
+        if not ok:
+            return hold(why)
+        atr, src = self._atr(s)
+        ticks = [tk for tk in eng.buf.ticks if tk.t >= now - 70.0]
+        imp = detect_early(ticks, now, atr, f.spread, cfg)
+        imp.status["atr_src"] = src
+        self.impulse[s] = imp
+        if imp.dir:
+            return Signal("BUY" if imp.dir > 0 else "SELL", imp.dir * imp.strength, imp.reason, f)
+        return hold(imp.reason)
+
+    def _scalp_step(self, s: str, eng, info: dict, sig, status: dict, now_wall: float) -> bool:
+        """Adds to an open scalp group while the impulse continues (same lot, ~1 s apart, never into a loser).
+        Returns True when a group exists on s (the normal entry path is then skipped)."""
+        cfg = self.cfg
+        mine = [ps for ps in self.pos_state.values() if ps.symbol == s]
+        if not mine:
+            return False
+        if not self.running or self.risk.halted:
+            return True
+        side = mine[0].side
+        bid_ = mine[0].batch_id
+        b = self.bursts.get(bid_)
+        if b is None or not b.get("scalp"):
+            return True                       # adopted / old-style batch: legacy exit logic only
+        if sig.action != side:
+            status["reason"] = f"scalp {side} x{len(mine)}: no continuing {side} impulse ({sig.reason})"
+            return True
+        if len(mine) >= cfg.scalp_max_orders:
+            self._skip(s, status, f"scalp group full: {len(mine)}/{cfg.scalp_max_orders}", now_wall, sig)
+            return True
+        if now_wall - float(b.get("last_add", 0.0)) < cfg.scalp_add_interval:
+            return True
+        f = eng.features(self._server_now(s, now_wall))
+        xq = self._exec_quote(s, now_wall)
+        mid = (xq[0] + xq[1]) / 2.0 if xq else f.mid
+        d = 1 if side == "BUY" else -1
+        adverse = (float(b.get("last_mid") or mid) - mid) * d
+        if adverse > cfg.scalp_add_adverse_spread * f.spread:
+            self._skip(s, status, "scalp add skipped: price against the last order (no averaging)", now_wall, sig)
+            return True
+        self._scalp_order(s, side, "add", sig, info, now_wall, status, batch_id=bid_)
+        return True
+
+    def _scalp_order(self, s: str, side: str, kind: str, sig, info: dict, now_wall: float, status: dict,
+                     batch_id: str, learn=None) -> bool:
+        """One small market order of a scalp group (kind open|add). Same lot for every order of the group (no
+        martingale). Total used margin <= max_margin_use_pct of equity AND free margin stays >= the guard, using
+        the broker's own margin numbers. Far emergency SL + quick small TP."""
+        cfg = self.cfg
+        eng = self.engines[s]
+        f = eng.features(self._server_now(s, now_wall))
+        d = 1 if side == "BUY" else -1
+        point = float(info["point"])
+        vmin, vmax, vstep = float(info["volume_min"]), float(info["volume_max"]), float(info["volume_step"])
+        ts, tv = self._tv(s)
+        atr, _ = self._atr(s)
+        stops = (int(info.get("trade_stops_level", 0)) + 5) * point
+        sl_dist = max(stops, cfg.scalp_sl_atr * atr if atr else 2.0 * cfg.sl_vol_units * f.vol_unit, 3.0 * f.spread)
+        tp_dist = max(stops, cfg.scalp_tp_atr * atr if atr else 0.0, cfg.scalp_tp_spread_mult * f.spread)
+        price = f.ask if side == "BUY" else f.bid
+        eq = float(self.account.get("equity", 0) or 0)
+        b = self.bursts.get(batch_id)
+        cap = eq * cfg.max_margin_use_pct / 100.0
+        used = self._margin_used()
+        free = float(self.account.get("margin_free", 0) or 0)
+        n_live = sum(1 for ps in self.pos_state.values() if ps.batch_id == batch_id)
+
+        def refuse(why: str) -> bool:
+            if kind == "open":
+                self.pacer.on_entry(s, now_wall)
+            elif b is not None:
+                b["last_add"] = now_wall
+            self._skip(s, status, f"{sig.action} {kind} blocked: {why}", now_wall, sig)
+            return False
+
+        if b is not None and b.get("lot0") and kind != "open":
+            lot0 = float(b["lot0"])
+        else:        # many small orders: the lot is what lets scalp_max_orders orders fill the margin cap (compounds with equity)
+            m_min = self.broker.calc_margin(side, s, vmin, price)
+            if m_min is None:
+                return refuse("margin calc unavailable")
+            lot = cap / (cfg.scalp_max_orders * m_min / vmin) if m_min > 0 else vmin
+            lot0 = normalize_volume(min(max(lot, vmin), cfg.max_lot_per_order, vmax), vmin, vmax, vstep) or vmin
+        margin = self.broker.calc_margin(side, s, lot0, price)
+        if margin is None:
+            return refuse("margin calc unavailable")
+        guard = eq * cfg.scalp_min_free_margin_pct / 100.0
+        if used + margin > cap + 1e-9:
+            return refuse(f"margin use cap: {used:.2f} + {margin:.2f} > {cfg.max_margin_use_pct:g}% of equity ({cap:.2f})")
+        if free - margin < guard:
+            return refuse(f"free margin guard: {free:.2f} - {margin:.2f} < {guard:.2f} ({cfg.scalp_min_free_margin_pct:g}% of equity)")
+        sl = price - d * sl_dist if cfg.broker_sl else 0.0
+        tp = price + d * tp_dist
+        comment = f"{cfg.comment_prefix}-{batch_id}-{uuid.uuid4().hex[:4]}"[:31]
+        self.pacer.inflight.add(s)
+        try:
+            r = self.broker.market_order(s, side, lot0, sl, tp, self._deviation(s, f.spread, f.vol_unit), cfg.magic, comment)
+        finally:
+            self.pacer.inflight.discard(s)
+        if not r.get("ok"):
+            self.add_log("WARNING", f"SCALP {kind.upper()} {side} {lot0} {s} rejected: {r.get('msg')}")
+            if "not found" in str(r.get("msg")):
+                self.unverified_entry = r["msg"]
+                self.running = False
+                self._save_state()
+            return refuse(f"rejected: {r.get('msg')}")
+        fill = float(r["price"])
+        slip = (fill - float(r["req_price"])) * d / point
+        self.slippage.setdefault(s, deque(maxlen=10)).append((now_wall, max(0.0, slip * point / max(f.vol_unit, point))))
+        ticket = int(r["ticket"])
+        self.pos_state[ticket] = PositionState(ticket=ticket, symbol=s, side=side, volume=float(r["volume"]),
+                                               open_price=fill, open_time=now_wall, sl=sl, tp=tp, entry_vu=f.vol_unit,
+                                               reason=f"scalp-{kind}: {sig.reason}", batch_id=batch_id,
+                                               hard_dist=sl_dist * cfg.hard_close_mult, peak_pl=-abs(f.spread))
+        cut = max(cfg.scalp_cut_atr * atr if atr else 0.0, 2.0 * f.spread)
+        risk_money = float(r["volume"]) * (cut / ts * tv if ts and tv else 0.0)
+        if b is None:
+            b = self.bursts.setdefault(batch_id, {"symbol": s, "side": side, "opened": now_wall, "mode": "scalp",
+                                                  "realized": 0.0, "legs": 0, "scalp": True, "lot0": lot0, "adds": 0,
+                                                  "peak_px": fill - d * f.spread / 2.0, "peak_v": 0.0, "best_pl": 0.0})
+        b["legs"] = int(b.get("legs", 0)) + 1
+        b["lot"] = float(r["volume"])
+        b["risk"] = float(b.get("risk", 0.0)) + risk_money
+        b["last_mid"] = fill - d * f.spread / 2.0
+        b["last_add"] = now_wall
+        if kind != "open":
+            b["adds"] = int(b.get("adds", 0)) + 1
+        else:
+            self.pacer.on_entry(s, now_wall)
+            if learn is not None:
+                tr_ = self.trends.get(s)
+                imp_ = self.impulse.get(s)
+                atr_, _ = self._atr(s)
+                b.update(bucket=getattr(learn, "bucket", ""), type="impulse", rel=status.get("trend_rel"),
+                         regime=vol_regime(f.spread, atr_), hour=time.gmtime(now_wall).tm_hour, learn_state=learn.state,
+                         comps={"score": round(sig.score, 3), "impulse": round(imp_.strength, 3) if imp_ and imp_.dir else 0.0,
+                                "pressure": round(f.pressure, 3), "vel": round(f.d_fast, 3), "breakout": f.breakout,
+                                "trend": round(tr_.dir * tr_.strength, 2) if tr_ and tr_.known else 0.0,
+                                "spread_atr": round(f.spread / atr_, 3) if atr_ else None})
+        dg = int(info["digits"])
+        self.add_log("INFO", f"SCALP {kind.upper()} {side} {r['volume']} {s} @ {fill} #{ticket} group {batch_id} "
+                             f"order {n_live + 1}/{cfg.scalp_max_orders} [{sig.reason}] TP {tp:.{dg}f} "
+                             f"far SL {format(sl, '.%df' % dg) if sl else 'OFF'} margin used {used + margin:.2f}/{cap:.2f} "
+                             f"({cfg.max_margin_use_pct:g}% of equity) free {free - margin:.2f} "
+                             f"slip {slip:+.0f}pt {r.get('latency', 0)*1000:.0f}ms")
+        self._decision(s, side, sig.score, f"SCALP {kind.upper()} order {n_live + 1} (lot {r['volume']})")
+        status["reason"] = f"scalp {batch_id}: {n_live + 1} order(s) {side}"
+        self._refresh_account()
+        self._save_state()
+        return True
+
+    def _scalp_exit(self, key: str, legs: list, live: dict, f, now_wall: float) -> Optional[str]:
+        """Exit the whole group the moment the bar's force reverses: tick velocity flips / decays with opposing
+        pressure / a wick forms against. Winners are taken short, losers cut fast when the reversal says wrong."""
+        cfg = self.cfg
+        b = self.bursts.get(key)
+        eng = self.engines.get(legs[0].symbol)
+        if b is None or eng is None or f is None or not f.spread:
+            return None
+        sym = legs[0].symbol
+        d = 1 if legs[0].side == "BUY" else -1
+        vol = sum(p.volume for p in legs)
+        avg = sum(p.open_price * p.volume for p in legs) / vol
+        pxs = [x for x in (self._exec_px(ps, live.get(ps.ticket, {}), f, now_wall) for ps in legs) if x]
+        if not pxs:
+            return None
+        exit_px = min(pxs) if d > 0 else max(pxs)            # broker executable price
+        pl = (exit_px - avg) * d
+        now_srv = self._server_now(sym, now_wall)
+        atr, _ = self._atr(sym)
+        spread = f.spread
+        pk = b.get("peak_px")
+        b["peak_px"] = f.mid if pk is None else (max(pk, f.mid) if d > 0 else min(pk, f.mid))
+        ticks = [tk for tk in eng.buf.ticks if tk.t >= now_srv - 10.0]
+        rev = detect_reversal(ticks, now_srv, d, atr, spread, b["peak_px"], float(b.get("peak_v", 0.0)), cfg)
+        b["peak_v"] = max(float(b.get("peak_v", 0.0)), rev["v"])
+        b["best_pl"] = max(float(b.get("best_pl", 0.0)), pl)
+        self.scalp_rev[sym] = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in rev.items()}
+        tp_dist = max(cfg.scalp_tp_atr * atr if atr else 0.0, cfg.scalp_tp_spread_mult * spread)
+        min_profit = cfg.scalp_min_profit_spread * spread
+        why = [k for k in ("vel_flip", "decay", "press", "wick") if rev[k]]
+        if tp_dist > 0 and pl >= tp_dist:
+            return f"quick take-profit +{pl:.2f} px (target {tp_dist:.2f})"
+        if pl >= min_profit:
+            if rev["vel_flip"] or rev["wick"] or (rev["decay"] and rev["press"]):
+                return f"reversal take-profit +{pl:.2f} px: {'+'.join(why)}"
+        else:
+            cut = cfg.scalp_cut_spread * spread
+            if pl <= -cut and (rev["vel_flip"] or rev["press"]):
+                return f"reversal cut {pl:+.2f} px: {'+'.join(why)} - trade is wrong"
+            if atr and pl <= -cfg.scalp_cut_atr * atr:
+                return f"hard cut {pl:+.2f} px (>= {cfg.scalp_cut_atr:g} ATR against)"
+        first = min(p.open_time for p in legs)
+        if now_wall - first >= cfg.scalp_wrong_way_s and b["best_pl"] < min_profit:
+            return f"wrong way: no profit in {now_wall - first:.0f}s (best {b['best_pl']:+.2f} px, now {pl:+.2f})"
+        if now_wall - first >= cfg.scalp_max_hold_s:
+            return f"scalp time stop {cfg.scalp_max_hold_s:.0f}s ({pl:+.2f} px)"
+        return None
+
+    def _scalp_view(self) -> dict:
+        c = self.cfg
+        eq = float(self.account.get("equity", 0) or 0) if self.conn_state == "CONNECTED" else 0.0
+        live = {int(p["ticket"]): p for p in self.own_positions} if self.conn_state == "CONNECTED" else {}
+        items = {}
+        for k, b in self.bursts.items():
+            if not b.get("scalp"):
+                continue
+            legs = [ps for ps in self.pos_state.values() if ps.batch_id == k and ps.ticket in live]
+            if legs:
+                net = sum(float(live[ps.ticket].get("profit", 0)) + float(live[ps.ticket].get("swap", 0)) for ps in legs)
+                items[k] = {"symbol": b.get("symbol"), "side": b.get("side"), "orders": len(legs),
+                            "volume": round(sum(ps.volume for ps in legs), 4), "net": round(net, 2),
+                            "adds": int(b.get("adds", 0)), "rev": self.scalp_rev.get(b.get("symbol"))}
+        used = self._margin_used() if eq else 0.0
+        return {"enabled": self._scalp_mode(), "max_orders": c.scalp_max_orders, "add_interval": c.scalp_add_interval,
+                "max_margin_use_pct": c.max_margin_use_pct, "margin_used": round(used, 2),
+                "margin_use_pct": round(used / eq * 100, 1) if eq else None,
+                "max_bar_atr": c.scalp_max_bar_atr, "max_swing_atr": c.scalp_max_swing_atr,
+                "tp_atr": c.scalp_tp_atr, "group_loss_pct": c.scalp_group_loss_pct, "items": items}
 
     # ------------------------------------------------------------- BASKET mode
     def _tv(self, s: str) -> tuple[float, float]:
@@ -1288,6 +1539,8 @@ class Trader:
         cfg = self.cfg
         sig = eng.signal(now)
         f = sig.features
+        if self._scalp_mode():
+            return self._scalp_signal(s, eng, now, sig)
         if not cfg.impulse_enabled or not f.ready:
             return sig
         if f.tick_rate < cfg.min_tick_rate or not eng.spread_ok(f)[0]:
@@ -1676,6 +1929,7 @@ class Trader:
                        "bursts": {k: {kk: v.get(kk) for kk in ("symbol", "side", "mode", "legs")}
                                   for k, v in self.bursts.items()},
                        "baskets": self._basket_view(),
+                       "scalp": self._scalp_view(),
                        "decisions": list(self.decisions)[-15:],
                        "learning": dict(self.learner.summary(), last=self.learn_view),
                        "risk_config": self._risk_view()},

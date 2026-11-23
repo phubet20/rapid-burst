@@ -155,6 +155,16 @@
     }).join("") : `<div class="muted small">${eng.halted ? esc(eng.halt_reason) : "Engine idle"}</div>`;
     const rc = eng.risk_config;
     if (rc) $("engine").insertAdjacentHTML("beforeend", `<div class="tiny muted rc">Active limits: broker SL ${rc.broker_sl} (${esc(rc.sl_rule || "")}) · exposure ≤ ${rc.max_total_notional_x}× equity · risk/trade ${rc.risk_per_trade_pct}% · min-lot floor (no minimum balance; max orders now ${rc.tier_legs_now}, tiers ${rc.batch_tiers}) · open risk ≤ ${rc.max_total_risk_pct}% · daily loss ${rc.daily_loss_limit_pct ? rc.daily_loss_limit_pct + "%" : "OFF"} · drawdown stop ${rc.equity_drawdown_pct ? rc.equity_drawdown_pct + "%" : "OFF"} · batch loss cap ${rc.batch_max_loss_pct}% · batch ${rc.batch} orders, TP ${rc.batch_tp_units} vu, max hold ${rc.batch_max_hold_s}s, cooldown ${rc.batch_cooldown_s}s · entry |score| ≥ ${rc.entry_threshold} (counter-trend ≥ ${rc.countertrend_min_score}) · ≥ ${rc.min_tick_rate} ticks/s · spread ≤ ${rc.max_spread_bps} bp</div>`);
+    const sc = eng.scalp;
+    if (sc && sc.enabled) {
+      const its = Object.entries(sc.items || {});
+      const rowS = ([k, x]) => `<div class="tiny"><b>${esc(x.symbol)} ${esc(x.side)}</b> group ${esc(k)} · ${x.orders}/${sc.max_orders} orders · ${fmt(x.volume, 2)} lots · ` +
+        `floating <b class="${x.net >= 0 ? "pos-v" : "neg-v"}">${x.net > 0 ? "+" : ""}${fmt(x.net)}</b> · adds ${x.adds}` +
+        (x.rev ? ` · reversal: ${["vel_flip", "decay", "press", "wick"].filter((q) => x.rev[q]).join("+") || "none"}` : "") + `</div>`;
+      $("engine").insertAdjacentHTML("beforeend", `<details class="small" open><summary>⚡ Scalp: margin used ${sc.margin_used ?? "—"} (${sc.margin_use_pct ?? "—"}% of equity, cap ${sc.max_margin_use_pct}%) · up to ${sc.max_orders} small orders, ${sc.add_interval}s apart</summary>` +
+        (its.length ? its.map(rowS).join("") : `<div class="tiny muted">no open scalp group - waiting for an impulse at its start</div>`) +
+        `<div class="tiny muted">Early entry only (refuses if > ${sc.max_bar_atr} ATR from the bar open or > ${sc.max_swing_atr} ATR from the swing, or decelerating) · quick TP ${sc.tp_atr} ATR · exit the moment velocity flips / decays / a wick forms against · group loss stop ${sc.group_loss_pct}% of equity. Higher risk by choice.</div></details>`);
+    }
     const bk = eng.baskets;
     if (bk && bk.enabled) {
       const its = Object.entries(bk.items || {});

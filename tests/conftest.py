@@ -13,6 +13,7 @@ _orig_init = _EC.__init__
 
 def _init(self, *a, **kw):
     kw.setdefault("basket_enabled", False)
+    kw.setdefault("scalp_enabled", False)
     _orig_init(self, *a, **kw)
 
 

@@ -22,6 +22,7 @@ def _path(up_after: float = 40.0):
 
 def _cfg(**kw):
     kw.setdefault("basket_enabled", True)
+    kw.setdefault("max_margin_use_pct", 70.0)
     return EngineConfig(**kw)
 
 

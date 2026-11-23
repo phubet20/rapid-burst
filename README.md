@@ -218,6 +218,28 @@ shown in the Engine card together with the recent decisions and the active limit
 `RB_CONFIG_FILE`), e.g. `{"small_account_max_loss_pct": 3, "batch_max": 3, "daily_loss_limit_pct": 10}`.
 The UI cannot change risk limits.
 
+## Scalp mode (DEFAULT): early entry, many small orders, exit on reversal
+
+Replaces the basket/hold mode as the default (`RB_BASKET_ENABLED=1` still turns the basket mode on; `RB_SCALP_ENABLED=0`
+returns to the older burst logic). Demo only, bot positions only, no change to any security rule.
+
+- **Early entry** (`impulse.detect_early`): tick velocity over the last 1.5 s must be fast **and accelerating**, one-sided
+  order flow (>= 0.4), a real but small move since its start (>= 1x spread), all inside the first seconds of the push.
+- **Anti-chase**: refused when price is already more than `RB_SCALP_MAX_BAR_ATR` (0.6) M1-ATR from the M1 bar open, or more
+  than `RB_SCALP_MAX_SWING_ATR` (0.7) ATR from the 20 s swing, or the velocity is decelerating.
+- **Many small orders**: up to `RB_SCALP_MAX_ORDERS` (20) orders of the SAME lot (multiplier 1.0, no martingale, never
+  averaging into a loser), at least `RB_SCALP_ADD_INTERVAL` (1 s) apart, only while a same-direction early impulse continues.
+  The lot is sized so 20 orders fill the margin cap and compounds with equity. Total used margin <= `RB_MAX_MARGIN_USE_PCT`
+  (default **100**) of equity from the broker's own numbers, and free margin must stay >= `RB_SCALP_MIN_FREE_MARGIN_PCT` (3%)
+  of equity after each order, so orders are not rejected near stop-out.
+- **Exits**: each order has a quick fixed TP (max(0.25 ATR, 2x spread)); the whole group closes the moment the bar's force
+  reverses (velocity flips sign, velocity decays with opposing pressure, or a wick forms against) while in profit; a loser is
+  cut when the reversal says the trade is wrong (>= 1x spread against + flip/pressure, 0.3 ATR hard cut, no profit in 5 s,
+  60 s max hold). BE+/trailing stays; the broker SL is a far emergency stop (8 ATR); group loss stop 10% of equity.
+- UI: *Scalp* panel (orders, floating P/L, margin used vs cap, live reversal flags). The learner keeps recording every group.
+
+High risk: up to 100% of equity can be in margin across 20 orders; a gap through the far SL can lose a large part of the account.
+
 ## Basket mode: averaging, pyramiding, compounding (aggressive - user-accepted risk, DEMO)
 
 Default ON (`RB_BASKET_ENABLED=0` returns to the old tight-SL burst/scalp behaviour). All orders of a symbol/direction

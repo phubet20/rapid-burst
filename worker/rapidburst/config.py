@@ -123,8 +123,8 @@ class EngineConfig:
     # --- BASKET mode (aggressive, user-accepted risk on the demo account): averaging + pyramiding + compounding ---
     # All orders of one symbol/direction form ONE basket that closes together at a profit target (profit trailed).
     # No tight SL, no wrong-way cut, no per-order BE/trail: the broker SL is a far disaster stop only.
-    basket_enabled: bool = True
-    max_margin_use_pct: float = 70.0     # RB_MAX_MARGIN_USE_PCT: total used margin <= x% of equity -> caps order count/size
+    basket_enabled: bool = False         # RB_BASKET_ENABLED=1: hold/average basket mode (off by default; scalp mode is the default)
+    max_margin_use_pct: float = 100.0    # RB_MAX_MARGIN_USE_PCT: total used margin <= x% of equity -> caps order count/size
     basket_loss_pct: float = 30.0        # RB_BASKET_MAX_LOSS_PCT: basket floating loss >= x% of equity at basket start => close all
     basket_target_pct: float = 2.0       # profit target of the whole basket, % of equity at basket start
     basket_target_spread_mult: float = 3.0  # ... and never below x * the basket's round-trip spread cost
@@ -137,6 +137,42 @@ class EngineConfig:
     basket_min_margin_level: float = 150.0  # never add while margin level (%) is below this
     basket_risk_pct: float = 3.0         # base lot compounds: first order loses x% of balance at the broker SL
     basket_sl_atr: float = 10.0          # far broker SL per order = x * M1 ATR (disaster stop, not the exit)
+
+    # --- SCALP mode (default): enter at the START of an impulse, many small same-lot orders, short profits,
+    #     exit the moment the bar's force reverses. Never enters after the spike (anti-chase). ---
+    scalp_enabled: bool = True           # RB_SCALP_ENABLED (ignored while basket mode is on)
+    scalp_max_orders: int = 20           # RB_SCALP_MAX_ORDERS: max open orders per symbol/direction group
+    scalp_add_interval: float = 1.0      # RB_SCALP_ADD_INTERVAL: seconds between orders while momentum continues
+    scalp_add_adverse_spread: float = 0.5  # never add when price is already > x*spread against the last order (no averaging)
+    scalp_min_free_margin_pct: float = 3.0  # RB_SCALP_MIN_FREE_MARGIN_PCT: keep >= x% of equity as free margin after each order
+    scalp_trend_filter: bool = False     # True = also apply the M1/M5 counter-trend gate to scalp entries
+    # early-impulse detector
+    scalp_vel_seconds: float = 1.5       # velocity window (s); acceleration = this window vs the previous one
+    scalp_vel_atr: float = 0.03          # velocity over the window >= x * M1 ATR (and >= 0.5 * spread)
+    scalp_min_accel: float = 1.0         # velocity must be >= x * previous velocity (not decelerating)
+    scalp_flow_seconds: float = 3.0      # order-flow window (s)
+    scalp_min_pressure: float = 0.40     # up-vs-down tick imbalance in the move direction
+    scalp_start_seconds: float = 5.0     # the impulse START must be inside this window
+    scalp_start_spread_mult: float = 1.0 # move since its start >= x * spread (else it is noise)
+    # anti-chase (refuse if the move already happened)
+    scalp_max_bar_atr: float = 0.6       # RB_SCALP_MAX_BAR_ATR: refuse if price moved > x M1 ATR from the M1 bar open
+    scalp_max_swing_atr: float = 0.7     # RB_SCALP_MAX_SWING_ATR: refuse if price moved > x ATR from the recent swing
+    scalp_swing_seconds: float = 20.0
+    # exits
+    scalp_tp_atr: float = 0.25           # quick fixed TP = max(x * ATR, scalp_tp_spread_mult * spread)
+    scalp_tp_spread_mult: float = 2.0
+    scalp_min_profit_spread: float = 0.5 # reversal take-profit only above x * spread of executable profit
+    scalp_rev_vel_atr: float = 0.02      # reversal: velocity against >= x * ATR (or 0.5 spread)
+    scalp_rev_pressure: float = 0.40     # reversal: opposing tick pressure >= x
+    scalp_decay_frac: float = 0.25       # reversal: velocity decayed below x * its peak (with opposing pressure)
+    scalp_wick_atr: float = 0.06         # reversal: price pulled back >= max(x * ATR, spread) from the favourable extreme
+    scalp_cut_spread: float = 1.0        # cut a loser on reversal once it is >= x * spread against
+    scalp_cut_atr: float = 0.30          # hard cut when the group is x * ATR against
+    scalp_wrong_way_s: float = 5.0       # no profit at all after x s => wrong, cut
+    scalp_max_hold_s: float = 60.0       # a scalp never lingers
+    scalp_group_loss_pct: float = 10.0   # software stop: group floating loss >= x% of equity
+    scalp_sl_atr: float = 8.0            # far emergency broker SL = x * ATR
+    scalp_trail_atr: float = 0.10        # BE+/trail distance of scalp orders = max(x * ATR, spread)
 
     # --- loop ---
     loop_interval: float = 0.1
@@ -163,7 +199,11 @@ class EngineConfig:
         for env, key in (("RB_BROKER_SL", "broker_sl"), ("RB_EMERGENCY_SL", "emergency_sl"),
                          ("RB_DAILY_LOSS_PCT", "daily_loss_limit_pct"), ("RB_MAX_DD_PCT", "equity_drawdown_pct"),
                          ("RB_LEARNING_ENABLED", "learning_enabled"),
-                         ("RB_BASKET_ENABLED", "basket_enabled"), ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"),
+                         ("RB_BASKET_ENABLED", "basket_enabled"), ("RB_SCALP_ENABLED", "scalp_enabled"),
+                         ("RB_SCALP_MAX_ORDERS", "scalp_max_orders"), ("RB_SCALP_ADD_INTERVAL", "scalp_add_interval"),
+                         ("RB_SCALP_MAX_BAR_ATR", "scalp_max_bar_atr"), ("RB_SCALP_MAX_SWING_ATR", "scalp_max_swing_atr"),
+                         ("RB_SCALP_MIN_FREE_MARGIN_PCT", "scalp_min_free_margin_pct"),
+                         ("RB_SCALP_TP_ATR", "scalp_tp_atr"), ("RB_SCALP_GROUP_LOSS_PCT", "scalp_group_loss_pct"), ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"),
                          ("RB_BASKET_MAX_LOSS_PCT", "basket_loss_pct"), ("RB_BASKET_TARGET_PCT", "basket_target_pct"),
                          ("RB_BASKET_MAX_ORDERS", "basket_max_orders"), ("RB_BASKET_AVG_MULT", "basket_avg_mult")):
             if os.environ.get(env, "").strip():
