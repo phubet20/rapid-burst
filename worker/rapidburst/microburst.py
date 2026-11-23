@@ -121,6 +121,7 @@ class Micro:
     mtf: Optional[object] = None    # mtf.MTFView
     ind: Optional[object] = None    # indicators.IndView (t32u confluence layer, family F)
     ind_w: Optional[dict] = None    # learned indicator weights for this symbol
+    zones: Optional[object] = None  # zones.ZoneView (t37u: DM/SP zones, FVG, confirmation candle, wick tip)
 
     def brief(self) -> dict:
         r = lambda x, n=3: round(x, n)   # noqa: E731
@@ -661,6 +662,11 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         num, den = num + W_IND * f, den + W_IND
         c["confluence"] = f
     s = num / den
+    zv = m.zones
+    if zv is not None and getattr(zv, "ready", False) and getattr(cfg, "zones_enabled", True):
+        z = zv.score(d)                                # t37u: zones / FVG / confirmation / wick tip as a score input
+        s += getattr(cfg, "zone_weight", 0.10) * (z - 0.5) * 2.0
+        c["zones"] = z
     vetoes = []
     if f is not None:
         from .indicators import sr_block

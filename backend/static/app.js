@@ -138,7 +138,7 @@
 
     const syms = eng.symbols || {};
     const bsl = (eng.risk_config || {}).broker_sl;
-    $("engMeta").textContent = (eng.batch && eng.batch.id ? `session ${eng.batch.id} · ` : "") + (bsl ? `Broker SL: ${bsl}` + (bsl === "OFF" ? " (engine hard-close)" : "") : "");
+    $("engMeta").textContent = (eng.batch && eng.batch.id ? `session ${eng.batch.id} · ` : "") + (bsl ? `Broker SL: ${bsl}` + (bsl === "OFF" ? " (engine hard-close)" : "") : "") + ((eng.risk_config || {}).learning_enabled === false ? " · Learning: record only (no influence)" : "");
     $("engine").innerHTML = Object.keys(syms).length ? Object.entries(syms).map(([k, v]) => {
       const f = v.features || {};
       const cls = v.signal === "BUY" ? "pos-v" : v.signal === "SELL" ? "neg-v" : "muted";
@@ -149,6 +149,8 @@
       const tfLine = (n, x) => !x || !x.ready ? `${n} waiting for bars` :
         `${n} ${esc(x.src)} ${x.bars} bars · MACD hist ${fmt(x.hist, 2)} slope ${x.hist_slope > 0 ? "+" : ""}${fmt(x.hist_slope, 2)}${x.macd_ready ? "" : " (warming)"} · body ${fmt(x.body, 2)} · tick-volume ${x.vol_x == null ? "n/a" : fmt(x.vol_x, 2) + "× (" + esc(x.vol_src) + ")"} · RSI ${x.rsi_ready ? fmt(x.rsi, 1) + " (" + (x.rsi_slope > 0 ? "+" : "") + fmt(x.rsi_slope, 1) + ")" : "warming"} · structure ${x.structure > 0 ? "HH/HL" : x.structure < 0 ? "LH/LL" : "mixed"}${x.exhaust ? ' · <span class="neg-v">exhausting</span>' : ""}`;
       const mtHtml = mt ? `<div class="tiny">📈 M5 momentum (forming bar) BUY ${fmt(mt.m5_up, 2)} / SELL ${fmt(mt.m5_dn, 2)} · ${esc(mt.m5_label || "")} · ${tfLine("M5", mt.m5)}</div><div class="tiny">⏱ M1 timing BUY ${fmt(mt.m1_up, 2)} / SELL ${fmt(mt.m1_dn, 2)} · ${tfLine("M1", mt.m1)}</div>` : "";
+      const zv = v.zones;
+      const zHtml = zv && zv.ready ? `<div class="tiny">🧱 Zones/FVG: BUY ${fmt(zv.buy, 2)} [${esc((zv.tags.BUY || []).join(", ") || "-")}] / SELL ${fmt(zv.sell, 2)} [${esc((zv.tags.SELL || []).join(", ") || "-")}] · confirmation candle ${zv.confirm > 0 ? "▲" : zv.confirm < 0 ? "▼" : "-"} · wick tip ${zv.wick > 0 ? "BUY (lower wick)" : zv.wick < 0 ? "SELL (upper wick)" : "-"}</div>` : "";
       const iv = v.ind;
       const ivHtml = iv && iv.ready ? `<div class="tiny">📊 indicators: ${Object.entries(iv.votes || {}).map(([k, x]) => `<span class="${x >= 0.2 ? "pos-v" : x <= -0.2 ? "neg-v" : "muted"}">${esc(k)} ${fmt(x, 2)}</span>`).join(" · ")} · ADX ${fmt(iv.adx, 1)}${iv.breakout ? " · breakout " + (iv.breakout > 0 ? "▲" : "▼") : ""}${iv.chop ? ' · <span class="neg-v">chop: ' + esc(iv.chop_why) + "</span>" : ""} · S/R ▲${iv.res_above ?? "—"} ▼${iv.sup_below ?? "—"}</div>` : "";
       const cy = v.m1_cycles;
@@ -159,7 +161,7 @@
       const sgHtml = sg.threshold != null ? `<div class="tiny">strength BUY ${bar(sg.buy, "pos-v")} · SELL ${bar(sg.sell, "neg-v")} · need ≥ ${fmt(sg.threshold, 2)} · regime <b>${esc(sg.regime || "—")}</b>` +
         (sg.scan ? ` · families BUY ${["A", "B", "C", "D", "E", "F"].map((k) => k + fmt(sg.scan.BUY?.[k], 2)).join(" ")} / SELL ${["A", "B", "C", "D", "E", "F"].map((k) => k + fmt(sg.scan.SELL?.[k], 2)).join(" ")}` : "") +
         (sg.vetoes && sg.vetoes.length ? ` · <span class="neg-v">${esc(sg.vetoes.join("; "))}</span>` : "") + `</div>` : "";
-      return `<div class="eng"><b>${esc(k)}</b>${mk}${trHtml} <span class="sig ${cls}">${esc(v.signal)}</span> · <b>${v.signal === "HOLD" ? "waiting for: " : ""}</b>${esc(v.reason)}` + sgHtml + mtHtml + ivHtml + cyHtml + sk +
+      return `<div class="eng"><b>${esc(k)}</b>${mk}${trHtml} <span class="sig ${cls}">${esc(v.signal)}</span> · <b>${v.signal === "HOLD" ? "waiting for: " : ""}</b>${esc(v.reason)}` + sgHtml + mtHtml + zHtml + ivHtml + cyHtml + sk +
         `<div class="tiny muted">vel ${f.vel_atr ?? "—"} ATR · acc ${f.acc_atr ?? "—"} · eff ${f.eff ?? "—"} · burst ${f.burst_z ?? "—"}× · tick-activity ${f.act_x ?? "—"}× (count, not real volume) · up/down-tick proxy ${f.imb ?? "—"} · bid/ask proxy ${f.bidask ?? "—"} · candle body ${f.body_atr ?? "—"} ATR · ${f.early ? '<span class="pos-v">early burst ' + (f.early > 0 ? "▲" : "▼") + "</span> · " : ""}${f.exhaust ? '<span class="neg-v">exhaustion</span> · ' : ""}${f.rebound ? "rebound " + (f.rebound > 0 ? "▲" : "▼") + " · " : ""}chase ▲${f.chase_up ?? "—"}/▼${f.chase_dn ?? "—"} ATR · target ${f.target ?? "—"} · spread ${v.spread_pts ?? "—"}pt · ${f.tps ?? "—"} t/s · tick ${v.tick_age ?? "—"}s ago</div></div>`;
     }).join("") : `<div class="muted small">${eng.halted ? esc(eng.halt_reason) : "Engine idle"}</div>`;
     const rc = eng.risk_config;

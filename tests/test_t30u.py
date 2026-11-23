@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from rapidburst.config import EngineConfig
 from rapidburst.microburst import exit_reason
 from rapidburst.mtf import TF, m1_trend
-from tests.harness import make, run
+from tests.harness import legacy, make, run
 from tests.paths import T0, _force_signal, _small_account, _start, series_up
 from tests.test_mtf import _live, _view
 
@@ -35,7 +35,7 @@ def test_m1_swing_structure_hh_hl_and_break():
 
 
 def test_spike_turning_back_closes_and_a_pullback_in_the_trend_is_held():
-    cfg = EngineConfig()
+    cfg = legacy()
     g = {"target": 0.3, "peak_pl": 0.9, "peak_vel": 0.5, "last_ext_t": 100.0}
     turn = _live(vel=-0.3, accel=-0.3, imbalance=-0.7, bidask=-0.7, mtf=_view(0.5))
     r = exit_reason(g, turn, 1, 0.5, 3, 0.0, 0.5, 0.8, 0.0, cfg)
@@ -45,8 +45,10 @@ def test_spike_turning_back_closes_and_a_pullback_in_the_trend_is_held():
     assert exit_reason(g2, calm, 1, 0.35, 3, 0.0, 0.5, 0.8, 0.0, cfg) is None       # pullback held
 
 
-def test_default_basket_has_at_least_two_orders(tmp_path):
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig())          # t30u defaults
+def test_min_orders_knob_still_gives_at_least_two_orders(tmp_path):
+    cfg = legacy()
+    cfg.min_orders_per_batch = 2                                                # t35u default is 1 (tunable)
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, cfg)
     _small_account(br, balance=10.0, margin_per_lot=10.0)
     _start(tr, br, T0 + 1)
     _force_signal(tr, "BUY", origin=T0 + 99.0)
@@ -56,7 +58,7 @@ def test_default_basket_has_at_least_two_orders(tmp_path):
 
 
 def test_margin_cap_shrinks_the_lot_not_the_safety(tmp_path):
-    cfg = EngineConfig(max_margin_use_pct=20.0)
+    cfg = legacy(max_margin_use_pct=20.0)
     tr, br = make(tmp_path, {"BTCUSDm": series_up()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=5000.0)
     _start(tr, br, T0 + 1)
@@ -72,7 +74,7 @@ def _legs(side="BUY", n=2, price=100.0):
 
 
 def test_pyramid_add_only_after_break_even_on_a_resumed_pullback(tmp_path):
-    tr, _ = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig())
+    tr, _ = make(tmp_path, {"BTCUSDm": series_up()}, legacy())
     st = SimpleNamespace(side="BUY")
     m = SimpleNamespace(ready=True, atr=1.0, mid=101.0, vel=0.2)
     g = {"ext_px": 101.0}
@@ -109,12 +111,13 @@ def test_setup_key_uses_m1_trend_and_swing():
 
 
 def test_add_to_basket_sends_same_lot_orders_into_the_open_basket(tmp_path):
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig())
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, legacy())
     _small_account(br, balance=1000.0, margin_per_lot=10.0)
     _start(tr, br, T0 + 1)
     _force_signal(tr, "BUY", origin=T0 + 99.0)
     tr._micro_exit = lambda *a, **k: None
     tr._hard_risk_exit = lambda *a, **k: None
+    tr._reversal_check = lambda *a, **k: None
     run(tr, br, T0 + 1, T0 + 5)
     legs = [ps for ps in tr.pos_state.values() if ps.ticket in br.positions_]
     assert len(legs) >= 2
@@ -131,10 +134,12 @@ def test_add_to_basket_sends_same_lot_orders_into_the_open_basket(tmp_path):
     g["last_add"] = 0.0
     g["prot_level"] = round(m.bid - 2 * m.spread, 2)
     n0 = len(br.positions_)
+    before = set(br.positions_)
     status = {}
     ok = tr._add_to_basket("BTCUSDm", legs, g, m, st, tr.sym_info["BTCUSDm"], status, T0 + 5, T0 + 5)
     assert ok, status
-    assert all(p["sl"] == g["prot_level"] for p in br.positions_.values() if "-a" in p["comment"])
+    # (t35u: an automatic add may already have gone in during the warm-up run - check only THIS add's legs)
+    assert all(p["sl"] == g["prot_level"] for t, p in br.positions_.items() if t not in before and "-a" in p["comment"])
     assert ok and len(br.positions_) > n0
     lots = {p["volume"] for p in br.positions_.values()}
     assert len(lots) == 1 and all(p["sl"] for p in br.positions_.values())          # same lot, hard stop
@@ -142,7 +147,7 @@ def test_add_to_basket_sends_same_lot_orders_into_the_open_basket(tmp_path):
 
 
 def test_young_loser_inside_the_m1_trend_is_not_cut_on_micro_noise():
-    cfg = EngineConfig()
+    cfg = legacy()
     g = {"target": 0.3, "peak_pl": 0.0, "peak_vel": 0.5, "last_ext_t": 0.0}
     kw = dict(vel=-0.3, accel=-0.3, imbalance=-0.7, bidask=-0.7, failed=-1, rejection=-1)
     v = _view(0.6)                                       # M1 trend with the BUY basket, no swing break
@@ -155,7 +160,7 @@ def test_young_loser_inside_the_m1_trend_is_not_cut_on_micro_noise():
 
 
 def test_t32u_trailing_basket_in_intact_trend_is_left_to_the_trail():
-    cfg = EngineConfig()
+    cfg = legacy()
     g = {"target": 0.3, "peak_pl": 0.9, "peak_vel": 0.5, "last_ext_t": 100.0, "prot": "trail"}
     turn = _live(vel=-0.3, accel=-0.3, imbalance=-0.7, bidask=-0.7, mtf=_view(0.5))
     assert exit_reason(g, turn, 1, 0.5, 3, 0.0, 0.5, 0.8, 0.0, cfg) is None             # the trail manages

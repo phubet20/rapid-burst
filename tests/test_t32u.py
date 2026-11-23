@@ -105,5 +105,5 @@ def test_new_tunables_validate():
     ok, bad = validate_tune({"sl_max_atr": 2.0, "ind_min_score": 0.3, "ind_chop_veto": 0, "safe_flatten_pct": 70})
     assert not bad and ok["ind_chop_veto"] is False and ok["sl_max_atr"] == 2.0
     c = EngineConfig()
-    assert c.mb_cut_frac == 0.0 and c.mb_max_hold_seconds == 0.0 and c.min_orders_per_batch == 2
+    assert c.mb_cut_frac == 0.0 and c.mb_max_hold_seconds == 0.0 and c.min_orders_per_batch == 1
     assert c.risk_per_batch_pct == 10.0 and c.max_total_risk_pct == 25.0 and c.equity_drawdown_pct == 30.0

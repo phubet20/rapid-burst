@@ -1,6 +1,6 @@
 """Unit tests for sizing, exposure limits, halts and pacing."""
 from rapidburst.config import EngineConfig
-from tests.harness import conservative
+from tests.harness import legacy, conservative
 from rapidburst.risk import (AccountView, EntryPacer, OpenPos, RiskGuard, floor_to_step, normalize_volume,
                              size_position)
 
@@ -16,7 +16,7 @@ def test_volume_normalisation():
 
 
 def test_size_xauusd():
-    cfg = EngineConfig(risk_per_trade_pct=0.25)
+    cfg = legacy(risk_per_trade_pct=0.25)
     # SL 1.50 USD on XAUUSD: 150 ticks * $1 per tick per lot = $150/lot; budget $25 -> 0.16 lot
     r = size_position(10000, cfg, 1.50, 0.01, 1.0, 0.01, 100, 0.01)
     assert r.volume == 0.16 and abs(r.risk_money - 24.0) < 1e-6
@@ -49,11 +49,11 @@ def test_size_small_account_min_lot_fallback():
 
 def test_floor_mode_total_risk_cap_and_free_margin():
     from rapidburst.risk import AccountView, RiskGuard
-    g = RiskGuard(EngineConfig(max_total_risk_pct=10))
+    g = RiskGuard(legacy(max_total_risk_pct=10))
     ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 2.0, 0.0), 0.01, 0.4, 0.45, True, 900.0,
                             floor_mode=True)
     assert not ok and "total stop-risk cap" in why          # 13% of equity > 10% total cap
-    g = RiskGuard(EngineConfig())                           # t30u default: 100% of equity across all baskets
+    g = RiskGuard(legacy())                           # t30u default: 100% of equity across all baskets
     ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 2.0, 0.0), 0.01, 0.4, 0.45, True, 900.0,
                             floor_mode=True)
     assert ok, why
@@ -62,7 +62,7 @@ def test_floor_mode_total_risk_cap_and_free_margin():
     assert not ok and "insufficient free margin for the minimum lot" in why
 
 def test_size_capped_by_max_lot():
-    cfg = EngineConfig(risk_per_trade_pct=5, max_lot_per_order=0.5)
+    cfg = legacy(risk_per_trade_pct=5, max_lot_per_order=0.5)
     r = size_position(1_000_000, cfg, 1.0, 0.01, 1.0, 0.01, 100, 0.01)
     assert r.volume == 0.5
 
@@ -92,7 +92,7 @@ def test_limits():
 
 
 def test_safe_mode_instead_of_daily_halt():
-    cfg = EngineConfig(equity_drawdown_pct=5, safe_pause_s=300, safe_pause_max_s=1800, safe_probe_batches=3)
+    cfg = legacy(equity_drawdown_pct=5, safe_pause_s=300, safe_pause_max_s=1800, safe_probe_batches=3)
     g = RiskGuard(cfg)
     g.reset_session(10000)
     assert g.update(0, ACCT) is None
@@ -108,7 +108,7 @@ def test_safe_mode_instead_of_daily_halt():
 
 
 def test_pacer_has_no_fixed_cooldowns_and_streak_only_raises_the_bar():
-    cfg = EngineConfig(max_entries_per_minute=3, loss_streak_threshold_add=0.03)
+    cfg = legacy(max_entries_per_minute=3, loss_streak_threshold_add=0.03)
     p = EntryPacer(cfg)
     assert p.can_enter("X", 0)[0]
     p.on_entry("X", 0)
@@ -128,7 +128,7 @@ def test_pacer_has_no_fixed_cooldowns_and_streak_only_raises_the_bar():
 
 
 def test_min_lot_floor_total_cap_and_catastrophic_safe_mode():
-    cfg = EngineConfig(max_total_risk_pct=100.0, small_account_batch_risk_pct=50.0, equity_drawdown_pct=50.0,
+    cfg = legacy(max_total_risk_pct=100.0, small_account_batch_risk_pct=50.0, equity_drawdown_pct=50.0,
                        safe_dd_cap_pct=50.0)            # the t30u aggressive limits (t32u defaults are lower)
     g = RiskGuard(cfg)
     g.reset_session(13.0)

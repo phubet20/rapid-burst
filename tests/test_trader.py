@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from rapidburst.config import EngineConfig
-from tests.harness import Invariants, instrument, make, now_base, run
+from tests.harness import legacy, Invariants, instrument, make, now_base, run
 from tests.synth import burst_series, gen_ticks
 
 T0 = now_base()
@@ -49,7 +49,7 @@ def test_no_credentials_no_start(tmp_path):
 
 
 def test_autonomous_session_respects_invariants(tmp_path):
-    cfg = EngineConfig()
+    cfg = legacy()
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 3600)}, cfg)
     inv = Invariants(); instrument(br, cfg, inv)
     assert connect_and_start(tr, br, T0 + 1)["ok"]
@@ -66,7 +66,7 @@ def test_autonomous_session_respects_invariants(tmp_path):
 
 
 def test_stop_closes_only_bot_positions(tmp_path):
-    cfg = EngineConfig()
+    cfg = legacy()
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 3600)}, cfg)
     assert connect_and_start(tr, br, T0 + 1)["ok"]
     manual = br.add_foreign_position("XAUUSD", "SELL", 0.05, magic=0)
@@ -92,7 +92,7 @@ def test_stop_closes_only_bot_positions(tmp_path):
 
 
 def test_restart_recovery_readopts_positions(tmp_path):
-    cfg = EngineConfig()
+    cfg = legacy()
     ticks = gen_ticks(5, T0, 3600)
     tr, br = make(tmp_path, {"XAUUSD": ticks}, cfg)
     assert connect_and_start(tr, br, T0 + 1)["ok"]
@@ -127,7 +127,7 @@ def test_restart_recovery_readopts_positions(tmp_path):
 
 
 def test_stop_when_disconnected_reconnects_then_flattens_and_shutdown(tmp_path):
-    cfg = EngineConfig()
+    cfg = legacy()
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 3600)}, cfg)
     assert connect_and_start(tr, br, T0 + 1)["ok"]
     t = T0 + 1
@@ -185,7 +185,7 @@ def test_equity_drawdown_enters_safe_mode_but_keeps_running(tmp_path):
 
 
 def test_netting_account_does_not_touch_manual_symbol(tmp_path):
-    cfg = EngineConfig()
+    cfg = legacy()
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 1800)}, cfg, hedging=False)
     br.advance(T0 + 1)
     manual = br.add_foreign_position("XAUUSD", "BUY", 0.1, magic=0)
@@ -217,5 +217,5 @@ def test_rejected_order_is_not_retried_in_a_loop(tmp_path):
         br.advance(t); tr.step(t); t += 0.15
     assert br.sent_orders == 1
     sent_at = t
-    run(tr, br, t, t + 3, dt=0.15)
+    run(tr, br, t, t + 2.6, dt=0.15)                # t35u: a reject blocks ANY resend on the symbol for 3 s
     assert br.sent_orders == 1, "retry within cooldown"

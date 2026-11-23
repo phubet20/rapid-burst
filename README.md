@@ -400,3 +400,32 @@ REPLAY on real Binance 1m/tick data (simulated broker double, NOT live results),
 | PAXGUSDT 8h (gold proxy) | after | 261 | 51.3 | 1.26 | +113.67 | 52.4 | 13.9 s / 132.8 s | 41 |
 
 More frequent trading also means more exposure; replay results are not a profit guarantee.
+
+## t35u–t39u — immediate entries, anti-jitter exits, owner no-stop full-batch mode, zones, learner off
+
+**Per-order stop loss is OFF by owner request (DEMO, risk accepted).** `no_stop_mode=1` (default):
+* at a signal ONE full batch goes in at once (up to `max_orders_per_batch` = 16, tunable to 40), same lot, sized by
+  MARGIN: all bot positions together use <= `nostop_margin_use_pct` (50%) of equity, with a 5% free-margin buffer;
+* no broker SL, no hard-stop mirror, no group-loss cut. The ONLY emergency guards: margin level below
+  `emergency_margin_level_pct` (150%) closes the bot's positions, and data-feed loss (`emergency_stale_s`).
+  BE/trail on winning baskets stays as engine-side profit protection; never martingale or averaging losers
+  (adds only into winning baskets);
+* exits: ZONE TARGET (price reaches an opposing supply/demand zone, FVG or S/R in profit) or a confirmed
+  pullback/reversal from volume + momentum + indicators; a pullback INTO the basket's own demand/supply zone or FVG
+  is held (`pullback_hold`).
+* `no_stop_mode=0` restores stop-based sizing with a broker SL on every order.
+
+Entries (t35u): `mb_threshold` 0.40, `mb_edge` 0.03, `min_orders_per_batch` 1. Live 15:27–15:32 BKK showed
+"below threshold" ~40–54 of 60 samples/min, START→first entry 91 s and close→re-entry 151–206 s; after the runtime
+tune entries came 1–5 s later and reversal re-entries 0.00 s after the verified close. A broker reject blocks resends
+on that symbol for 3 s (no blind resend).
+
+Anti-jitter (t36u): soft exits (reversal, spike-turn, momentum, structure, profit protection, auto-reverse) must
+persist >= `exit_confirm_s` (0.8 s) over >= `exit_confirm_ticks` (2) clean ticks; outlier ticks (> 0.8 ATR from the
+median of the last 5 mids), feed gaps, stale quotes and spread spikes never count; emergency guards are never delayed.
+
+Price action (t37u, `zones.py`): demand/supply zones, fair value gaps, confirmation candles and wick-tip entries
+from real M5/M1 candles add up to ±0.10 strength (never decide alone).
+
+Learner (t39u): `learning_enabled=0` - closed trades are still recorded, but the learner no longer skips,
+resizes, reweights or exits anything.

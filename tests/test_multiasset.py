@@ -3,6 +3,7 @@
 SYNTHETIC specs/ticks (test doubles of what TickerAll/the broker return) - these tests prove the
 engine/risk maths is symbol-agnostic, not that any market is quoting right now."""
 import math
+from tests.harness import legacy
 import random
 import time
 from datetime import datetime, timezone
@@ -38,7 +39,7 @@ def ticks(a, seconds=150, seed=3):
 
 @pytest.mark.parametrize("name", list(ASSETS))
 def test_engine_features_and_spread_gate_scale_with_the_symbol(name):
-    a, cfg = ASSETS[name], EngineConfig()
+    a, cfg = ASSETS[name], legacy()
     eng = MomentumEngine(name, a["point"], cfg)
     for t, b, k in ticks(a):
         eng.on_tick(t, b, k)
@@ -55,7 +56,7 @@ def test_engine_features_and_spread_gate_scale_with_the_symbol(name):
 
 @pytest.mark.parametrize("name", list(ASSETS))
 def test_sizing_respects_budget_step_and_limits(name):
-    a, cfg = ASSETS[name], EngineConfig()
+    a, cfg = ASSETS[name], legacy()
     sl_dist = a["price"] * 0.0012                            # ~12 bp stop
     res = size_position(EQUITY, cfg, sl_dist, a["ts"], a["tv"], a["vmin"], a["vmax"], a["vstep"])
     budget = EQUITY * cfg.risk_per_trade_pct / 100
@@ -68,7 +69,7 @@ def test_sizing_respects_budget_step_and_limits(name):
 
 
 def test_sizing_refuses_when_tick_value_unknown_or_min_lot_too_risky():
-    cfg = EngineConfig(max_lot_per_order=1.0)
+    cfg = legacy(max_lot_per_order=1.0)
     r = size_position(EQUITY, cfg, 100.0, 0.01, 0.0, 0.01, 20, 0.01)
     assert r.volume == 0 and "invalid" in r.note
     r = size_position(EQUITY, cfg, 5_000.0, 0.01, 0.01, 2.0, 20, 2.0)   # broker min lot above max_lot_per_order
@@ -76,7 +77,7 @@ def test_sizing_refuses_when_tick_value_unknown_or_min_lot_too_risky():
 
 
 def test_total_exposure_cap_is_notional_based_across_assets():
-    cfg = EngineConfig(max_total_notional_x=2.0, max_total_lots=1000, max_total_risk_pct=100)
+    cfg = legacy(max_total_notional_x=2.0, max_total_lots=1000, max_total_risk_pct=100)
     g = RiskGuard(cfg)
     acct = AccountView(EQUITY, EQUITY, EQUITY, 0.0)
     held = [OpenPos("BTCUSDm", "BUY", 0.15, 0.0, 10.0, notional=0.15 * 98_000)]            # 14.7k = 1.47x equity
@@ -84,7 +85,7 @@ def test_total_exposure_cap_is_notional_based_across_assets():
     assert ok                                                                               # 4.4k more: 1.9x
     ok, why = g.check_entry("EURUSD", "BUY", held, acct, 0.1, 10.0, 10.0, True, new_notional=11_000)
     assert not ok and "exposure" in why
-    cfg2 = EngineConfig(max_positions_per_symbol=1)
+    cfg2 = legacy(max_positions_per_symbol=1)
     ok, why = RiskGuard(cfg2).check_entry("BTCUSDm", "BUY", held, acct, 0.01, 1.0, 1.0, True)
     assert not ok and "positions on BTCUSDm" in why                                         # per-symbol limit kept
 
@@ -128,7 +129,7 @@ def test_tick_value_derived_only_when_exact(fake, tmp_path):
 
 def test_no_default_symbol_and_start_needs_a_tradable_quoting_symbol(fake, tmp_path):
     fake.auto_ticks = True
-    tr = Trader(connected(fake, tmp_path), MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
+    tr = Trader(connected(fake, tmp_path), MemStore(dict(DEMO)), legacy(), str(tmp_path))
     assert tr.selected == []                               # no hardcoded XAUUSD
     tr.step(time.time())
     chk = {c["name"]: c for c in tr.validation["checks"]}["Tradable symbol selected"]
@@ -148,7 +149,7 @@ def test_closed_symbol_is_skipped_not_blocking_and_resumes(fake, tmp_path):
     """Only BTC quotes (weekend); XAU/EURUSD are 'closed'. START works on BTC, the others show
     'no quotes' and pick up automatically once quotes arrive."""
     b = connected(fake, tmp_path)
-    tr = Trader(b, MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
+    tr = Trader(b, MemStore(dict(DEMO)), legacy(), str(tmp_path))
     tr.step(time.time())
     assert tr.cmd_select(["BTCUSDm", "XAUUSD"])["ok"] is True      # selection itself never needs quotes
     assert wait(lambda: any(c.get("kind") == "ticks" for c in fake.subscriptions))
@@ -174,7 +175,7 @@ def test_closed_symbol_is_skipped_not_blocking_and_resumes(fake, tmp_path):
 
 def test_start_blocked_with_reason_when_every_selected_symbol_is_closed(fake, tmp_path):
     b = connected(fake, tmp_path)
-    tr = Trader(b, MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
+    tr = Trader(b, MemStore(dict(DEMO)), legacy(), str(tmp_path))
     tr.step(time.time())
     tr.cmd_select(["XAUUSD"])
     r = tr.cmd_start()
@@ -185,7 +186,7 @@ def test_start_blocked_with_reason_when_every_selected_symbol_is_closed(fake, tm
 
 
 def test_search_paging_through_trader(fake, tmp_path):
-    tr = Trader(connected(fake, tmp_path), MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
+    tr = Trader(connected(fake, tmp_path), MemStore(dict(DEMO)), legacy(), str(tmp_path))
     tr.step(time.time())
     p1 = tr.cmd_search("", 0, 4)
     p2 = tr.cmd_search("", 4, 4)

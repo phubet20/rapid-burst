@@ -197,6 +197,13 @@ class RiskGuard:
                 return False, "add requires stronger momentum"
         if sum(p.volume for p in pos) + new_volume > cfg.max_total_lots + 1e-9:
             return False, f"max total lots {cfg.max_total_lots} would be exceeded"
+        if getattr(cfg, "no_stop_mode", False):
+            # t38u: no per-order stop (owner request) - stop-risk caps cannot apply; margin governs
+            if acct.margin_level and acct.margin_level < cfg.emergency_margin_level_pct:
+                return False, f"margin level {acct.margin_level:.0f}% below the emergency level"
+            if new_margin > acct.margin_free + 1e-9:
+                return False, "insufficient free margin for order"
+            return True, "ok (no-stop mode: margin-sized)"
         if new_notional > 0 and cfg.max_total_notional_x > 0:
             cap_n = acct.equity * cfg.max_total_notional_x
             if sum(p.notional for p in pos) + new_notional > cap_n + 1e-9:

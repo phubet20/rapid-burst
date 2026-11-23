@@ -16,11 +16,13 @@ import threading
 import time
 import uuid
 from collections import Counter, deque
+from types import SimpleNamespace
 from concurrent.futures import Future
 from dataclasses import replace as dc_replace
 from typing import Optional
 
 from . import __version__
+from . import zones
 from .config import TUNABLE, EngineConfig, validate_tune
 from .engine import MomentumEngine, PositionState
 from .risk import AccountView, EntryPacer, OpenPos, RiskGuard, SizeResult, size_position
@@ -96,6 +98,10 @@ class Trader:
         self._ind_cache: dict = {}
         self._reverse_to: dict = {}
         self.reversals = 0
+        self._exit_pending: dict = {}     # t36u: basket -> soft exit awaiting confirmation (anti-jitter)
+        self._mid_hist: dict = {}         # t36u: symbol -> recent (tick time, mid) for the outlier filter
+        self._exit_held_log: dict = {}
+        self.exits_filtered = 0
         self.last_burst: dict[str, dict] = {}        # duplicate prevention: last traded burst per symbol
         self._recv_wall: dict[str, float] = {}       # real wall time the latest tick of a symbol reached the worker
         self._feed_ms: dict[str, float] = {}         # broker tick time -> worker receipt (when the API provides it)
@@ -873,6 +879,12 @@ class Trader:
                 if cfg.ind_enabled and m.ready:
                     m.ind = self._ind_view(s, mt, m.mid)
                     m.ind_w = self.learner.ind_weights(s) if cfg.learning_enabled else None
+                if cfg.zones_enabled:
+                    try:
+                        m.zones = zones.analyze(list(mt.m5.bars), list(mt.m1.bars), getattr(mt.m1, "live", None),
+                                                m.mid, m.atr, cfg)
+                    except Exception:  # noqa: BLE001 - context only, never blocks the engine
+                        m.zones = None
             st = decide(m, cfg)
             add = self.pacer.threshold_add(s)
             if add and st.side != "NO TRADE":
@@ -902,6 +914,7 @@ class Trader:
                 "tick_age": round(now_wall - self.last_receipt[s], 1) if s in self.last_receipt else None,
                 "mtf": m.mtf.brief() if getattr(m, "mtf", None) is not None else None,
                 "ind": m.ind.brief() if getattr(m, "ind", None) is not None else None,
+                "zones": m.zones.brief() if getattr(m, "zones", None) is not None else None,
                 "m1_cycles": self._cycles(s, now_wall)}
 
     def _m1_bar(self, s: str, now_wall: float) -> float:
@@ -969,20 +982,24 @@ class Trader:
                 self._skip(s, status, "paused: poor execution quality (slippage)", now_wall, sig)
                 continue
             last = self.last_burst.get(s)
-            lvl = m.micro_hi if side == "BUY" else m.micro_lo
-            if (last and last.get("rejected") and last.get("side") == side
-                    and abs(float(last.get("level", lvl)) - lvl) <= 0.1 * max(m.atr, 1e-12)
-                    and now_wall - float(last.get("wall", 0.0)) < 3.0):
+            if (last and last.get("rejected")
+                    and now_wall - float(last.get("wall", 0.0)) < 3.0):     # t35u: any side - a reject is not retried
                 # t34u: only a signal the BROKER REJECTED is not re-sent for 3 s (no blind resend). A losing basket's
                 # signal no longer locks that side until the swing changes (that held re-entry back 25-40 s live)
-                self._skip(s, status, f"{side} skipped: the broker just rejected this signal - not re-sent blindly",
+                self._skip(s, status, f"{side} skipped: the broker rejected an order on {s} <3 s ago - not re-sent blindly",
                            now_wall, sig)
                 continue
             if last and float(last.get("tick_t", -1.0)) == m.t:
                 self._skip(s, status, f"{side} skipped: duplicate - same tick", now_wall, sig)
                 continue
             learn = None
-            if cfg.learning_enabled:
+            if not cfg.learning_enabled:
+                # t39u: the learner has NO influence on trading (no skip, no size change, no weights, no exits);
+                # closed trades are still recorded for reporting only
+                learn = SimpleNamespace(bucket=self._setup_key(s, side, m), allow=True, min_lot=False, mult=1.0, state="record-only",
+                                        why="learning: record only (no influence)")
+                self.learn_view[s] = learn.why
+            else:
                 bucket = self._setup_key(s, side, m)
                 learn = self.learner.decide(bucket, now_wall)
                 learn.bucket = bucket
@@ -1150,9 +1167,12 @@ class Trader:
         strength = st.buy if side == "BUY" else st.sell
         sq = max(0.0, min(1.0, (strength - st.threshold) / max(1e-6, 1.0 - st.threshold)))
         n_min = max(1, min(cfg.min_orders_per_batch, cfg.max_orders_per_batch))
-        n = max(n_min, 1 + int(round(7 * sq)))
-        if m.regime in ("quiet", "chop"):
-            n = min(n, max(2, n_min))               # weak tape: small baskets only
+        if cfg.full_batch:
+            n = cfg.max_orders_per_batch            # t37u: FULL batch from the first entry - capped only by stop-risk,
+        else:                                       # margin and exposure limits below (no score scaling)
+            n = max(n_min, 1 + int(round(7 * sq)))
+            if m.regime in ("quiet", "chop"):
+                n = min(n, max(2, n_min))           # weak tape: small baskets only
         mult = float(getattr(learn, "mult", 1.0) or 1.0) if learn is not None else 1.0
         if mult > 1.0:
             n = int(round(n * mult))                # learning: a proven setup gets more orders
@@ -1160,62 +1180,84 @@ class Trader:
         probe = self.risk.probe_left > 0
         if probe:
             n = n_min
-        risk_scale = min(1.0, (0.6 + 0.4 * sq) * mult)   # weaker edge -> less risk; proven setup -> more
+        risk_scale = 1.0 if cfg.full_batch else min(1.0, (0.6 + 0.4 * sq) * mult)   # weaker edge -> less risk
         per_pct = min(cfg.risk_per_trade_pct, cfg.risk_per_batch_pct * risk_scale / n)
         size = size_position(acct.equity, dc_replace(cfg, risk_per_trade_pct=per_pct), sl_dist, ts, tv, vmin, vmax, vstep)
         if size.volume <= 0:
             return refuse(size.note)
-        floor = size.note.startswith("min lot floor")
-        open_risk = sum(self._pos_risk(p) for p in self.own_positions)
-        if floor:
-            # small account: the min lot already exceeds the per-order share -> as many min lots as fit in the
-            # basket stop-risk budget (scaled by the score); at least min_orders_per_batch if the UNSCALED budget
-            # holds them
-            cap_money = acct.equity * cfg.small_account_batch_risk_pct / 100.0
-            k = int((cap_money * risk_scale + 1e-9) // max(size.risk_money, 1e-9))
-            k_full = int((cap_money + 1e-9) // max(size.risk_money, 1e-9))
-            tot_room = int((acct.equity * cfg.max_total_risk_pct / 100.0 - open_risk + 1e-9) // max(size.risk_money, 1e-9))
-            k_full = min(k_full, tot_room)
-            if k_full < 1:
-                return refuse(f"min-lot stop risk {size.risk_money:.2f} ({size.risk_money / max(acct.equity, 1e-9):.1%} of "
-                              f"equity) does not fit the basket risk budget {cap_money:.2f} "
-                              f"({cfg.small_account_batch_risk_pct:g}% of equity, open risk {open_risk:.2f})")
-            if k_full < n_min:
-                # t32u (5): never a single order - if two min lots do not fit the stop-risk budget, skip the symbol
-                return refuse(f"only {k_full} min lot(s) of stop risk {size.risk_money:.2f} fit the basket budget "
-                              f"{cap_money:.2f} - a basket needs >= {n_min} orders (skip until equity grows)")
-            n = max(n_min, min(n, max(k, n_min), k_full))
-        if learn is not None and learn.min_lot and size.volume > vmin:
-            size = type(size)(vmin, size.risk_money * vmin / size.volume, size.note + "; learning: losing setup, min lot")
-        if probe and size.volume > vmin:
-            size = type(size)(vmin, size.risk_money * vmin / size.volume, size.note + "; safe-mode probe: min lot")
-        cap_lot = self.no_up_after_loss.get(s)
-        if cap_lot and size.volume > cap_lot:
-            size = type(size)(cap_lot, size.risk_money * cap_lot / size.volume, size.note + f"; capped {cap_lot:g} after a loss")
-        budget = acct.equity * (cfg.small_account_batch_risk_pct if floor else cfg.risk_per_batch_pct) / 100.0
-        while n > n_min and (n * size.volume > cfg.max_batch_lots + 1e-9 or n * size.risk_money > budget + 1e-9):
-            n -= 1
-        if size.volume > cfg.max_batch_lots + 1e-9:
-            v = normalize_volume(cfg.max_batch_lots, vmin, vmax, vstep)
-            if v <= 0:
-                return refuse(f"min lot {vmin:g} > max batch lots {cfg.max_batch_lots:g}")
-            size = type(size)(v, size.risk_money * v / size.volume, size.note + "; batch lot cap")
-        # margin: lots compound with equity up to the margin-use cap (shared by every symbol), keeping a buffer
-        price0 = m.ask if side == "BUY" else m.bid
-        m_one = self.broker.calc_margin(side, s, size.volume, price0)
-        if m_one:
-            room = acct.equity * cfg.max_margin_use_pct / 100.0 - self._margin_used()
-            if n * m_one > room + 1e-9:
-                v = normalize_volume(size.volume * max(0.0, room) / (n * m_one), vmin, vmax, vstep)
-                if v >= vmin and v < size.volume:
-                    size = type(size)(v, size.risk_money * v / size.volume, size.note + "; margin-use cap")
-                elif v < vmin:
-                    m_min = m_one * vmin / size.volume
-                    n = min(n, int(max(0.0, room) // max(m_min, 1e-12)))
-                    if n < n_min:
-                        return refuse(f"margin room {room:.2f} fits fewer than {n_min} min-lot orders")
-                    if size.volume > vmin:
-                        size = type(size)(vmin, size.risk_money * vmin / size.volume, size.note + "; margin-use cap")
+        floor = False
+        if cfg.no_stop_mode:
+            # t38u: FULL batch at the signal, sized by MARGIN (no per-order stop, owner request): every order the
+            # same lot, all sent at once, total margin of all bot positions <= nostop_margin_use_pct of equity
+            price0 = m.ask if side == "BUY" else m.bid
+            m_min = self.broker.calc_margin(side, s, vmin, price0)
+            if not m_min:
+                return refuse("margin calc unavailable")
+            room = acct.equity * cfg.nostop_margin_use_pct / 100.0 - self._margin_used()
+            room = min(room, float(acct.margin_free) * 0.95) if acct.margin_free else room
+            units = int(max(0.0, room) // m_min + 1e-9)
+            if units < 1:
+                return refuse(f"no-stop mode: margin room {room:.2f} < one min-lot margin {m_min:.2f} "
+                              f"({cfg.nostop_margin_use_pct:g}% margin-use cap keeps a buffer)")
+            n = max(1, min(cfg.max_orders_per_batch, cfg.max_positions_per_symbol, units))
+            v = normalize_volume(min((units // n) * vmin, cfg.max_batch_lots / n, cfg.max_lot_per_order), vmin, vmax, vstep)
+            if v < vmin:
+                return refuse(f"no-stop mode: lot {v:g} below the minimum {vmin:g}")
+            size = type(size)(v, 0.0, f"no-stop full batch: {n} x {v:g} lots, margin ~{n * v / vmin * m_min:.2f} of "
+                                      f"room {room:.2f} (no per-order SL, owner request)")
+            n_min = 1
+        else:
+            floor = size.note.startswith("min lot floor")
+            open_risk = sum(self._pos_risk(p) for p in self.own_positions)
+            if floor:
+                # small account: the min lot already exceeds the per-order share -> as many min lots as fit in the
+                # basket stop-risk budget (scaled by the score); at least min_orders_per_batch if the UNSCALED budget
+                # holds them
+                cap_money = acct.equity * cfg.small_account_batch_risk_pct / 100.0
+                k = int((cap_money * risk_scale + 1e-9) // max(size.risk_money, 1e-9))
+                k_full = int((cap_money + 1e-9) // max(size.risk_money, 1e-9))
+                tot_room = int((acct.equity * cfg.max_total_risk_pct / 100.0 - open_risk + 1e-9) // max(size.risk_money, 1e-9))
+                k_full = min(k_full, tot_room)
+                if k_full < 1:
+                    return refuse(f"min-lot stop risk {size.risk_money:.2f} ({size.risk_money / max(acct.equity, 1e-9):.1%} of "
+                                  f"equity) does not fit the basket risk budget {cap_money:.2f} "
+                                  f"({cfg.small_account_batch_risk_pct:g}% of equity, open risk {open_risk:.2f})")
+                if k_full < n_min:
+                    # t32u (5): never a single order - if two min lots do not fit the stop-risk budget, skip the symbol
+                    return refuse(f"only {k_full} min lot(s) of stop risk {size.risk_money:.2f} fit the basket budget "
+                                  f"{cap_money:.2f} - a basket needs >= {n_min} orders (skip until equity grows)")
+                n = max(n_min, min(n, max(k, n_min), k_full))
+            if learn is not None and learn.min_lot and size.volume > vmin:
+                size = type(size)(vmin, size.risk_money * vmin / size.volume, size.note + "; learning: losing setup, min lot")
+            if probe and size.volume > vmin:
+                size = type(size)(vmin, size.risk_money * vmin / size.volume, size.note + "; safe-mode probe: min lot")
+            cap_lot = self.no_up_after_loss.get(s)
+            if cap_lot and size.volume > cap_lot:
+                size = type(size)(cap_lot, size.risk_money * cap_lot / size.volume, size.note + f"; capped {cap_lot:g} after a loss")
+            budget = acct.equity * (cfg.small_account_batch_risk_pct if floor else cfg.risk_per_batch_pct) / 100.0
+            while n > n_min and (n * size.volume > cfg.max_batch_lots + 1e-9 or n * size.risk_money > budget + 1e-9):
+                n -= 1
+            if size.volume > cfg.max_batch_lots + 1e-9:
+                v = normalize_volume(cfg.max_batch_lots, vmin, vmax, vstep)
+                if v <= 0:
+                    return refuse(f"min lot {vmin:g} > max batch lots {cfg.max_batch_lots:g}")
+                size = type(size)(v, size.risk_money * v / size.volume, size.note + "; batch lot cap")
+            # margin: lots compound with equity up to the margin-use cap (shared by every symbol), keeping a buffer
+            price0 = m.ask if side == "BUY" else m.bid
+            m_one = self.broker.calc_margin(side, s, size.volume, price0)
+            if m_one:
+                room = acct.equity * cfg.max_margin_use_pct / 100.0 - self._margin_used()
+                if n * m_one > room + 1e-9:
+                    v = normalize_volume(size.volume * max(0.0, room) / (n * m_one), vmin, vmax, vstep)
+                    if v >= vmin and v < size.volume:
+                        size = type(size)(v, size.risk_money * v / size.volume, size.note + "; margin-use cap")
+                    elif v < vmin:
+                        m_min = m_one * vmin / size.volume
+                        n = min(n, int(max(0.0, room) // max(m_min, 1e-12)))
+                        if n < n_min:
+                            return refuse(f"margin room {room:.2f} fits fewer than {n_min} min-lot orders")
+                        if size.volume > vmin:
+                            size = type(size)(vmin, size.risk_money * vmin / size.volume, size.note + "; margin-use cap")
         ref = m.ask if side == "BUY" else m.bid
         run_cap = cfg.batch_run_cancel_frac * m.target
         q = self.broker.last_tick(s) or {}
@@ -1236,7 +1278,7 @@ class Trader:
             plans.append((i, margin))
         n = len(plans)
         gid = uuid.uuid4().hex[:6]
-        sl = (ref - d * sl_dist) if cfg.broker_sl else 0.0
+        sl = (ref - d * sl_dist) if (cfg.broker_sl and not cfg.no_stop_mode) else 0.0   # t38u: no per-order SL
         dev = self._deviation(s, m.spread, m.vu)
         opened, why_stop = 0, ""
         self.pacer.inflight.add(s)
@@ -1437,7 +1479,7 @@ class Trader:
             p = live.get(t)
             if p is None:
                 continue
-            if cfg.broker_sl and not float(p.get("sl", 0.0)):       # adopted/legacy order without a stop
+            if cfg.broker_sl and not cfg.no_stop_mode and not float(p.get("sl", 0.0)):   # adopted order without a stop
                 dist = (ps.hard_dist / cfg.soft_stop_mult) if ps.hard_dist else 0.0
                 if not dist:
                     atr, _ = self._atr(ps.symbol)
@@ -1473,11 +1515,17 @@ class Trader:
             m, st = self._micro(sym, now_wall)
             reason = self._hard_risk_exit(key, legs, live, m, now_wall)       # hard risk ALWAYS first
             if not reason and self.running:
-                reason = self._protect_basket(key, legs, live, m, st, now_wall)   # BE / dynamic trailing
+                # BE / trailing; its only exit is "protection failed" (stop not confirmed by MT5) = a RISK exit, never delayed
+                reason = self._protect_basket(key, legs, live, m, st, now_wall)
             if not reason and self.running:
-                reason = self._micro_exit(key, legs, live, m, st, now_wall)
-            if not reason and self.running:
-                reason = self._reversal_check(legs, m, st)
+                soft = self._zone_target(legs, live, m) or self._micro_exit(key, legs, live, m, st, now_wall)
+                if not soft:
+                    soft = self._reversal_check(legs, m, st)
+                if soft and self._pullback_hold(legs, soft, m, now_wall, key):
+                    soft = None                                                     # t37u: pullback into own zone
+                reason = self._confirm_soft_exit(key, sym, soft, m, now_wall)   # t36u: anti-jitter
+            else:
+                self._exit_pending.pop(key, None)
             if not reason:
                 continue
             closed = []
@@ -1518,6 +1566,82 @@ class Trader:
             self._refresh_account()
             self._adopt_positions()          # book the closed basket now: the same loop can re-enter on a fresh signal
 
+    def _pullback_hold(self, legs: list, soft: str, m, now_wall: float, key: str) -> bool:
+        """t37u: a mere pullback INTO a demand zone / bullish FVG (BUY basket; supply / bearish FVG for SELL) does not
+        close the basket. Real reversals (REVERSAL with the opposite side scoring, M1 swing broken) and every hard
+        stop still close it; the broker SL protects the pullback."""
+        cfg = self.cfg
+        zv = getattr(m, "zones", None)
+        if not cfg.pullback_hold or zv is None or not getattr(zv, "ready", False):
+            return False
+        if soft.startswith("REVERSAL") or "M1 swing" in soft or "in profit" in soft or "profit protection" in soft:
+            return False                                  # reversal / swing break / profit-taking are not pullbacks
+        d = 1 if legs[0].side == "BUY" else -1
+        if not zv.holds(d) or zv.wick == -d or zv.confirm == -d:
+            return False
+        if now_wall - self._exit_held_log.get("pb" + key, 0.0) > 5.0:
+            self._exit_held_log["pb" + key] = now_wall
+            self.add_log("INFO", f"HOLD basket {key} {legs[0].symbol}: pullback into "
+                                 f"{'/'.join(zv.tags['BUY' if d > 0 else 'SELL'])} - not closing on '{soft[:50]}' "
+                                 f"(hard stop active)")
+        return True
+
+    def _exit_noise(self, sym: str, m) -> Optional[str]:
+        """t36u: why the CURRENT tick must not count as confirmation of a soft exit (chart glitch / jitter)."""
+        cfg = self.cfg
+        mid = float(getattr(m, "mid", 0.0) or 0.0)
+        t = float(getattr(m, "t", 0.0) or 0.0)
+        h = self._mid_hist.setdefault(sym, deque(maxlen=7))
+        if mid > 0 and (not h or h[-1][0] != t):
+            h.append((t, mid))
+        if not getattr(m, "ready", False) or mid <= 0:
+            return "no clean quote"
+        if not getattr(m, "stable", True):
+            return f"feed gap {getattr(m, 'gap_max', 0.0):.1f}s"
+        lat = float(getattr(m, "latency", 0.0) or 0.0)
+        if lat > cfg.exit_stale_s:
+            return f"stale quote ({lat:.1f}s old)"
+        if float(getattr(m, "spread_ratio", 1.0) or 1.0) > cfg.spread_spike_ratio:
+            return f"spread spike ({getattr(m, 'spread_ratio', 0.0):.1f}x normal)"
+        atr = float(getattr(m, "atr", 0.0) or 0.0)
+        if atr > 0 and len(h) >= 4:
+            prev = sorted(x for _, x in list(h)[-6:-1])
+            med = prev[len(prev) // 2]
+            if abs(mid - med) > cfg.exit_outlier_atr * atr:
+                return f"outlier tick ({abs(mid - med) / atr:.2f} ATR from the median)"
+        return None
+
+    def _confirm_soft_exit(self, key: str, sym: str, soft: Optional[str], m, now_wall: float) -> Optional[str]:
+        """t36u: a soft exit fires only when it PERSISTS: >= exit_confirm_s and >= exit_confirm_ticks distinct clean
+        ticks. A flicker that disappears resets it; glitch ticks (gap, stale, spread spike, outlier) never count."""
+        cfg = self.cfg
+        if not soft:
+            if self._exit_pending.pop(key, None):
+                self.exits_filtered += 1                  # the signal vanished before confirmation = jitter avoided
+            return None
+        if cfg.exit_confirm_s <= 0 and cfg.exit_confirm_ticks <= 1:
+            return soft
+        noise = self._exit_noise(sym, m)
+        c = self._exit_pending.get(key)
+        if c is None:
+            c = self._exit_pending[key] = {"t0": now_wall, "n": 0, "tick": None}
+        if noise:
+            if now_wall - self._exit_held_log.get(key, 0.0) > 5.0:
+                self._exit_held_log[key] = now_wall
+                self.add_log("INFO", f"EXIT HELD basket {key} {sym}: '{soft[:60]}' not confirmed - {noise} "
+                                     f"(glitch/jitter filter; hard stop still active)")
+        else:
+            tick = float(getattr(m, "t", 0.0) or 0.0)
+            if tick != c["tick"]:
+                c["n"], c["tick"] = c["n"] + 1, tick
+        age = now_wall - c["t0"]
+        if age >= cfg.exit_confirm_s and c["n"] >= cfg.exit_confirm_ticks:
+            self._exit_pending.pop(key, None)
+            return f"{soft} [confirmed {age:.1f}s / {c['n']} clean ticks]"
+        if soft.startswith("REVERSAL"):
+            self._reverse_to.pop(sym, None)               # not reversed until the close is confirmed
+        return None
+
     def _reversal_check(self, legs: list, m, st) -> Optional[str]:
         """t34u AUTO-REVERSAL: the OPPOSITE side passes its own entry check (positive evidence, threshold, families)
         and beats the held side's strength by `reverse_edge` -> close this basket now (every close verified on
@@ -1552,6 +1676,8 @@ class Trader:
         """Hard risk exits override everything: safe mode (equity drawdown), hard stop mirror and
         locked-stop mirror, group loss cap, exposure breach, emergency (no price)."""
         cfg = self.cfg
+        if cfg.no_stop_mode:
+            return self._nostop_emergency(legs, live, m, now_wall)
         if self.risk.catastrophic:
             return (f"CATASTROPHIC drawdown: equity below {self.cfg.safe_flatten_pct:g}% under the closed-balance peak "
                     f"- flatten")
@@ -1596,6 +1722,48 @@ class Trader:
             xq = self._exec_quote(sym, now_wall)
             if xq is None or xq[2] != "rest":
                 return f"emergency: no fresh price for {age:.0f}s"
+        return None
+
+    def _nostop_emergency(self, legs: list, live: dict, m, now_wall: float) -> Optional[str]:
+        """t38u no-stop mode: the ONLY hard exits - margin level near stop-out, data-feed loss, and the engine-side
+        BE/trail level of a winning basket (profit protection, never a loss stop)."""
+        cfg = self.cfg
+        sym = legs[0].symbol
+        ml = float(self.account.get("margin_level", 0.0) or 0.0)
+        if ml and ml < cfg.emergency_margin_level_pct:
+            return f"EMERGENCY margin level {ml:.0f}% < {cfg.emergency_margin_level_pct:g}% - close bot positions"
+        for ps in legs:
+            p = live.get(ps.ticket) or {}
+            d = 1 if ps.side == "BUY" else -1
+            px = self._exec_px(ps, p, m if getattr(m, "bid", 0) else None, now_wall)
+            if px is not None and ps.vsl and (px - ps.vsl) * d <= 0:
+                return f"{ps.sl_state} profit-protection level hit #{ps.ticket} at {px} (engine BE/trail)"
+        age = now_wall - self.last_receipt.get(sym, now_wall)
+        if age > cfg.emergency_stale_s:
+            xq = self._exec_quote(sym, now_wall)
+            if xq is None or xq[2] != "rest":
+                return f"EMERGENCY data feed lost: no fresh price for {age:.0f}s"
+        return None
+
+    def _zone_target(self, legs: list, live: dict, m) -> Optional[str]:
+        """t38u: take the basket's profit when price reaches an OPPOSING zone (supply / bearish FVG / resistance for a
+        BUY basket; demand / bullish FVG / support for SELL)."""
+        cfg = self.cfg
+        if not cfg.zone_target_exit:
+            return None
+        money = sum(float((live.get(ps.ticket) or {}).get("profit", 0.0)) for ps in legs)
+        if money <= 0:
+            return None
+        d = 1 if legs[0].side == "BUY" else -1
+        zv, iv = getattr(m, "zones", None), getattr(m, "ind", None)
+        hit = []
+        if zv is not None and getattr(zv, "ready", False):
+            hit += [t for t in zv.tags["SELL" if d > 0 else "BUY"]]
+        lvl = getattr(iv, "res_above" if d > 0 else "sup_below", None) if iv is not None else None
+        if lvl and m.atr and abs(float(lvl) - m.mid) <= 0.1 * m.atr:
+            hit.append("resistance" if d > 0 else "support")
+        if hit:
+            return f"ZONE TARGET: price reached {'/'.join(hit)} with the basket {money:+.2f} in profit"
         return None
 
     def _micro_exit(self, key: str, legs: list, live: dict, m, st, now_wall: float) -> Optional[str]:
@@ -1853,6 +2021,8 @@ class Trader:
         return m if m > 0 else max(0.0, eq - float(self.account.get("margin_free", 0) or 0))
 
     def _pos_risk(self, p: dict) -> float:
+        if self.cfg.no_stop_mode:
+            return 0.0                                  # t38u: no stop -> stop-risk is not defined; margin governs
         info = self.sym_info.get(p["symbol"]) or {}
         sl = float(p.get("sl", 0.0))
         ps = self.pos_state.get(int(p["ticket"]))
@@ -2083,6 +2253,7 @@ class Trader:
                           "persistent learning)",
                 "min_agree": c.mb_min_agree, "candle_poll_s": {"M1": c.candle_poll_m1_s, "M5": c.candle_poll_m5_s},
                 "reverse_enabled": c.reverse_enabled, "reverse_edge": c.reverse_edge, "reversals": self.reversals,
+                "exit_confirm_s": c.exit_confirm_s, "exit_confirm_ticks": c.exit_confirm_ticks, "exits_filtered": self.exits_filtered,
                 "safe_dd_limit": round(self.risk.dd_limit(), 2) if self.risk.peak_equity else None,
                 "loss_streak_add": round(max((self.pacer.threshold_add(x) for x in self.selected), default=0.0), 2),
                 "risk_per_trade_pct": c.risk_per_trade_pct, "max_total_risk_pct": c.max_total_risk_pct,
@@ -2111,7 +2282,11 @@ class Trader:
                 "small_account_batch_risk_pct": c.small_account_batch_risk_pct, "mb_edge": c.mb_edge,
                 "runtime_tuning": dict(self.tune), "tunable": sorted(TUNABLE),
                 "min_orders_per_batch": c.min_orders_per_batch, "add_enabled": c.add_enabled,
-                "broker_sl": "ON" if c.broker_sl else "OFF", "exec_halt": self.exec_halt,
+                "broker_sl": ("OFF - per-order SL disabled by owner request (no-stop mode; emergency guards: margin level "
+                              f"< {c.emergency_margin_level_pct:g}% or data-feed loss)") if c.no_stop_mode
+                             else ("ON" if c.broker_sl else "OFF"), "exec_halt": self.exec_halt,
+                "no_stop_mode": c.no_stop_mode, "nostop_margin_use_pct": c.nostop_margin_use_pct,
+                "emergency_margin_level_pct": c.emergency_margin_level_pct, "learning_enabled": c.learning_enabled,
                 "sl_rule": f"hard stop max({c.sl_atr:g}x M1 ATR, {c.sl_spread_mult:g}x spread) at the broker -> basket BE "
                            f"(avg + costs + {c.be_lock_spread_mult:g}x spread) once net >= max({c.be_trigger_atr:g}x ATR, "
                            f"{c.be_trigger_spread:g}x spread) -> dynamic trail {c.trail_atr_strong:g}/{c.trail_atr_frac:g}/"

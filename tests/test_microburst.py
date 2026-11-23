@@ -49,8 +49,8 @@ def test_up_burst_gives_buy_early_and_down_burst_gives_sell():
 def test_random_market_trades_are_the_exception():
     rows = _analyze_stream(gen_ticks(11, T0, 900), after=T0 + 60)
     fired = sum(st.side != "NO TRADE" for _, _, st in rows)
-    # t30u: fewer slow filters -> more entries, still a minority of moments on a random walk
-    assert rows and fired / len(rows) < 0.2, (fired, len(rows))
+    # t35u: minimal threshold/edge (immediate entries requested) -> still a minority of moments on a random walk
+    assert rows and fired / len(rows) < 0.3, (fired, len(rows))
 
 
 def test_strength_is_two_sided_and_explains_itself():
@@ -237,7 +237,7 @@ def test_no_daily_loss_halt_and_safe_mode_defaults(monkeypatch):
     # t32u: ruin-avoiding defaults (10% basket, 25% total, safe mode 30% below the closed-balance peak)
     assert not hasattr(c, "daily_loss_limit_pct") and c.equity_drawdown_pct == 30.0
     assert c.max_margin_use_pct == 90.0 and c.risk_per_batch_pct == 10.0 and c.max_total_risk_pct == 25.0
-    assert c.max_orders_per_batch == 8 and c.min_orders_per_batch == 2 and c.broker_sl
+    assert c.max_orders_per_batch == 16 and c.min_orders_per_batch == 1 and c.broker_sl and c.no_stop_mode   # t38u
 
 
 def test_safe_mode_pauses_entries_keeps_stops_and_keeps_running(tmp_path):

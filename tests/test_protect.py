@@ -4,7 +4,7 @@ import math
 
 from rapidburst.config import EngineConfig
 from rapidburst.mtf import TF
-from tests.harness import make, run
+from tests.harness import legacy, make, run
 from tests.paths import T0, _small_account, _start, series_up
 
 
@@ -85,7 +85,7 @@ def test_intrabar_reentry_cycles_are_counted_not_limited(tmp_path):
 
 
 def test_batch_cap_is_8_but_never_forced(tmp_path):
-    cfg = EngineConfig()
+    cfg = legacy()
     assert cfg.max_orders_per_batch == 8 and cfg.max_positions_per_symbol >= 8
     tr, br, _ = _session(tmp_path)
     sizes = [int(m.split(":")[1].split("/")[0]) for m in (l["msg"] for l in tr.logs) if m.startswith("BATCH ")]

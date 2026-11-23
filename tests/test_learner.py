@@ -6,7 +6,7 @@ import random
 
 from rapidburst.config import EngineConfig
 from rapidburst.learner import Learner, regime
-from tests.harness import make, run
+from tests.harness import legacy, make, run
 from tests.paths import _small_account, _start
 from tests.paths import T0, trend_then_pullback
 
@@ -71,7 +71,7 @@ def test_regime_buckets():
 
 
 def test_trader_journals_closed_baskets_by_setup(tmp_path):
-    cfg = EngineConfig()
+    cfg = legacy()
     cfg.learn_min_samples = 100                          # stay in cold start for this run
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=1.0)     # risk sizing alone would be ~1 lot
@@ -94,7 +94,7 @@ def test_trader_journals_closed_baskets_by_setup(tmp_path):
 
 
 def test_trader_trades_a_disabled_bucket_at_min_lot_only(tmp_path):
-    cfg = EngineConfig()
+    cfg = legacy()
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=1.0)
     for rel in ("with", "counter", "flat", "trend?"):

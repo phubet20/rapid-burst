@@ -31,14 +31,17 @@ INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE"
 TUNABLE = {
     "sl_struct_buffer_atr": (0.0, 0.5), "sl_min_atr": (0.2, 2.0), "sl_max_atr": (0.5, 4.0),
     "ind_min_score": (0.0, 0.6), "ind_sr_near_atr": (0.0, 1.0), "safe_flatten_pct": (0.0, 95.0), "exit_min_r": (0.0, 2.0), "reverse_enabled": (0, 1), "reverse_edge": (0.0, 0.5),
+    "no_stop_mode": (0, 1), "nostop_margin_use_pct": (5.0, 90.0), "emergency_margin_level_pct": (50.0, 1000.0),
+    "zone_target_exit": (0, 1), "broker_sl": (0, 1), "full_batch": (0, 1), "zones_enabled": (0, 1), "zone_weight": (0.0, 0.3), "zone_impulse_atr": (0.5, 3.0),
+    "pullback_hold": (0, 1), "exit_confirm_s": (0.0, 5.0), "exit_confirm_ticks": (1, 20), "exit_outlier_atr": (0.2, 5.0), "exit_stale_s": (0.5, 10.0),
     "candle_poll_m5_s": (5, 120),
     "ind_enabled": (0, 1), "ind_chop_veto": (0, 1), "mb_require_m1_trigger": (0, 1), "sl_structure": (0, 1),
     "mb_threshold": (0.35, 0.90), "mb_edge": (0.0, 0.40), "mb_min_agree": (2, 5), "mb_scan_support": (0.2, 0.7),
     "mb_max_chase_atr": (0.3, 4.0), "mb_max_bar_atr": (0.3, 5.0), "loss_streak_threshold_add": (0.0, 0.1),
     "mb_min_velocity": (0.05, 0.8), "m1_trend_veto": (0.2, 1.0), "min_orders_per_batch": (1, 8),
-    "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 4),
+    "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
-    "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 64),
+    "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 64), "max_positions_per_symbol": (1, 64),
     "max_lot_per_order": (0.01, 100.0), "max_batch_lots": (0.01, 500.0), "max_total_lots": (0.01, 1000.0),
     "min_margin_level_pct": (50.0, 1000.0), "margin_use_max_pct": (10.0, 100.0), "safe_probe_batches": (0, 5),
     "exit_min_signals": (2, 6), "exit_retrace_atr": (0.05, 1.0), "exit_retrace_spread": (0.5, 6.0),
@@ -47,7 +50,7 @@ TUNABLE = {
     "be_trigger_atr": (0.1, 2.0), "be_trigger_spread": (1.0, 10.0), "be_lock_spread_mult": (0.0, 2.0),
     "trail_atr_frac": (0.05, 1.5), "trail_atr_strong": (0.05, 2.0), "trail_atr_fade": (0.03, 1.0),
     "trail_spread_mult": (1.0, 6.0), "sl_atr": (0.3, 3.0), "sl_spread_mult": (2.0, 12.0),
-    "max_orders_per_batch": (1, 8), "risk_per_trade_pct": (0.1, 100.0), "risk_per_batch_pct": (0.2, 100.0),
+    "max_orders_per_batch": (1, 40), "risk_per_trade_pct": (0.1, 100.0), "risk_per_batch_pct": (0.2, 100.0),
     "small_account_batch_risk_pct": (2.0, 100.0), "max_total_risk_pct": (1.0, 300.0),
     "equity_drawdown_pct": (0.0, 90.0), "safe_pause_s": (30, 3600), "safe_min_stopouts": (1.0, 3.0),
     "safe_dd_cap_pct": (10.0, 90.0), "group_loss_pct": (0.5, 100.0), "max_margin_use_pct": (10.0, 95.0),
@@ -108,8 +111,8 @@ class EngineConfig:
     mb_swing_seconds: float = 20.0    # swing used for anti-chase and burst identity (s)
     mb_vel_ref_atr: float = 0.25      # velocity (ATR per window) that counts as full strength
     mb_min_velocity: float = 0.08     # the chosen side needs at least this much live velocity component
-    mb_threshold: float = 0.55        # base strength threshold (adapted to regime, spread and slippage risk)
-    mb_edge: float = 0.08             # chosen side must beat the other side by this much (each side scored on its own)
+    mb_threshold: float = 0.40        # t35u: 0.55 -> 0.40 (live: 'below threshold' was ~50/60 s of every minute); base strength threshold (adapted to regime, spread and slippage risk)
+    mb_edge: float = 0.03             # t35u: 0.08 -> 0.03; chosen side must beat the other side by this much (each side scored on its own)
     mb_scan_support: float = 0.35     # a family (A/B/C/D/E) supports a side when its score >= this
     mb_min_agree: int = 2             # families that must agree (of A tick, B activity/candle, C structure,
                                       # D M1 timing, E M5 bias), one of them C or D (structure / candle trigger):
@@ -163,13 +166,36 @@ class EngineConfig:
     ind_sr_near_atr: float = 0.20     # no entry into S/R closer than x ATR (unless breaking it)
     ind_chop_veto: bool = False        # ADX < 18 with no breakout, or a squeeze without the break => no entry
     reverse_enabled: bool = True      # t34u AUTO-REVERSAL: opposite side has the edge -> close, verify, open opposite
+    # t36u: anti-jitter for SOFT exits (reversal, spike-turn, momentum, structure, profit protection, auto-reverse):
+    # the exit signal must persist >= exit_confirm_s AND over >= exit_confirm_ticks distinct ticks on clean data
+    # (no feed gap / stale quote, no spread spike, no single outlier tick); hard stop / broker SL are never delayed
+    # t37u: full batch from the first entry (capped only by stop-risk / margin / exposure), more orders per basket,
+    # price-action context and pullback hold
+    # t38u (OWNER REQUEST, demo, risk accepted): NO per-order stop loss. One full batch at the signal sized by
+    # MARGIN (nostop_margin_use_pct of equity, buffer kept so orders are not rejected); exits by zone target or a
+    # confirmed pullback/reversal (volume + momentum + indicators, anti-jitter). The ONLY emergency guards are the
+    # margin level (< emergency_margin_level_pct closes the bot's positions) and data-feed loss. BE/trail on winners
+    # stays as engine-side profit protection. Set no_stop_mode=0 to restore stop-based sizing + broker SL.
+    no_stop_mode: bool = True
+    nostop_margin_use_pct: float = 50.0     # margin used by ALL bot positions after the batch <= x% of equity
+    emergency_margin_level_pct: float = 150.0
+    zone_target_exit: bool = True     # take profit when price reaches an opposing zone / FVG / S-R level
+    full_batch: bool = True
+    zones_enabled: bool = True
+    zone_weight: float = 0.10         # max +-0.10 strength from DM/SP zones, FVG, confirmation candle, wick tip
+    zone_impulse_atr: float = 1.2     # impulsive candle body >= x ATR marks the base before it as a zone
+    pullback_hold: bool = True        # pullback into the basket's own demand/supply zone or FVG does not close it
+    exit_confirm_s: float = 0.8
+    exit_confirm_ticks: int = 2
+    exit_outlier_atr: float = 0.8     # a tick > x ATR away from the median of the last 5 mids is an outlier
+    exit_stale_s: float = 2.0         # last tick older than this = stale data, never a reversal
     reverse_edge: float = 0.10        # opposite strength must beat the held side's strength by this much
     exit_min_r: float = 0.0           # discretionary profit exits only at net >= x * stop distance (0 = off)
     mb_require_m1_trigger: bool = False  # once M1 bars exist, the M1 trigger family D must agree
     safe_flatten_pct: float = 60.0    # last resort: equity this % below the closed-balance peak => flatten all
     soft_stop_mult: float = 1.15      # engine mirror of the hard stop (if the broker SL fails)
     # batch: ONE batch per signal, opened at once, same lot per order, never added to later
-    max_orders_per_batch: int = 8     # RB_MAX_ORDERS_PER_BATCH: orders in one batch (a CAP, never forced: the count
+    max_orders_per_batch: int = 16    # RB_MAX_ORDERS_PER_BATCH: orders in one batch (a CAP, never forced: the count
                                       # follows momentum quality, then equity/lot/margin/exposure limits cut it)
     # order count from the score: n = 1 + round(7 x q), q = (strength - threshold) / (1 - threshold), then cut by
     # risk, margin, stop distance and exposure
@@ -178,13 +204,13 @@ class EngineConfig:
     batch_run_cancel_frac: float = 1.0  # cancel the rest of a batch if price ran > x * target from the decision
     max_lot_per_order: float = 50.0
     max_positions_total: int = 40
-    max_positions_per_symbol: int = 8
-    min_orders_per_batch: int = 2     # never a single order (unless the stop-risk cap cannot fit two min lots)
+    max_positions_per_symbol: int = 24
+    min_orders_per_batch: int = 1     # t35u: 1 (a 2-lot minimum skipped small accounts entirely); never a single order (unless the stop-risk cap cannot fit two min lots)
     # pyramid ADD into a basket that already has its break-even stop: shallow pullback, then price resumes in the
     # trade direction with the signal still valid; same lot (no multiplier), total legs <= max_orders_per_batch
     add_enabled: bool = True
     add_pullback_atr: float = 0.12    # pullback from the basket's best price >= x * M1 ATR before an add
-    add_max_per_step: int = 2
+    add_max_per_step: int = 3
     max_total_lots: float = 400.0
     max_total_notional_x: float = 0.0    # sum of open notional <= x * equity
     max_total_risk_pct: float = 25.0  # RB_MAX_TOTAL_RISK_PCT: sum of open stop risk <= x% of equity
@@ -226,7 +252,7 @@ class EngineConfig:
                                              # a winning basket resets it. Quality goes up, risk never does.
 
     # --- learning from real closed groups ---
-    learning_enabled: bool = True
+    learning_enabled: bool = False    # t39u (owner): learner records stats only - NO influence on trading
     learn_min_samples: int = 8
     learn_half_life_hours: float = 0.0   # 0 = never forget (no decay, memory is never reset)
     learn_max_mult: float = 2.0

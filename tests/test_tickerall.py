@@ -1,6 +1,7 @@
 """TickerAll adapter tests against FakeTickerAll (a MOCKED TickerAll API - TEST DOUBLE,
 SYNTHETIC data). They verify the adapter's mapping and safety rules, not TickerAll itself."""
 import logging
+from tests.harness import legacy
 import time
 
 import pytest
@@ -10,7 +11,7 @@ from rapidburst.config import EngineConfig
 from rapidburst.trader import Trader
 from tests.fake_tickerall import API_KEY, DEMO, LIVE, FakeTickerAll
 
-MAGIC = EngineConfig().magic
+MAGIC = legacy().magic
 
 
 class MemStore:
@@ -179,7 +180,7 @@ def test_trader_stop_flattens_only_bot_trades_over_tickerall(fake, tmp_path):
     own_pend = fake.add_order(comment="RBurst-p")
     other_pend = fake.add_order(comment="manual")
     b = mk(fake, tmp_path)
-    tr = Trader(b, MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
+    tr = Trader(b, MemStore(dict(DEMO)), legacy(), str(tmp_path))
     tr.selected = ["XAUUSD"]
     tr.step(time.time())
     assert tr.conn_state == "CONNECTED", tr.conn_msg
@@ -204,7 +205,7 @@ def test_trader_enters_with_sl_on_streamed_burst(fake, tmp_path):
     from tests.synth import burst_series
     fake.quotes["XAUUSD"] = (2650.0, 2650.18)
     b = mk(fake, tmp_path)
-    tr = Trader(b, MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
+    tr = Trader(b, MemStore(dict(DEMO)), legacy(), str(tmp_path))
     tr.selected = ["XAUUSD"]
     tr.step(time.time())
     assert wait(lambda: any(c.get("kind") == "ticks" for c in fake.subscriptions))
@@ -238,7 +239,7 @@ def test_trader_enters_with_sl_on_streamed_burst(fake, tmp_path):
 def test_untradable_symbol_explains_why_and_select_revalidates(fake, tmp_path):
     fake.auto_ticks = True
     b = mk(fake, tmp_path)
-    tr = Trader(b, MemStore(dict(DEMO)), EngineConfig(), str(tmp_path))
+    tr = Trader(b, MemStore(dict(DEMO)), legacy(), str(tmp_path))
     tr.selected = ["BTCUSD"]                    # mocked spec has no price geometry -> not tradable
     tr.step(time.time())
     chk = {c["name"]: c for c in tr.validation["checks"]}["Tradable symbol selected"]
