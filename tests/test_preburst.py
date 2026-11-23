@@ -87,11 +87,12 @@ def test_agreement_rule_no_single_indicator_speed_only_or_volume_only():
     for fam in ((0.9, 0.1, 0.1), (0.1, 0.9, 0.1), (0.9, 0.6, 0.1, 0.1, 0.1), (0.1, 0.9, 0.1, 0.1, 0.9)):
         st = _decide_with(*fam)
         assert st.side == "NO TRADE" and "families agree" in st.reason, (fam, st.reason)
-    assert _decide_with(0.9, 0.6, 0.1).side == "BUY"                 # no bars yet: 2 of A/B/C
+    assert _decide_with(0.9, 0.6, 0.1).side == "NO TRADE"            # t29u: speed + activity alone, no trigger
     assert _decide_with(0.9, 0.1, 0.6).side == "BUY"
     st = _decide_with(0.9, 0.6, 0.1, 0.5, 0.1)                       # 3 of 5 incl. M1 timing
     assert st.side == "BUY" and "agree ABD" in st.reason
-    assert _decide_with(0.2, 0.2, 0.2, 0.6, 0.6).side == "NO TRADE"  # 2 of 5
+    assert _decide_with(0.2, 0.2, 0.2, 0.6, 0.6).side == "BUY"       # t29u: 2 families incl. the M1 trigger
+    assert _decide_with(0.2, 0.6, 0.2, 0.2, 0.6).side == "NO TRADE"  # volume + M5 bias without a trigger
     assert _decide_with(0.6, 0.2, 0.2, 0.6, 0.6).side == "BUY"       # tick + M1 + M5 agree, no volume needed
 
 

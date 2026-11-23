@@ -824,13 +824,19 @@ class TickerAllBroker:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "msg": str(exc)}
         # verify on the REAL position: an accepted request is not protection until MT5 shows the new SL
-        try:
-            now_pos = self.position(ticket)
-        except Exception:  # noqa: BLE001
-            now_pos = None
-        if now_pos is None:
-            return {"ok": False, "closed": True, "msg": "position closed while modifying"}
-        live_sl = float(now_pos.get("sl") or 0.0)
+        live_sl = 0.0
+        for attempt in range(3):                 # the account view can lag the PATCH by a few hundred ms
+            if attempt:
+                time.sleep(0.3)
+            try:
+                now_pos = self.position(ticket)
+            except Exception:  # noqa: BLE001
+                now_pos = None
+            if now_pos is None:
+                return {"ok": False, "closed": True, "msg": "position closed while modifying"}
+            live_sl = float(now_pos.get("sl") or 0.0)
+            if abs(live_sl - sl) <= 0.5 * tick + 1e-12:
+                break
         if abs(live_sl - sl) > 0.5 * tick + 1e-12:
             return {"ok": False, "unverified": True, "sl": sl, "live_sl": live_sl,
                     "msg": f"SL modify accepted but the position shows SL {live_sl:.{digits}f}, not {sl:.{digits}f}"}

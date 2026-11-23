@@ -287,7 +287,7 @@ def test_snapshot_has_one_engine_view(tmp_path):
     e = tr.get_snapshot()["engine"]
     assert "groups" in e and "baskets" not in e and "scalp" not in e
     rc = e["risk_config"]
-    assert rc["engine"].startswith("Fast Candle Momentum Batch Scalper") and rc["broker_sl"] == "ON"
+    assert rc["engine"].startswith("Immediate Continuous Score Momentum Scalper") and rc["broker_sl"] == "ON"
     assert "daily_loss_limit_pct" not in rc and "latency" in e and "performance" in e
     assert e["performance"]["source"] == "real broker deals"
     st = e["symbols"]["BTCUSDm"]

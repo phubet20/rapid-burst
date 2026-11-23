@@ -1,4 +1,4 @@
-"""Engine / risk configuration (one engine: the Fast Candle Momentum Batch Scalper).
+"""Engine / risk configuration (one engine: the Immediate Continuous Score Momentum Scalper).
 
 All values are conservative defaults intended for a DEMO account.  They can be
 overridden with a JSON file (``RB_CONFIG_FILE``) on the worker machine.  The
@@ -24,6 +24,50 @@ INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE"
              "RB_STANDBY_SECONDS", "RB_TEST_BROKER_FACTORY", "RB_UI_PASSWORD", "RB_WAKE_URL"}
 
 
+# Engine settings that may be changed at RUNTIME (no redeploy, the MT5 login stays): name -> (min, max).
+# Only strategy/sizing knobs inside safe bounds. Never: live trading, broker SL on/off, magic, credentials.
+TUNABLE = {
+    "mb_threshold": (0.35, 0.90), "mb_edge": (0.0, 0.40), "mb_min_agree": (2, 5), "mb_scan_support": (0.2, 0.7),
+    "mb_max_chase_atr": (0.3, 2.0), "mb_max_bar_atr": (0.3, 2.5), "loss_streak_threshold_add": (0.0, 0.1),
+    "exit_min_signals": (2, 6), "exit_retrace_atr": (0.05, 1.0), "exit_retrace_spread": (0.5, 6.0),
+    "exit_retrace_frac": (0.1, 0.9), "exit_opp_frac": (0.5, 1.5), "mb_cut_frac": (0.2, 1.0),
+    "mb_max_hold_seconds": (0, 1800), "mb_min_net_spread": (0.0, 3.0),
+    "be_trigger_atr": (0.1, 2.0), "be_trigger_spread": (1.0, 10.0), "be_lock_spread_mult": (0.0, 2.0),
+    "trail_atr_frac": (0.05, 1.5), "trail_atr_strong": (0.05, 2.0), "trail_atr_fade": (0.03, 1.0),
+    "trail_spread_mult": (1.0, 6.0), "sl_atr": (0.3, 3.0), "sl_spread_mult": (2.0, 12.0),
+    "max_orders_per_batch": (1, 8), "risk_per_trade_pct": (0.1, 2.0), "risk_per_batch_pct": (0.2, 5.0),
+    "small_account_batch_risk_pct": (2.0, 25.0), "max_total_risk_pct": (1.0, 10.0),
+    "equity_drawdown_pct": (3.0, 30.0), "safe_pause_s": (30, 3600), "safe_min_stopouts": (1.0, 3.0),
+    "safe_dd_cap_pct": (10.0, 40.0), "group_loss_pct": (0.5, 30.0), "max_margin_use_pct": (10.0, 80.0),
+    "learning_enabled": (0, 1),
+}
+
+
+def validate_tune(values) -> tuple[dict, list]:
+    """(accepted {name: typed value}, rejected [reasons]) for a runtime tuning request."""
+    ok, bad = {}, []
+    if not isinstance(values, dict):
+        return ok, ["values must be an object"]
+    defaults = EngineConfig()
+    for k, v in list(values.items())[:40]:
+        k = str(k)[:60]
+        if k not in TUNABLE:
+            bad.append(f"{k}: not tunable at runtime")
+            continue
+        lo, hi = TUNABLE[k]
+        cur = getattr(defaults, k)
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            bad.append(f"{k}: not a number")
+            continue
+        if x != x or not (lo <= x <= hi):
+            bad.append(f"{k}: {v} outside [{lo}, {hi}]")
+            continue
+        ok[k] = bool(x) if isinstance(cur, bool) else int(round(x)) if isinstance(cur, int) else x
+    return ok, bad
+
+
 @dataclass
 class EngineConfig:
     # --- tick data layer ---
@@ -31,8 +75,8 @@ class EngineConfig:
     slow_window: float = 15.0
     vol_window: float = 120.0         # volatility normalisation window (s)
     breakout_lookback: float = 20.0
-    min_ticks_warmup: int = 4         # ticks required before any decision (scale seeded from broker M1 candles)
-    warmup_seconds: float = 2.5
+    min_ticks_warmup: int = 3         # ticks required before any decision (scale seeded from broker M1 candles)
+    warmup_seconds: float = 1.0
     min_tick_rate: float = 0.3        # ticks/s below which the market is 'quiet'
     max_tick_age: float = 10.0        # older last tick => market idle, no decision
 
@@ -53,10 +97,11 @@ class EngineConfig:
     mb_vel_ref_atr: float = 0.25      # velocity (ATR per window) that counts as full strength
     mb_min_velocity: float = 0.35     # the chosen side needs at least this much live velocity component
     mb_threshold: float = 0.55        # base strength threshold (adapted to regime, spread and slippage risk)
-    mb_edge: float = 0.12             # chosen side must beat the other side by this much
+    mb_edge: float = 0.08             # chosen side must beat the other side by this much (each side scored on its own)
     mb_scan_support: float = 0.35     # a family (A/B/C/D/E) supports a side when its score >= this
-    mb_min_agree: int = 3             # families that must agree (of A tick, B activity/candle, C structure,
-                                      # D M1 timing, E M5 bias); 2 while the M1/M5 families have no bars
+    mb_min_agree: int = 2             # families that must agree (of A tick, B activity/candle, C structure,
+                                      # D M1 timing, E M5 bias), one of them C or D (structure / candle trigger):
+                                      # speed+volume alone (A+B) never trades
     candle_poll_m1_s: float = 20.0    # broker M1 candle refresh (the forming bar comes from live ticks)
     candle_poll_m5_s: float = 60.0    # broker M5 candle refresh
     mb_max_chase_atr: float = 0.90    # RB_MB_MAX_CHASE_ATR: no entry if price is > x ATR from the recent swing
@@ -94,7 +139,8 @@ class EngineConfig:
     # batch: ONE batch per signal, opened at once, same lot per order, never added to later
     max_orders_per_batch: int = 8     # RB_MAX_ORDERS_PER_BATCH: orders in one batch (a CAP, never forced: the count
                                       # follows momentum quality, then equity/lot/margin/exposure limits cut it)
-    batch_step_strength: float = 0.05 # +1 order per x strength above the threshold (up to the cap)
+    # order count from the score: n = 1 + round(7 x q), q = (strength - threshold) / (1 - threshold), then cut by
+    # risk, margin, stop distance and exposure
     risk_per_batch_pct: float = 1.0   # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
     max_batch_lots: float = 1.0       # lots in one batch
     batch_run_cancel_frac: float = 0.5  # cancel the rest of a batch if price ran > x * target from the decision
@@ -108,15 +154,17 @@ class EngineConfig:
     min_margin_level_pct: float = 200.0
     margin_use_max_pct: float = 50.0  # one order may use <= x% of the free margin
     small_account_max_loss_pct: float = 0.0  # 0 = min lot always allowed (free margin permitting)
+    small_account_batch_risk_pct: float = 10.0  # min-lot-floor accounts: ALL open bot stops together <= x% of
+                                      # equity (scaled by score 0.6..1.0) -> several min-lot orders per basket
     group_loss_pct: float = 2.0       # RB_GROUP_LOSS_PCT: hard exit when one basket's floating loss >= x% equity
     # NO all-day daily-loss halt. Equity drawdown => SAFE MODE (flatten, pause new entries, resume reduced)
     equity_drawdown_pct: float = 8.0  # RB_MAX_DD_PCT: equity x% below the session peak => safe mode (0 = off)
-    safe_pause_s: float = 300.0       # first safe-mode pause; doubles on each repeat in a session ...
+    safe_pause_s: float = 180.0       # first safe-mode pause; doubles on each repeat in a session ...
     safe_pause_max_s: float = 1800.0  # ... up to this
     safe_probe_batches: int = 3       # after a pause: this many single min-lot batches before normal sizing
-    safe_min_stopouts: float = 1.25   # min-lot floor accounts: the safe-mode drawdown is never smaller than this
-                                      # many single-order stop losses (one normal stop must not trip it) ...
-    safe_dd_cap_pct: float = 25.0     # ... but never more than x% of the peak equity
+    safe_min_stopouts: float = 1.5    # min-lot floor accounts: the safe-mode drawdown is never smaller than this
+                                      # many full basket stop losses (one normal basket stop must not trip it) ...
+    safe_dd_cap_pct: float = 30.0     # ... but never more than x% of the peak equity
     emergency_stale_s: float = 15.0   # open positions and no fresh price for x s => emergency close
     exec_fail_max: int = 3            # entry rejects within 60 s before the symbol is paused
     exec_fail_pause_s: float = 60.0

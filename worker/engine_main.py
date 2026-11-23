@@ -22,7 +22,8 @@ from rapidburst.config import EngineConfig  # noqa: E402
 from rapidburst.proclock import ProcessLock  # noqa: E402
 from rapidburst.trader import Trader  # noqa: E402
 
-ENGINE_CMDS = {"set_credentials", "connect_stored", "start", "stop", "search", "select", "refresh", "shutdown", "detach"}
+ENGINE_CMDS = {"set_credentials", "connect_stored", "start", "stop", "search", "select", "refresh", "shutdown", "detach",
+               "tune"}
 
 
 class MemoryCredStore:

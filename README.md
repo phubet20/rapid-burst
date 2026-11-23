@@ -47,9 +47,11 @@ Oracle Cloud Always Free and Google Cloud free tiers have no free Windows. AWS/A
 Windows VM for a limited period with a card on file (1 GB RAM is tight for MT5) – the same installer works
 there; nothing in this repo buys or starts cloud resources.
 
-## Trading engine: ONE Fast Candle Momentum Batch Scalper (microburst.py + mtf.py + trader.py)
+## Trading engine: ONE Immediate Continuous Score Momentum Scalper (microburst.py + mtf.py + trader.py)
 
-One engine, refactored in place (Rapid Micro-Burst -> Pre-Burst -> Continuous Directional -> this). Loop
+One engine, refactored in place (Rapid Micro-Burst -> Pre-Burst -> Continuous Directional -> Fast Candle
+Momentum Batch Scalper -> this). START evaluates after ~1 s / 3 live ticks (warm-up reduced from 2.5 s).
+ Loop
 (~0.1 s, per selected symbol): new ticks -> scanners (updated per tick) -> ONE decision -> risk & execution
 checks -> one batch -> basket managed tick by tick (momentum hold, break-even, dynamic trailing) -> verified
 exit -> immediate re-evaluation.
@@ -73,11 +75,14 @@ exit -> immediate re-evaluation.
   break, pullback recovery, rebound / re-acceleration, anti-chase distance from the swing.
 Tick volume is compared like-for-like and never called exchange volume. Market depth is not used.
 
-**Decision = agreement**: strength = regime-weighted mean of A/B/C/D/E (families without data drop out);
-trade when strength >= adaptive threshold (0.55 base; higher in quiet/chop, wide spread, bad slippage), it
-beats the other side, >= 3 families agree (2 while M1/M5 have no bars) with at least one price family, and
-no veto (anti-chase, exhaustion, candle already travelled, spread vs expected move, M5 clearly against). No
-single mandatory indicator, no speed-only or volume-only entry.
+**Decision = two independent scores**: every loop BUY and SELL each get a strength (regime-weighted mean of
+A/B/C/D/E; families without data drop out) and are checked on their OWN evidence: strength >= adaptive
+threshold (0.55 base; higher in quiet/chop, wide spread, bad slippage), >= 0.08 edge over the other side,
+>= 2 families agree (was 3) and one of them is C (micro-structure) or D (M1 intrabar trigger), and no veto
+(anti-chase, exhaustion, candle already travelled, spread vs expected move, M5 clearly against). A weak or
+vetoed side never implies the opposite side and never blocks it. A+B (speed + activity) or B+E alone can
+never enter: no single mandatory indicator, no speed-only or volume-only entry. The score also sets the
+order count and the risk (below).
 
 **Continuous intrabar entry / re-entry**: unlimited entry/exit cycles per M1 bar. There is NO cooldown, NO
 candle lock, NO one-trade-per-candle rule and NO re-entry delay. A closed basket is booked in the same loop
@@ -88,16 +93,30 @@ and an unverified execution (the engine stops). A losing streak raises the thres
 basket, max +0.09) - never the size. 30 baskets/min is only an API guard. Re-entry delay and entries per
 M1 bar are measured and shown.
 
-**Batch entry (max 8 orders)**: n = 1 + 1 per 0.05 of strength above the threshold, capped at 8 (2 in
-quiet/chop, 1 during safe-mode probing); then cut by the batch risk budget (1 % of equity, per order
-min(0.5 %, 1 %/n)), batch lots <= 1.0, total open risk <= 3 %, margin use <= 50 %, exposure, positions per
+**Batch entry (max 8 orders)**: q = (strength - threshold) / (1 - threshold); n = 1 + round(7 q), capped at 8
+(2 in quiet/chop, 1 during safe-mode probing); risk scale 0.6 + 0.4 q; then cut by the batch risk budget
+(1 % of equity x scale, per order min(0.5 %, budget/n)), batch lots <= 1.0, total open risk <= 3 %, margin use <= 50 %, exposure, positions per
 symbol (8) and in total (10) - every order is validated up front including the batch's own orders. Same lot
 per order; orders sent in parallel (one round trip), each fill verified; never added to later (no
 martingale, no averaging down, no adding to a losing basket, no size-up after a loss).
-*Tiny accounts:* on a ~$13-15 account the broker minimum lot (0.01) already risks more than 0.5 %/order
-(BTCUSDm ~3.8 % per stop, XAUUSDm ~18-20 %). Such accounts trade **one min-lot order per basket** ("min-lot
-floor"), one basket at a time - an 8-order basket appears only when equity is large enough that 8 orders fit
-inside the 1 % batch budget.
+*Tiny accounts (min-lot floor):* on a ~$12 account the broker minimum lot (0.01) already risks more than
+0.5 %/order (BTCUSDm ~0.44-0.51 USD = ~4 % per stop, XAUUSDm ~1.4 USD = ~12 %). Such accounts may open
+**several min-lot orders** as long as the stop risk of ALL open bot orders stays <= `small_account_batch_risk_pct`
+(10 % of equity) x the score's risk scale, and free margin covers them. On ~$11.7: BTCUSDm 1-2 orders
+(~0.5-1.0 USD = 4-9 %); XAUUSDm is refused (one min lot alone > the cap). Safe mode on such accounts trips at
+max(8 % of peak, min(1.5 x the largest basket risk, 30 % of peak)), i.e. ~1.5 USD for a 2-order BTC basket.
+
+**Duplicate protection is not an entry lock**: only an order in flight, an unconfirmed execution, and the
+SAME signal (side + origin + level) whose previous basket LOST or was rejected are blocked. A winning signal
+may re-enter at once. A basket closed by the broker (SL/trail) is booked with its REAL P/L as soon as the exit
+deals appear in the history (re-read twice a second, max 120 s, flagged `pl_incomplete` otherwise).
+
+**Runtime tuning (no redeploy, the MT5 login stays)**: `POST /api/cmd {"cmd":"tune","args":{"values":{...}}}`
+(UI login + CSRF required) or `{"args":{"reset":true}}`. Only keys in `config.TUNABLE` with their min/max
+bounds are accepted (thresholds, agreement, exits, BE/trail, stop sizing, order count, risk %, safe mode,
+learning); `live`, `broker_sl`, magic and credentials are never tunable. A running engine applies them on the
+next loop and logs `TUNE old -> new`; they are saved to `tune.json` in the data dir (re-applied when the engine
+restarts; a redeploy resets to defaults). The active overrides are shown in the engine panel.
 
 **Momentum hold & exit** (net basket P/L after spread and commission; NO fixed take-profit):
 1. hard risk first (always wins): safe mode, broker/engine stop mirror, hard stop, basket loss cap, exposure

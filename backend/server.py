@@ -29,7 +29,7 @@ REPO = ROOT.parent
 STATIC = ROOT / "static"
 log = logging.getLogger("rb.backend")
 
-UI_CMDS = {"connect", "start", "stop", "search", "select", "refresh", "forget"}
+UI_CMDS = {"connect", "start", "stop", "search", "select", "refresh", "forget", "tune"}
 SESSION_TTL = 30 * 86400
 
 
@@ -286,6 +286,19 @@ def _validate_cmd(cmd: str, args: dict) -> dict:
                 return d
         return {"q": str(args.get("q", ""))[:40], "offset": _i(args.get("offset"), 0, 0, 100000),
                 "limit": _i(args.get("limit"), 50, 1, 200)}
+    if cmd == "tune":
+        # structural check only (names/bounds are validated again by the engine against config.TUNABLE)
+        vals = args.get("values") or {}
+        if not isinstance(vals, dict) or len(vals) > 40:
+            raise web.HTTPBadRequest(text="values object required")
+        clean = {}
+        for k, v in vals.items():
+            if not isinstance(k, str) or len(k) > 60 or not all(c.isalnum() or c == "_" for c in k):
+                raise web.HTTPBadRequest(text="bad setting name")
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise web.HTTPBadRequest(text="numeric values only")
+            clean[k] = v
+        return {"values": clean, "reset": bool(args.get("reset") is True)}
     if cmd == "select":
         syms = args.get("symbols")
         if not isinstance(syms, list):

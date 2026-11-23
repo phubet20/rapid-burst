@@ -1,4 +1,4 @@
-"""Fast Candle Momentum Batch Scalper: scanners, decision and the basket exit (pure logic).
+"""Immediate Continuous Score Momentum Scalper: scanners, decision and the basket exit (pure logic).
 
 ONE engine. Five families are scored on the same moment and feed ONE decision:
   A. tick velocity & acceleration  - tick rate, velocity, acceleration/deceleration, direction sequence,
@@ -700,32 +700,40 @@ def decide(m: Micro, cfg) -> Strength:
     if not m.stable:
         st.reason = f"feed unstable (gap {m.gap_max:.1f}s)"
         return st
-    d = 1 if b >= s else -1
-    best, other, sc, vet = (b, s, sb, vb) if d > 0 else (s, b, ss, vs)
-    side = "BUY" if d > 0 else "SELL"
-    st.vetoes = vet
-    if vet:
-        st.reason = f"{side} {best:.2f}: " + "; ".join(vet)
+    # DUAL-SIDE: each side is checked on its OWN evidence (threshold, vetoes, agreement); a weak or vetoed
+    # side never implies the other one and never blocks it. The side that passes must also beat the other
+    # side's raw score by the edge (no SELL into a strong up-move just because BUY was vetoed for chasing).
+    def check(d):
+        best, other, sc, vet = (b, s, sb, vb) if d > 0 else (s, b, ss, vs)
+        side = "BUY" if d > 0 else "SELL"
+        if vet:
+            return None, f"{side} {best:.2f}: " + "; ".join(vet)
+        if best < st.threshold:
+            return None, f"no edge: {side} {best:.2f} < threshold {st.threshold:.2f} ({m.regime})"
+        if best - other < cfg.mb_edge:
+            return None, f"two-sided: BUY {b:.2f} vs SELL {s:.2f}"
+        avail = [f for f, x in zip(FAMILIES, sc) if x is not None]
+        agree = [f for f, x in zip(FAMILIES, sc) if x is not None and x >= lvl]
+        need = max(2, min(cfg.mb_min_agree, len(avail)))
+        trigger = [f for f in agree if f in ("C", "D")]           # micro-structure or M1 intrabar trigger
+        if len(agree) < need or not trigger:
+            return None, (f"{side} {best:.2f} but only {len(agree)}/{len(avail)} families agree "
+                          f"({''.join(agree) or '-'}), need {need} incl. a structure/candle trigger (C or D) - no "
+                          f"single-indicator, speed-only or volume-only entries")
+        tag = " pre-burst" if m.early == d else ""
+        fams = " ".join(f"{f}{x:.2f}" for f, x in zip(FAMILIES, sc) if x is not None)
+        return best, f"{side} {best:.2f} >= {st.threshold:.2f} [{m.regime}{tag}] agree {''.join(agree)} | {fams}"
+    first = 1 if b >= s else -1
+    res = {d: check(d) for d in (first, -first)}
+    ok = [d for d in (first, -first) if res[d][0] is not None]
+    if not ok:
+        st.vetoes = vb if first > 0 else vs
+        st.reason = res[first][1] + ("" if res[-first][1] == res[first][1] else f" | {res[-first][1]}")
         return st
-    if best < st.threshold:
-        st.reason = f"no edge: {side} {best:.2f} < threshold {st.threshold:.2f} ({m.regime})"
-        return st
-    if best - other < cfg.mb_edge:
-        st.reason = f"two-sided: BUY {b:.2f} vs SELL {s:.2f}"
-        return st
-    avail = [f for f, x in zip(FAMILIES, sc) if x is not None]
-    agree = [f for f, x in zip(FAMILIES, sc) if x is not None and x >= lvl]
-    need = min(cfg.mb_min_agree, max(2, len(avail) - 2))
-    price_fams = [f for f in agree if f != "B"]
-    if len(agree) < need or not price_fams:
-        st.reason = (f"{side} {best:.2f} but only {len(agree)}/{len(avail)} families agree ({''.join(agree) or '-'}), "
-                     f"need {need} - no single-indicator, speed-only or volume-only entries")
-        return st
-    st.side = side
+    d = ok[0]
+    st.side = "BUY" if d > 0 else "SELL"
     st.origin = m.origin_up if d > 0 else m.origin_dn
-    tag = " pre-burst" if m.early == d else ""
-    fams = " ".join(f"{f}{x:.2f}" for f, x in zip(FAMILIES, sc) if x is not None)
-    st.reason = f"{side} {best:.2f} >= {st.threshold:.2f} [{m.regime}{tag}] agree {''.join(agree)} | {fams}"
+    st.reason = res[d][1]
     return st
 
 

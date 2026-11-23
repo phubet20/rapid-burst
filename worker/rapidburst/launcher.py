@@ -32,7 +32,7 @@ from .secure_store import SecureStore
 
 log = logging.getLogger("rapidburst.launcher")
 
-UI_CMDS = {"connect", "start", "stop", "search", "select", "refresh", "forget"}
+UI_CMDS = {"connect", "start", "stop", "search", "select", "refresh", "forget", "tune"}
 CMD_TTL = 25.0  # seconds; older commands are ignored (no replay of stale commands)
 
 
@@ -426,6 +426,31 @@ class Launcher:
                                             f"is reachable to verify."}
             self.add_log("ERROR", "STOP: bot positions not all closed - engine kept alive and retrying")
             return {"ok": False, "msg": f"{r.get('msg')} (engine keeps retrying, will shut down when flat)"}
+
+        if cmd == "tune":
+            # runtime engine tuning: forwarded to a running engine, otherwise written for the next start
+            if self.engine and self.engine.alive():
+                r = await self.engine.request("tune", args, timeout=15)
+                return r
+            from .config import validate_tune
+            path = os.path.join(self.data_dir, "tune.json")
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    cur, _ = validate_tune(json.load(fh))
+            except (OSError, ValueError):
+                cur = {}
+            if args.get("reset"):
+                cur, bad, changed = {}, [], {"reset": True}
+            else:
+                ok, bad = validate_tune(args.get("values") or {})
+                cur.update(ok)
+                changed = ok
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(cur, fh)
+            os.replace(path + ".tmp", path)
+            if changed:
+                self.add_log("WARNING", f"TUNE saved for the next START (engine not running): {sorted(changed)}")
+            return {"ok": not bad or bool(changed), "changed": changed, "rejected": bad, "active": cur}
 
         if cmd == "forget":
             if self.desired == "RUNNING":

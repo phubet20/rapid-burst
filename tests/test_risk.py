@@ -46,12 +46,16 @@ def test_size_small_account_min_lot_fallback():
     assert size_position(10_000.0, cfg, 25.0, 0.01, 0.01, 0.01, 200, 0.01).volume > 0.01
 
 
-def test_floor_mode_only_requires_free_margin():
+def test_floor_mode_basket_cap_and_free_margin():
     from rapidburst.risk import AccountView, RiskGuard
     g = RiskGuard(EngineConfig())
     ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 2.0, 0.0), 0.01, 0.4, 0.45, True, 900.0,
                             floor_mode=True)
-    assert ok, why      # risk 13% of equity and margin use 22% would fail the normal rules
+    assert not ok and "small-account basket cap" in why     # 13% of equity > 10% basket cap
+    g = RiskGuard(EngineConfig(small_account_batch_risk_pct=15))
+    ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 2.0, 0.0), 0.01, 0.4, 0.45, True, 900.0,
+                            floor_mode=True)
+    assert ok, why      # margin use 22% would fail the normal rules
     ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 0.3, 0.0), 0.01, 0.4, 0.45, True, 900.0,
                             floor_mode=True)
     assert not ok and "insufficient free margin for the minimum lot" in why
@@ -123,16 +127,18 @@ def test_pacer_has_no_fixed_cooldowns_and_streak_only_raises_the_bar():
     assert "in flight" in p.can_enter("X", 9999)[1]
 
 
-def test_min_lot_floor_is_one_position_at_a_time_and_safe_mode_tolerates_one_stop():
-    cfg = EngineConfig(equity_drawdown_pct=8, safe_min_stopouts=1.25, safe_dd_cap_pct=25)
+def test_min_lot_floor_allows_a_capped_multi_order_basket_and_safe_mode_tolerates_it():
+    cfg = EngineConfig(equity_drawdown_pct=8, safe_min_stopouts=1.5, safe_dd_cap_pct=30, small_account_batch_risk_pct=10)
     g = RiskGuard(cfg)
     g.reset_session(13.0)
     small = AccountView(13, 13, 12, 0)
-    one = OpenPos("XAUUSDm", "BUY", 0.01, -0.1, 2.6)
-    assert g.check_entry("XAUUSDm", "BUY", [], small, 0.01, 2.6, 1.0, True, floor_mode=True)[0]
-    ok, why = g.check_entry("XAUUSDm", "BUY", [one], small, 0.01, 2.6, 1.0, True, batch_leg=True, floor_mode=True)
-    assert not ok and "one position at a time" in why
-    g.floor_risk = 2.6
-    assert abs(g.dd_limit() - 3.25) < 1e-9                # 1.25 stop-outs, not 8% (= 1.04)
-    assert g.update(1, AccountView(13, 10.4, 10, 0)) is None          # one normal stop loss: keep going
-    assert g.update(2, AccountView(13, 9.7, 9, 0))[0] == "safe"
+    one = OpenPos("BTCUSDm", "BUY", 0.01, -0.1, 0.6)
+    assert g.check_entry("BTCUSDm", "BUY", [], small, 0.01, 0.6, 1.0, True, floor_mode=True)[0]
+    ok, why = g.check_entry("BTCUSDm", "BUY", [one], small, 0.01, 0.6, 1.0, True, batch_leg=True, floor_mode=True)
+    assert ok, why                                       # 2 x 0.6 = 1.2 <= 1.3 (10% of 13)
+    ok, why = g.check_entry("BTCUSDm", "BUY", [one, one], small, 0.01, 0.6, 1.0, True, batch_leg=True, floor_mode=True)
+    assert not ok and "small-account basket cap" in why  # a third would exceed the cap
+    g.floor_risk = 1.2
+    assert abs(g.dd_limit() - 1.8) < 1e-9                # 1.5 x the basket risk, not 8% (= 1.04)
+    assert g.update(1, AccountView(13, 11.8, 11, 0)) is None          # one full basket stop: keep going
+    assert g.update(2, AccountView(13, 11.1, 11, 0))[0] == "safe"
