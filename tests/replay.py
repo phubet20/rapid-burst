@@ -46,7 +46,7 @@ def replay(seed: int, hours: float, cfg: EngineConfig | None = None, noise_only:
             mdd = max(mdd, peak - e)
         reasons = Counter()
         for l in tr.logs:
-            m = re.match(r"EXIT #\d+ \S+ \S+ \S+: ([a-z\- ]+)", l["msg"])
+            m = re.match(r"EXIT GROUP \S+ \S+ \S+ \S+: ([a-z\- ]+)", l["msg"])
             if m:
                 reasons[m.group(1).strip()] += 1
         return {

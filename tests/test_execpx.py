@@ -2,8 +2,8 @@
 SYNTHETIC ticks; the REST quote is a test stub)."""
 from rapidburst.config import EngineConfig
 from tests.harness import make, run
-from tests.test_burst import _small_account, _start
-from tests.test_impulse import T0, trend_then_pullback
+from tests.paths import _small_account, _start
+from tests.paths import T0, trend_then_pullback
 
 
 def _open_position(tr, br):
@@ -40,7 +40,7 @@ def test_exec_quote_uses_rest_when_ws_deviates_or_is_stale(tmp_path):
     assert q[2] == "rest" and q[0] == 3000.0 and br.quotes
     # exit/trailing price follows the broker price (BUY: worst of position price and broker bid)
     px = tr._exec_px(ps, {"price_current": 2650.0}, None, t + 0.2)
-    assert px == (3000.0 if ps.side == "SELL" else 2650.0)
+    assert px == (3000.2 if ps.side == "SELL" else 2650.0)   # SELL closes at the ask
     # WS lagging far from the broker quote -> REST mode is switched on and logged
     tr._xq.clear(); tr._rest_mode.clear(); tr._rest_check.clear()
     tr.last_receipt["BTCUSDm"] = t + 0.25

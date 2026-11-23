@@ -1,22 +1,12 @@
-"""Tick-based momentum scalping engine (pure logic, no MetaTrader dependency).
+"""Tick data layer (pure logic, no MetaTrader dependency).
 
-The engine reads raw tick flow and computes, normalised by a short-term
-volatility unit:
-  * price displacement (fast / slow), velocity and acceleration
-  * buying / selling pressure (tick-direction and magnitude imbalance)
-  * micro-breakouts of short-term structure
-  * compression -> expansion transitions and dead-market detection
-  * exhaustion (price stretched from its 60s mean, decelerating)
-  * pullback-and-renewal inside a short trend
-  * spread / volatility / tick-rate quality
-
-It blends these into one signed score in [-1, 1] instead of a rigid chain of
-confirmations, so an entry can fire on the tick where the burst starts.
-No RSI and no lagging oscillators are used.
+Per symbol: a rolling buffer of REAL ticks, the spread history, a short-term volatility unit (typical 3 s
+move) and a few base measurements (velocity/acceleration in vol units, tick pressure, micro breakout,
+compression/expansion) plus the spread/quality gate. Signal strength, entries and exits are decided in
+ONE place: microburst.py. No RSI and no lagging oscillators.
 """
 from __future__ import annotations
 
-import math
 from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass, field
@@ -60,10 +50,7 @@ class Features:
     breakout: int = 0
     compressed: bool = False
     expansion: float = 0.0
-    zscore: float = 0.0
-    renewal: int = 0
-    extended: bool = False
-    score: float = 0.0
+    score: float = 0.0           # filled with the micro-burst strength for display
 
     def brief(self) -> dict:
         r = lambda x: round(x, 3)
@@ -71,8 +58,7 @@ class Features:
             "ready": self.ready, "reason": self.reason, "score": r(self.score),
             "vel": r(self.d_fast), "acc": r(self.accel), "slow": r(self.d_slow),
             "press": r(self.pressure), "brk": self.breakout, "comp": self.compressed,
-            "exp": r(self.expansion), "z": r(self.zscore), "renew": self.renewal,
-            "ext": self.extended, "spread": self.spread, "vu": self.vol_unit,
+            "exp": r(self.expansion), "spread": self.spread, "vu": self.vol_unit,
             "tps": r(self.tick_rate),
         }
 
@@ -142,7 +128,7 @@ def _range(ticks: list[Tick]) -> float:
 
 
 class MomentumEngine:
-    """Per-symbol engine. Feed ticks, ask for a signal or an exit decision."""
+    """Per-symbol tick store + base features + spread gate (decisions live in microburst.py)."""
 
     def __init__(self, symbol: str, point: float, cfg: EngineConfig):
         self.symbol = symbol
@@ -256,51 +242,6 @@ class MomentumEngine:
         fast_range = _range(self.buf.window(last.t - cfg.fast_window, last.t) + [p_fast])
         f.expansion = fast_range / r5
 
-        # exhaustion: z-score of price vs 60s mean
-        w60 = [x.mid for x in self.buf.window(last.t - 60.0, last.t)]
-        if len(w60) > 5:
-            mu = sum(w60) / len(w60)
-            sd = math.sqrt(sum((x - mu) ** 2 for x in w60) / len(w60))
-            f.zscore = (last.mid - mu) / sd if sd > 0 else 0.0
-
-        # pullback-and-renewal inside a 30s trend
-        p30 = self.buf.at(last.t - 30.0)
-        if p30 is not None:
-            trend = (last.mid - p30.mid) / vu
-            if abs(trend) >= 1.5:
-                s = 1 if trend > 0 else -1
-                w15 = [x.mid for x in self.buf.window(last.t - 15.0, last.t - 1.0)]
-                if w15:
-                    extreme = max(w15) if s > 0 else min(w15)
-                    trough = min(w15) if s > 0 else max(w15)
-                    # retracement happened after the extreme and price is now pushing again
-                    retr = (extreme - trough) * s / vu
-                    if retr >= 0.8 and s * f.d_fast >= 0.7 and s * f.accel > 0:
-                        f.renewal = s
-
-        # extension / chase guard
-        sd = 1 if f.d_slow > 0 else -1
-        f.extended = (abs(f.zscore) >= cfg.exhaustion_z and (1 if f.zscore > 0 else -1) * f.accel < 0) or (
-            abs(f.d_slow) >= cfg.chase_disp_units and sd * f.accel < 0.3
-        )
-
-        # blended score (impulse-led; other components add or subtract conviction)
-        raw = (
-            0.30 * math.tanh(f.d_fast / 2.5)
-            + 0.15 * math.tanh(f.accel / 2.5)
-            + 0.20 * f.pressure
-            + 0.15 * f.breakout * (1.3 if f.compressed else 1.0)
-            + 0.10 * f.renewal
-            + 0.10 * math.tanh(f.d_slow / 4.0)
-        )
-        impulse_dir = 1 if f.d_fast > 0 else -1
-        if abs(f.d_fast) < cfg.min_impulse_units or impulse_dir * f.pressure < cfg.min_pressure:
-            raw *= 0.45       # no real one-sided displacement burst behind the reading
-        if f.expansion < 0.6:
-            raw *= 0.5        # dead / non-expanding market
-        if f.extended and (raw > 0) == (f.d_slow > 0):
-            raw *= 0.3        # do not chase stretched moves
-        f.score = max(-1.0, min(1.0, raw))
         f.ready = True
         f.reason = "ok"
         self.last = f
@@ -322,65 +263,6 @@ class MomentumEngine:
             if med > 0 and f.spread > cfg.spread_spike_ratio * med:
                 return False, f"spread spike ({f.spread / med:.1f}x median)"
         return True, "ok"
-
-    def signal(self, now: Optional[float] = None) -> Signal:
-        f = self.features(now)
-        cfg = self.cfg
-        if not f.ready:
-            return Signal("HOLD", 0.0, f.reason, f)
-        if f.tick_rate < cfg.min_tick_rate:
-            return Signal("HOLD", f.score, f"thin tick flow {f.tick_rate:.2f}/s", f)
-        ok, why = self.spread_ok(f)
-        if not ok:
-            return Signal("HOLD", f.score, why, f)
-        if abs(f.score) < cfg.entry_threshold:
-            return Signal("HOLD", f.score, "no momentum edge", f)
-        direction = 1 if f.score > 0 else -1
-        if f.extended and direction * f.d_slow > 0:
-            return Signal("HOLD", f.score, "move extended - not chasing", f)
-        tags = []
-        if f.breakout == direction:
-            tags.append("breakout")
-        if f.compressed and f.expansion > 1.2:
-            tags.append("compression->expansion")
-        if f.renewal == direction:
-            tags.append("pullback-renewal")
-        if direction * f.pressure > 0.5:
-            tags.append("pressure")
-        if direction * f.accel > 0.5:
-            tags.append("accel")
-        return Signal("BUY" if direction > 0 else "SELL", f.score, "+".join(tags) or "momentum", f)
-
-    def exit_decision(self, pos: "PositionState", f: Features, now: float) -> Optional[str]:
-        """Return a close reason or None. Uses executable price (bid for BUY, ask for SELL)."""
-        cfg = self.cfg
-        if not f.ready:
-            return None
-        d = 1 if pos.side == "BUY" else -1
-        px = f.bid if d > 0 else f.ask
-        vu = pos.entry_vu or f.vol_unit or self.point
-        profit_u = (px - pos.open_price) * d / vu
-        pos.peak_units = max(pos.peak_units, profit_u)
-        held = now - pos.open_time
-        if pos.peak_units >= cfg.profit_trigger_units and profit_u <= pos.peak_units * (1 - cfg.giveback_frac):
-            return f"profit lock (peak {pos.peak_units:.1f}u -> {profit_u:.1f}u)"
-        if profit_u >= cfg.weak_momentum_close_units and (
-            d * f.d_fast < -0.5 or (d * f.pressure < -0.4 and d * f.accel < 0)
-        ):
-            return f"momentum weakening (+{profit_u:.1f}u)"
-        if profit_u > 0.5 and d * f.zscore >= cfg.exhaustion_z and d * f.accel < 0:
-            return f"exhaustion take-profit (+{profit_u:.1f}u)"
-        if d * f.score <= -cfg.reversal_score:
-            return f"reversal (score {f.score:+.2f})"
-        # the spread is already inside profit_u (executable price): only react to loss beyond it
-        spread_u = (f.spread / vu) if vu else 0.0
-        if profit_u <= -(cfg.adverse_fade_units + spread_u) and d * f.d_fast < 0 and d * f.pressure < 0:
-            return f"adverse fade ({profit_u:+.1f}u, momentum against)"
-        if held >= cfg.max_hold_seconds:
-            return f"time stop {held:.0f}s ({profit_u:+.1f}u)"
-        if held >= cfg.max_hold_seconds / 2 and profit_u <= -cfg.stale_loss_units:
-            return f"setup invalid ({profit_u:+.1f}u)"
-        return None
 
 
 @dataclass

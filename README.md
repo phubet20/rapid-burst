@@ -47,40 +47,88 @@ Oracle Cloud Always Free and Google Cloud free tiers have no free Windows. AWS/A
 Windows VM for a limited period with a card on file (1 GB RAM is tight for MT5) – the same installer works
 there; nothing in this repo buys or starts cloud resources.
 
-## Trading engine (worker/rapidburst/engine.py)
-Per symbol, on every new tick (pulled with `copy_ticks_from`), normalised by a short-term volatility unit:
-displacement (3 s / 15 s), velocity and acceleration, tick-direction + magnitude pressure, micro-breakout of
-the 20 s structure, compression→expansion, exhaustion (z-score vs 60 s mean with deceleration),
-pullback-and-renewal inside a 30 s trend, spread/volatility/tick-rate quality. These blend into one score
-in [-1, 1] (no RSI, no fixed confirmation chain); BUY/SELL when |score| ≥ 0.60 and a real one-sided impulse
-(≥ 3 vol units with pressure) is present, HOLD otherwise. Extended/stalling moves are not chased.
+## Trading engine: ONE Rapid Micro-Burst Scalping Engine (worker/rapidburst/microburst.py)
 
-Exits (checked every loop, ~150 ms): profit lock with give-back from peak, momentum weakening while in
-profit, exhaustion take-profit, reversal score, time stop, setup invalid; plus a mandatory server-side SL
-(and a wide backstop TP) on every order.
+There is exactly one signal/entry/exit system. The old momentum score, the M1 impulse detectors, the
+burst-batch / basket / scalp modes, their fixed TPs and separate exit stacks were removed (no RSI, no
+lagging oscillator, no fixed confirmation chain, no waiting for the candle close).
 
-## Risk & execution (risk.py, trader.py, broker_mt5.py)
-* Size from SL distance: `risk_per_trade_pct` (0.25 % equity) via `trade_tick_value_loss/trade_tick_size`,
-  floored to `volume_step`, clamped to `volume_min/max` and `max_lot_per_order`.
-* `order_check` before every `order_send`; filling mode from `symbol_info.filling_mode` (FOK→IOC→RETURN);
-  `deviation` slippage cap; requote retry with fresh price; timeouts verified on the server before any retry.
-* Max positions (4 total / 2 per symbol), max total lots, max open SL risk (1 % equity), margin checks.
-* Adds only when every existing leg is in profit and momentum is stronger (no martingale/averaging/grid),
-  no hedging, cooldowns, entries/minute cap, loss-streak pause, in-flight lock (duplicate prevention).
-* Daily loss limit (3 % of day-start balance, bot P/L) and equity drawdown stop (5 % from day peak) → halt +
-  flatten bot positions for the rest of the broker day.
-* Only touches orders/positions with its magic number (26112201). Manual trades and other EAs are ignored;
-  on netting accounts it will not trade a symbol that already has someone else's position.
-* STOP: blocks entries, cancels bot pending orders, closes bot positions and verifies each close; retries
-  each loop if any close could not be verified.
-* Recovery: state in `data/state.json`; after a crash/reboot the worker reconnects, re-adopts bot positions by
-  magic, and resumes only if it was running and validation passes. Server-side SL protects positions while
-  disconnected. Watchdog restarts a stalled process.
-* LIVE accounts are refused unless the worker machine sets `RB_ALLOW_LIVE=I_UNDERSTAND_LIVE_RISK`
-  (never from the UI, never automatic).
+Loop (every ~0.1 s, per selected symbol): real ticks -> analysis -> BUY/SELL strength -> validation & risk
+-> entry -> tick-by-tick management -> exit -> position verification -> next scan.
 
-All parameters: `worker/rapidburst/config.py` (override with a JSON file via `RB_CONFIG_FILE`).
-Defaults are conservative and **not yet calibrated on real ticks** – run on DEMO first.
+**Analysis from real ticks** (bid/ask/time only):
+* A. tick flow: tick rate vs its 60 s baseline, same-direction tick runs/consistency, velocity and
+  acceleration (in M1-ATR units), directional efficiency, short burst size vs the typical move;
+* B. tick activity = number of quotes the broker sent. It is **not** exchange volume and is never shown or
+  used as "real volume"; absorption = activity up while price does not move;
+* C. live (unfinished) M1 candle: body/range, wicks, close location, range expansion vs previous broker
+  candles, consecutive candles, abnormal bars, wick rejection;
+* D. micro structure (20 s): breakout, failed breakout, structure break, compression -> expansion;
+* E. pullback depth, continuation, weak return and **anti-chase** (distance from the recent swing, live
+  candle body already travelled);
+* F. pressure **proxies**: up- vs down-ticks and bid/ask up vs down changes. Market depth is not used:
+  neither TickerAll nor the MT5 bridge gives a reliable book, the UI says "n/a";
+* G. context: spread vs its median, spread vs the capture target, slippage history, tick latency and
+  gaps (feed stability), regime = fast / normal / quiet / chop.
+
+**Strength**: each signal family is scored 0..1 for BUY and for SELL, weighted by regime, minus penalties
+(chasing, opposite wick, exhaustion). A side trades only when its strength >= an adaptive threshold
+(0.55 base; higher in quiet/chop markets, with a wide spread or bad slippage; lower in fast markets),
+beats the other side by 0.12, has >= 3 independent supporting families, live velocity in that direction,
+a stable feed and no veto. Big-bar-only, volume-only or candle-only entries are impossible by design.
+Trend (M1/M5 from broker bars) is shown as context only.
+
+**Entry** (inside the bar, no candle-close wait): side chosen automatically; anti-chase (> 0.9 ATR from the
+swing or a live candle body > 1.0 ATR in that direction = no entry; 1.3x in a fast regime);
+duplicate prevention (the same burst, identified by its swing origin, and the same tick are never traded
+twice); spread / tick-rate / slippage / execution-failure gates; timing by speed (fast and normal markets
+enter at once, slow markets need 0.4 s of persistence). More orders in the same group only when
+justified: same side, strength >= threshold + 0.10, group already in net profit, not in quiet/chop, spaced
+by market speed, max 3 orders per group, **each add the same lot as the first order** (no martingale, no
+averaging down, no grid).
+
+**Exit** (one system, evaluated tick by tick, never slowed by confirmations):
+1. hard risk first (always wins): risk halt (daily loss / drawdown), broker-stop / locked-stop mirror,
+   hard stop mirror, group loss cap, exposure breach, emergency (no fresh price), execution failure;
+2. profit capture net of costs: target = max(0.20 x M1 ATR, 2 x spread) (min 0.3 x spread net);
+   take it at 2x target at once, at target on velocity decay / tick flip / opposing pressure / stall,
+   or on a 40 % give-back from the peak;
+3. micro-reversal: failed breakout, micro structure break, wick rejection + tick flip, opposite strength
+   above the threshold;
+4. no follow-through within ~4 s (scaled by regime), momentum against beyond half the stop, stale after 120 s
+   without net profit. The whole group closes together.
+
+Broker SL on every order: max(0.8 x M1 ATR, 4 x spread, broker stop level); no broker TP (exits are
+engine-driven); the SL moves to breakeven+ and trails (max(0.15 x ATR, 1 x spread)) while in profit.
+
+## Risk & execution (risk.py, trader.py, broker_mt5.py / broker_tickerall.py)
+Defaults (all in `worker/rapidburst/config.py`, overridable by env / `RB_CONFIG_JSON`):
+* risk per order 0.5 % of equity (SL distance x tick value; min-lot floor for tiny accounts) –
+  `RB_RISK_PER_TRADE_PCT`;
+* total open risk <= 3 % of equity (`RB_MAX_TOTAL_RISK_PCT`); 1.5x breach closes the newest group;
+* **margin use cap 50 % of equity** (`RB_MAX_MARGIN_USE_PCT`) and min margin level 200 % – the earlier
+  100 % margin setting was replaced by this risk-based cap;
+* max 3 orders per group (`RB_MAX_ORDERS_PER_GROUP`), 3 per symbol, 6 in total, 2.0 lots total, max
+  1.0 lot per order, exposure <= 500x equity notional;
+* group loss cap 2 % of equity (`RB_GROUP_LOSS_PCT`, never inside 3x the spread cost);
+* **daily loss limit 5 %** (`RB_DAILY_LOSS_PCT`) and **equity drawdown stop 8 %** from the day peak
+  (`RB_MAX_DD_PCT`) -> halt + flatten bot positions for the rest of the day (0 disables – not
+  recommended);
+* execution protection: 3 rejected opens within 60 s pause the symbol 60 s; 5 failed close attempts halt new entries;
+  15 s without a fresh price = emergency exit (REST quote used first when the stream lags);
+* pacing: 1 s cooldown (2 s after a loss), 30 entries/min, 4 losses in a row pause the symbol 30 s,
+  never size up after a losing group.
+* `order_check` before every send where the broker supports it; filling mode from the symbol; deviation
+  cap; timeouts verified on the server before any retry; only the bot's magic number (26112201) is ever
+  touched – manual trades and other EAs are ignored; netting accounts are not traded on a symbol that
+  already has someone else's position.
+* STOP blocks entries and closes every bot position, verifying each close (retried each loop).
+* Recovery: bot positions are re-adopted by magic after a restart and managed by the same engine; trading
+  only resumes on an explicit START. LIVE accounts are refused unless the worker sets
+  `RB_ALLOW_LIVE=I_UNDERSTAND_LIVE_RISK` (never from the UI, never automatic).
+
+Defaults are a starting point, **not calibrated on enough real ticks** – run on DEMO first. No profit
+guarantee.
 
 ## Security
 * UI: access password (`UI_PASSWORD` env on Render) → HMAC-signed HttpOnly/Secure/SameSite=Strict cookie,
@@ -156,144 +204,16 @@ Limits to know (honest):
   "tick value unknown"), volume min/step/max, slippage in volatility units, per-symbol position
   limits and a total notional cap (`max_total_notional_x`).
 
-## Burst batches, small accounts and the trend filter
-
-**M1 impulse entries.** Every loop (0.15 s) the engine checks whether the current M1 bar is starting
-to surge, from real tick order flow: 3 s velocity vs the M1 ATR (from broker M1 bars), up-ticks vs
-down-ticks over 5 s, the bar's expansion vs ATR, the move vs the spread, not decelerating and not
-already exhausted. On an impulse it enters at once in the surge direction (1 order; 2 on a very
-strong impulse when the equity tier allows). The main trend is a bias only: a counter-trend impulse
-needs strength >= 0.70 and opens a single order. The older momentum score remains as a fallback.
-
-**Broker SL on every order (default, `RB_BROKER_SL=1`).** Initial SL = max(broker stop level,
-2 x spread, 0.5 x M1 ATR). When the trade runs in our favour the SL is moved to breakeven+
-(open + 0.3 x spread) and then trailed (max(0.25 x ATR, 1 x spread)) on the broker via TickerAll
-`PATCH /positions/{ticket}` (at most once per second per position; never backwards). A software
-mirror of every level is kept, so if the broker refuses a modify the engine still closes at that
-level. Wrong way: no follow-through within 6 s, or 0.6 x SL against with momentum against -> cut
-at once. Right way: the trailing SL governs (early profit exits are suppressed once the SL is
-locked); a short take-profit at 0.6 x ATR closes the burst, and the next impulse re-opens.
-Pyramiding adds one order at a time only while every open order's SL is locked in profit, never
-against the trend, at most N adds per burst (N = equity tier) and within the notional cap.
-No martingale: after a losing burst the lot can never be larger until a winning burst.
-Software backup stop at 1.3 x the SL distance and the per-burst loss cap stay active.
-
-**Daily-loss / drawdown halts: OFF by default (user choice).** Re-enable with
-`RB_DAILY_LOSS_PCT=20` / `RB_MAX_DD_PCT=30` on the server. Margin check, notional cap,
-per-order SL and per-burst loss caps always stay on.
-
-**Burst batch.** On a strong momentum score the engine opens 2-5 same-direction market
-orders that share a batch id (count scales with |score| from `entry_threshold` to
-`batch_full_score`; every leg is re-checked by the risk guard and the batch is cut short at
-the first refusal). Every leg has its own server-side SL. The whole batch is closed together on:
-batch target (`batch_tp_units` vol units, measured at the executable bid/ask so the spread is
-already paid), momentum fade, reversal, or time stop (`batch_max_hold_seconds`). After a batch is
-flat there is a `batch_cooldown_seconds` pause. No martingale, no grid, never adds to a losing
-position, never opens against an open batch. Lots compound with equity through `risk_per_trade_pct`.
-
-**Any equity, no minimum balance.** When the risk-based lot is below the broker minimum the bot
-trades the broker minimum lot instead of skipping on risk % (the engine hard-close, batch loss cap
-and the 20% daily-loss / 30% drawdown kill-switch still bound the loss; optional
-`small_account_max_loss_pct` > 0 re-adds a per-order cap). The only skip is **insufficient free
-margin for the minimum lot** (the broker would reject it) - shown clearly in the app. Orders per
-batch scale with equity (`batch_tiers`, default below $5: 1, $5-20: 2, $20-50: 3, $50-200: 4, above:
-`batch_max`; pyramiding may add one more into a winning, trend-aligned batch). Lots grow
-automatically with equity through `risk_per_trade_pct`.
-Example (Exness BTCUSDm, $10): spread ~$6.4, hard-close ~$20-30 -> 0.01 lot risks $0.20-0.30 (2-3%).
-
-**Trend filter.** Every 60 s the engine fetches real M1 (45 min) and M5 (90 min) bars from the
-broker (TickerAll `GET /v1/accounts/{id}/candles`, or MT5 `copy_rates_from_pos`) and computes
-trend direction + strength from M1 regression slope, M1 EMA(8/21) gap and M5 slope, each
-normalised by the average bar range. With-trend (or flat) signals open a full batch; a
-counter-trend signal needs |score| >= `countertrend_min_score` (0.85) and opens a single order
-at half risk; adding to an open batch (pyramiding) happens only when the trend is aligned and every
-leg is in profit. If no bars are available the trend shows "unknown" and is treated as neutral.
-
-**Why no trade?** Each symbol keeps counters of skip reasons (sampled once per second: warming
-up, no momentum edge, spread filter, sizing refused, counter-trend filter, cooldown, risk cap ...),
-shown in the Engine card together with the recent decisions and the active limits; a
-`WHY NO TRADE (last 60s)` summary is written to the log every minute while running.
-
-**Changing limits server-side.** Set `RB_CONFIG_JSON` on the Render service (or a JSON file via
-`RB_CONFIG_FILE`), e.g. `{"small_account_max_loss_pct": 3, "batch_max": 3, "daily_loss_limit_pct": 10}`.
-The UI cannot change risk limits.
-
-## Scalp mode (DEFAULT): early entry, many small orders, exit on reversal
-
-Replaces the basket/hold mode as the default (`RB_BASKET_ENABLED=1` still turns the basket mode on; `RB_SCALP_ENABLED=0`
-returns to the older burst logic). Demo only, bot positions only, no change to any security rule.
-
-- **Early entry** (`impulse.detect_early`): tick velocity over the last 1.5 s must be fast **and accelerating**, one-sided
-  order flow (>= 0.4), a real but small move since its start (>= 1x spread), all inside the first seconds of the push.
-- **Anti-chase**: refused when price is already more than `RB_SCALP_MAX_BAR_ATR` (0.6) M1-ATR from the M1 bar open, or more
-  than `RB_SCALP_MAX_SWING_ATR` (0.7) ATR from the 20 s swing, or the velocity is decelerating.
-- **Many small orders**: up to `RB_SCALP_MAX_ORDERS` (20) orders of the SAME lot (multiplier 1.0, no martingale, never
-  averaging into a loser), at least `RB_SCALP_ADD_INTERVAL` (1 s) apart, only while a same-direction early impulse continues.
-  The lot is sized so 20 orders fill the margin cap and compounds with equity. Total used margin <= `RB_MAX_MARGIN_USE_PCT`
-  (default **100**) of equity from the broker's own numbers, and free margin must stay >= `RB_SCALP_MIN_FREE_MARGIN_PCT` (3%)
-  of equity after each order, so orders are not rejected near stop-out.
-- **Exits**: a losing group is **held until it is in profit**, then closed: each order has a quick fixed TP
-  (max(0.25 ATR, 2x spread)); the whole group closes the moment the bar's force reverses while in profit (velocity flips,
-  velocity decays with opposing pressure, or a wick forms against). BE+/trailing stays. There is **no time stop** and **no
-  fast loss cut** by default (`RB_SCALP_WRONG_WAY_S`, `RB_SCALP_MAX_HOLD_S`, `RB_SCALP_CUT_SPREAD`, `RB_SCALP_CUT_ATR`; 0 = off).
-  Emergency only: far broker SL (8 ATR) and group loss stop 10% of equity (`RB_SCALP_GROUP_LOSS_PCT`). No averaging-down:
-  adds only fire on a continuing early impulse and never when price is already against the last order.
-- UI: *Scalp* panel (orders, floating P/L, margin used vs cap, live reversal flags). The learner keeps recording every group.
-
-High risk: a losing group can be held until the 10% group stop or the far 8-ATR broker SL; up to ~97% of equity can be in margin across 20 orders; a gap through the far SL can lose a large part of the account.
-
-## Basket mode: averaging, pyramiding, compounding (aggressive - user-accepted risk, DEMO)
-
-Default OFF (`RB_BASKET_ENABLED=1` turns it on). All orders of a symbol/direction
-form ONE basket:
-
-- **Entry**: the M1 impulse / momentum signal opens the first order. Further orders: **averaging** when price moves
-  `basket_avg_atr` (1.0) M1-ATR against the last order, **pyramiding** when it moves `basket_pyr_atr` (0.6) ATR in favour
-  and a same-direction impulse confirms (never against the trend). Same lot (`basket_avg_mult` = 1.0, no martingale),
-  `basket_add_cooldown` 3 s apart, at most `basket_max_orders` (8).
-- **Margin-use cap (70%)**: `RB_MAX_MARGIN_USE_PCT=70` - an order is refused when total used margin would exceed 70% of
-  equity (the lot is shrunk to fit first); adds also stop while margin level < 150%. This caps order count and size.
-- **Compounding**: the base lot follows the balance (first order loses `basket_risk_pct`=3% of balance at its broker SL,
-  limited so a full basket fits the margin cap); it grows as the balance grows.
-- **Exits** (whole basket together): closes at the profit target (`basket_target_pct` 2% of equity at basket start,
-  never below 3x the spread cost), then the **profit is trailed** (closes when it gives back 30% of its peak, floor 50% of
-  target). **Basket loss stop** `RB_BASKET_MAX_LOSS_PCT=30` (% of equity at basket start) - NOT 70% (70% is margin use).
-  No wrong-way cut, no tight initial SL, no per-order BE/trailing; each order has only a far broker SL
-  (`basket_sl_atr` 10 x M1 ATR) as a disaster stop.
-- The learner still records each closed basket (cold-start min-lot sizing no longer applies to baskets; a losing bucket
-  still blocks new baskets). UI: *Baskets* panel (floating P/L, target, trail floor, loss stop, margin used vs cap).
-
-This is high risk: averaging into a trend can reach the 30% loss stop or the far broker SL.
-
 ## Adaptive learning from real closed trades (learner.py)
 
-* Every fully closed bot burst is written to a journal (`learning.json` in the engine data dir):
-  symbol, side, signal type (impulse / momentum), component scores (score, impulse strength, tick
-  pressure, velocity, breakout, trend), trend relation, spread/ATR regime (tight / mid / wide), UTC
-  hour, hold time, exit reason, P/L and P/L in R (realised P/L / risk at open).
-* Bucket = signal type x trend relation x spread/ATR regime. Stats are time-decayed (half-life
-  `learn_half_life_hours`, 36 h) and shrunk toward a slightly negative prior, outliers clipped to +/-3R.
-* Cold start (fewer than `learn_min_samples`, 8, trades in a bucket): MIN LOT only and a 40% faster
-  wrong-way cut. Losing buckets (shrunk expectancy < -0.15R) are skipped via a Thompson-style gate and
-  come back to exploration as old results decay. Only buckets whose expectancy is positive beyond one
-  standard error get normal risk sizing x a multiplier (1..`learn_max_mult`, 2). The no-martingale
-  cap still applies after a losing burst.
-* UI: "Learning" panel with trades learned, best/worst buckets (n, win rate, expectancy) and the
-  current gate / size multiplier per symbol. `RB_LEARNING_ENABLED=false` turns it off.
-* Persistence limit: Render free has no persistent disk and TickerAll history carries no order
-  comment / magic, so the journal survives STOP/START and engine restarts but is reset by a redeploy
-  or a Render instance restart (it then starts cold again at min lot). No guarantee of profit or of a
-  smooth equity curve: the learner only re-weights what real trades have shown so far.
-
-## Speed settings (second-by-second entries)
-
-Warm-up 2.5 s / 4 ticks (vol scale seeded from TickerAll M1 candles, tick rate measured over the real
-span), entry cooldown 1.5 s, after a loss 2 s, after a closed batch 2 s, up to 30 entries/minute,
-entry threshold 0.42, loop every 0.1 s. Entries are evaluated on every loop. The slippage pause only
-counts fills of the last 90 s (it used to stick until the next fill), and a losing streak pauses a
-symbol for 20 s (was 10 min). Kept: broker SL at open, BE+/trail, fast wrong-way cut, learner
-cold start at min lot, no martingale, idempotency. A PRICE MISMATCH warning is logged when the engine's
-tick price differs from the broker's own position price by more than 4x spread.
+* Every fully closed group is journaled (`learning.json`): symbol, side, regime, strength components,
+  spread/ATR regime, UTC hour, hold time, exit reason, P/L and P/L in R (realised / risk at open).
+* Bucket = `micro | market regime | spread-ATR regime`. Stats are time-decayed (half-life 36 h) and shrunk
+  toward a slightly negative prior; outliers clipped to +/-3R.
+* Cold start (< 8 trades in a bucket): min lot only. Losing buckets are skipped (with the reason shown) and
+  re-explored as old results decay; only buckets with proven positive expectancy may size up, capped at
+  1.5x and never above the risk caps. `RB_LEARNING_ENABLED=false` turns it off.
+* Render free has no persistent disk: the journal survives STOP/START but a redeploy resets it.
 
 ## Path to a LIVE account (not enabled)
 

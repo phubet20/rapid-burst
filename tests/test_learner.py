@@ -7,8 +7,8 @@ import random
 from rapidburst.config import EngineConfig
 from rapidburst.learner import Learner, regime
 from tests.harness import make, run
-from tests.test_burst import _small_account, _start
-from tests.test_impulse import T0, trend_then_pullback
+from tests.paths import _small_account, _start
+from tests.paths import T0, trend_then_pullback
 
 NOW = 1_800_000_000.0
 
@@ -80,7 +80,7 @@ def test_trader_cold_start_min_lot_journals_closed_bursts(tmp_path):
     j = tr.learner.journal[0]
     for k in ("symbol", "side", "bucket", "type", "rel", "regime", "hour", "comps", "hold_s", "exit", "pl", "r"):
         assert k in j, k
-    for k in ("impulse", "pressure", "vel", "breakout", "trend", "spread_atr"):
+    for k in ("velocity", "accel", "efficiency", "sequence", "candle", "structure", "flow"):
         assert k in j["comps"], k
     snap = json.loads(json.dumps(tr.get_snapshot()))
     learn = snap["engine"]["learning"]
@@ -93,10 +93,9 @@ def test_trader_skips_a_disabled_bucket_with_visible_reason(tmp_path):
     cfg = EngineConfig()
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=1.0)
-    for t in ("impulse", "momentum"):
-        for rel in ("aligned", "neutral", "counter", "unknown"):
-            for reg in ("tight", "mid", "wide", "unknown"):
-                _feed(tr.learner, f"{t}|{rel}|{reg}", [-1.0] * 15, now=__import__("time").time())
+    for rel in ("fast", "normal", "quiet", "chop"):
+        for reg in ("tight", "mid", "wide", "unknown"):
+            _feed(tr.learner, f"micro|{rel}|{reg}", [-1.0] * 15, now=T0)
     tr.decisions = collections.deque(maxlen=10_000)
     _start(tr, br, T0 + 1)
     run(tr, br, T0 + 1, T0 + 200)

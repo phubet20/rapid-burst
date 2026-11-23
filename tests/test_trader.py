@@ -160,12 +160,23 @@ def test_disconnect_pauses_and_reconnects(tmp_path):
 
 
 def test_daily_loss_limit_halts_and_flattens(tmp_path):
-    cfg = EngineConfig(daily_loss_limit_pct=0.05)   # $5 on a $10k test account
-    # pure noise (no momentum bursts) + slippage: the engine should lose here, and the limit must stop it
-    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 7200, burst_every=1e9)}, cfg, slippage_pts=5)
+    from tests.paths import _force_signal
+    cfg = EngineConfig(daily_loss_limit_pct=0.01)   # $1 on a $10k test account
+    # pure noise + slippage and a FORCED entry signal (test only): losses must trip the daily limit
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 1800, burst_every=1e9)}, cfg, slippage_pts=5)
     assert connect_and_start(tr, br, T0 + 1)["ok"]
-    run(tr, br, T0 + 1, T0 + 7200)
-    assert tr.risk.halted and "daily loss" in tr.risk.halt_reason
+    _force_signal(tr, "BUY", origin=0.0)
+    real = tr._micro
+    k = [0]
+
+    def fresh(s, now_wall):            # new burst identity every call so duplicate prevention lets it trade
+        m, st = real(s, now_wall)
+        k[0] += 1
+        st.origin = float(k[0])
+        return m, st
+    tr._micro = fresh
+    run(tr, br, T0 + 1, T0 + 1800)
+    assert tr.risk.halted and "daily loss" in tr.risk.halt_reason, (tr.risk.halt_reason, tr.daily_realized)
     assert not [p for p in br.positions_.values() if p["magic"] == cfg.magic]
     assert not tr.cmd_start()["ok"]
 
