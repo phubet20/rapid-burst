@@ -103,6 +103,7 @@ class TickerAllBroker:
         self._specs: dict[str, dict] = {}
         self._spec_rows: Optional[dict] = None
         self._live_at: dict[str, float] = {}
+        self._meta: dict[str, tuple] = {}            # symbol -> (worker receipt wall time, broker tick UTC time)
         self._symbols: Optional[list] = None
         self._watched: set[str] = set()
         self._ticks: dict[str, deque] = {}
@@ -478,8 +479,11 @@ class TickerAllBroker:
         bid, ask = _f(msg.get("bid")), _f(msg.get("ask"))
         if not s or bid <= 0 or ask <= 0 or msg.get("stale"):
             return
-        self._live_at[s] = time.time()
-        t = _iso_to_epoch(msg.get("timestamp")) or time.time()
+        now = time.time()
+        self._live_at[s] = now
+        src = _iso_to_epoch(msg.get("timestamp"))
+        t = src or now
+        self._meta[s] = (now, src)
         msc = int(round((t + self._srv_off) * 1000))   # broker server time, like MT5 time_msc
         buf = self._ticks.setdefault(s, deque(maxlen=5000))
         if buf and msc <= buf[-1][3]:
@@ -523,8 +527,25 @@ class TickerAllBroker:
         buf = self._ticks.get(symbol)
         if not buf:
             return []
-        out = [t for t in list(buf) if t[3] > last_msc]
-        return out[-max_count:]
+        if buf[-1][3] <= last_msc:          # nothing new: O(1), no copy of the 5000-tick buffer
+            return []
+        out = []
+        for t in reversed(buf):             # walk back only over the new ticks
+            if t[3] <= last_msc or len(out) >= max_count:
+                break
+            out.append(t)
+        out.reverse()
+        return out
+
+    def tick_meta(self, symbol: str) -> dict:
+        """Receipt time of the latest WS tick and broker->worker feed delay (clock-skew sensitive, so only
+        reported when it is plausible: 0..10 s)."""
+        m = self._meta.get(symbol)
+        if not m:
+            return {}
+        recv, src = m
+        feed = (recv - src) * 1000.0 if src else None
+        return {"recv": recv, "feed_ms": round(feed, 1) if feed is not None and 0.0 <= feed <= 10000.0 else None}
 
     def candles(self, symbol: str, timeframe: str = "M1", hours: float = 0.5) -> list[dict]:
         """Real broker OHLC bars (oldest -> newest); [] when unavailable (never synthesised)."""

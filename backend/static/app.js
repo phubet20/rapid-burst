@@ -67,8 +67,8 @@
     const mode = (acct && acct.mode) || (!acct && lc && lc.account && lc.account.mode) || null;
     badge($("bMode"), mode ? (mode === "REAL" ? "LIVE" : mode) : "NO ACCOUNT", mode === "DEMO" ? "ok" : mode ? "live" : "");
     const phase = L.phase || (eng.running ? "RUNNING" : "IDLE");
-    const engTxt = !online ? "ENGINE —" : eng.halted ? "HALTED" : phase === "IDLE" ? "ENGINE OFF" : phase;
-    badge($("bEngine"), engTxt, eng.halted ? "bad" : phase === "RUNNING" ? "ok" : "warn");
+    const engTxt = !online ? "ENGINE —" : eng.halted ? "SAFE MODE" : phase === "IDLE" ? "ENGINE OFF" : phase;
+    badge($("bEngine"), engTxt, eng.halted ? "warn" : phase === "RUNNING" ? "ok" : "warn");
 
     const ka = (S.cloud || {}).keepalive || {};
     const cloudNote = cloud ? ` · cloud (TickerAll)${(S.cloud || {}).api_key_set ? "" : " · TICKERALL_API_KEY NOT SET"}${ka.active ? ` · keep-awake ON (${ka.pings_ok || 0} pings)` : ""}` : "";
@@ -89,7 +89,7 @@
 
     const liveOk = conn.state === "CONNECTED" && val.ok;
     const storedOk = L.has_credentials && lc && lc.validation_ok;
-    const canStart = online && (eng.selected || []).length > 0 && (liveOk || storedOk) && !eng.running && !eng.halted && !eng.blocked &&
+    const canStart = online && (eng.selected || []).length > 0 && (liveOk || storedOk) && !eng.running && !eng.blocked &&
       !["STARTING", "RUNNING", "STOPPING"].includes(phase);
     $("btnStart").disabled = !canStart;
     const why = [];
@@ -98,7 +98,6 @@
       if (cloud && !(S.cloud || {}).api_key_set) why.push("TICKERALL_API_KEY is not set on Render (Render -> rapid-burst -> Environment).");
       if (eng.running || ["STARTING", "RUNNING"].includes(phase)) why.push("The engine is already running (use STOP first).");
       if (phase === "STOPPING") why.push("STOP is still in progress.");
-      if (eng.halted) why.push("Risk halt for today: " + (eng.halt_reason || "limit reached") + ".");
       if (eng.blocked) why.push("Blocked: " + eng.blocked);
       if (!(eng.selected || []).length && !eng.running) why.push("No symbol selected - CONNECT MT5, then search in Symbols, tick the assets you want (up to 6) and press APPLY.");
       if (!liveOk && !storedOk && !eng.running) {
@@ -151,21 +150,29 @@
       const sg = v.strength || {};
       const bar = (x, c) => `<span class="${c}">${x == null ? "—" : fmt(x, 2)}</span>`;
       const sgHtml = sg.threshold != null ? `<div class="tiny">strength BUY ${bar(sg.buy, "pos-v")} · SELL ${bar(sg.sell, "neg-v")} · need ≥ ${fmt(sg.threshold, 2)} · regime <b>${esc(sg.regime || "—")}</b>` +
-        (sg.support ? ` · supporting families B${sg.support.BUY ?? 0}/S${sg.support.SELL ?? 0}` : "") +
+        (sg.scan ? ` · scanners BUY A${fmt(sg.scan.BUY?.A, 2)} B${fmt(sg.scan.BUY?.B, 2)} C${fmt(sg.scan.BUY?.C, 2)} / SELL A${fmt(sg.scan.SELL?.A, 2)} B${fmt(sg.scan.SELL?.B, 2)} C${fmt(sg.scan.SELL?.C, 2)}` : "") +
         (sg.vetoes && sg.vetoes.length ? ` · <span class="neg-v">${esc(sg.vetoes.join("; "))}</span>` : "") + `</div>` : "";
       return `<div class="eng"><b>${esc(k)}</b>${mk}${trHtml} <span class="sig ${cls}">${esc(v.signal)}</span> · <b>${v.signal === "HOLD" ? "waiting for: " : ""}</b>${esc(v.reason)}` + sgHtml + sk +
-        `<div class="tiny muted">vel ${f.vel_atr ?? "—"} ATR · acc ${f.acc_atr ?? "—"} · eff ${f.eff ?? "—"} · burst ${f.burst_z ?? "—"}× · tick-activity ${f.act_x ?? "—"}× (count, not real volume) · up/down-tick proxy ${f.imb ?? "—"} · bid/ask proxy ${f.bidask ?? "—"} · candle body ${f.body_atr ?? "—"} ATR · chase ▲${f.chase_up ?? "—"}/▼${f.chase_dn ?? "—"} ATR · target ${f.target ?? "—"} · spread ${v.spread_pts ?? "—"}pt · ${f.tps ?? "—"} t/s · tick ${v.tick_age ?? "—"}s ago</div></div>`;
+        `<div class="tiny muted">vel ${f.vel_atr ?? "—"} ATR · acc ${f.acc_atr ?? "—"} · eff ${f.eff ?? "—"} · burst ${f.burst_z ?? "—"}× · tick-activity ${f.act_x ?? "—"}× (count, not real volume) · up/down-tick proxy ${f.imb ?? "—"} · bid/ask proxy ${f.bidask ?? "—"} · candle body ${f.body_atr ?? "—"} ATR · ${f.early ? '<span class="pos-v">pre-burst ' + (f.early > 0 ? "▲" : "▼") + "</span> · " : ""}${f.exhaust ? '<span class="neg-v">exhaustion</span> · ' : ""}${f.rebound ? "rebound " + (f.rebound > 0 ? "▲" : "▼") + " · " : ""}chase ▲${f.chase_up ?? "—"}/▼${f.chase_dn ?? "—"} ATR · target ${f.target ?? "—"} · spread ${v.spread_pts ?? "—"}pt · ${f.tps ?? "—"} t/s · tick ${v.tick_age ?? "—"}s ago</div></div>`;
     }).join("") : `<div class="muted small">${eng.halted ? esc(eng.halt_reason) : "Engine idle"}</div>`;
     const rc = eng.risk_config;
     if (rc) {
       const gs = Object.entries(eng.groups || {});
-      const rowG = ([k, x]) => `<div class="tiny"><b>${esc(x.symbol)} ${esc(x.side)}</b> group ${esc(k)} · ${x.orders}/${rc.max_orders_per_group} orders · ${fmt(x.volume, 2)} lots · ` +
+      const rowG = ([k, x]) => `<div class="tiny"><b>${esc(x.symbol)} ${esc(x.side)}</b> group ${esc(k)} · ${x.orders} order(s) (max ${rc.max_orders_per_batch}/batch) · ${fmt(x.volume, 2)} lots · ` +
         `net <b class="${x.money >= 0 ? "pos-v" : "neg-v"}">${x.money > 0 ? "+" : ""}${fmt(x.money)}</b> · peak ${x.peak_px ?? "—"} / target ${x.target_px ?? "—"} (price) · ${esc(x.regime || "")} · ${x.age_s ?? "—"}s</div>`;
-      $("engine").insertAdjacentHTML("beforeend", `<details class="small" open><summary>⚡ Rapid Micro-Burst engine: ${gs.length} open group(s) · margin used ${rc.margin_used ?? "—"} (${rc.margin_use_pct ?? "—"}% of equity, cap ${rc.max_margin_use_pct}%)${rc.exec_halt ? ' · <span class="neg-v">entries halted: close failures</span>' : ""}</summary>` +
-        (gs.length ? gs.map(rowG).join("") : `<div class="tiny muted">no open group - scanning live ticks for a fresh micro-burst</div>`) +
-        `<div class="tiny muted">One engine: live-tick strength (velocity, acceleration, efficiency, tick bursts, tick-activity, live candle, micro structure, pullback/continuation, up/down-tick &amp; bid/ask proxies) ≥ adaptive threshold ${rc.threshold} with ≥ ${rc.min_support} supporting families · anti-chase ≤ ${rc.max_chase_atr} ATR from the swing, candle ≤ ${rc.max_bar_atr} ATR · up to ${rc.max_orders_per_group} same-lot orders per group, adds only while the group is in net profit (no averaging down, no martingale, no grid).</div>` +
-        `<div class="tiny muted">Exit (one system, tick by tick): profit capture net of costs (target max(${rc.target_atr} ATR, ${rc.target_spread}× spread)), momentum decay / tick flip / opposing pressure, give-back, micro-reversal, failed breakout, no follow-through in ~${rc.follow_s}s, stale after ${rc.max_hold_s}s.</div>` +
-        `<div class="tiny muted rc">Hard risk (overrides everything): broker SL ${esc(rc.broker_sl)} (${esc(rc.sl_rule || "")}) · group loss ${rc.group_loss_pct}% of equity · risk/order ${rc.risk_per_trade_pct}% · open risk ≤ ${rc.max_total_risk_pct}% · exposure ≤ ${rc.max_total_notional_x}× equity · max ${rc.max_positions_total} positions (${rc.max_positions_per_symbol}/symbol) · daily loss ${rc.daily_loss_limit_pct ? rc.daily_loss_limit_pct + "%" : "OFF"} · drawdown ${rc.equity_drawdown_pct ? rc.equity_drawdown_pct + "%" : "OFF"} · ≥ ${rc.min_tick_rate} ticks/s · spread ≤ ${rc.max_spread_bps} bp. Depth: not available from this broker. No profit guarantee.</div></details>`);
+      const lt = eng.latency || {};
+      const q = (o) => o && o.p50 != null ? `${o.p50}/${o.p90}ms` : "—";
+      const latHtml = `<div class="tiny">⏱ Measured latency (p50/p90, real clocks, ${lt.entries || 0} order(s), ${lt.exits || 0} close(s)): tick→decision ${q(lt.tick_to_decision_ms)} · decision→send ${q(lt.decision_to_send_ms)} · send→ack ${q(lt.send_to_ack_ms)} · send→fill verified ${q(lt.send_to_fill_verified_ms)} · tick→fill ${q(lt.tick_to_fill_ms)} · feed (broker→worker) ${q(lt.feed_ms)} · close ${q(lt.close_ms)}${lt.entries ? "" : " · no orders yet - nothing measured"}</div>`;
+      const pf = eng.performance || {};
+      const pfHtml = pf.batches ? `<div class="tiny">📊 Real demo results this session (${esc(pf.source)}, after costs): ${pf.batches} batch(es) · win rate ${pf.win_rate}% · net ${pf.net > 0 ? "+" : ""}${fmt(pf.net)} · expectancy ${fmt(pf.expectancy)} · profit factor ${pf.profit_factor ?? "—"} · max drawdown ${fmt(pf.max_drawdown)}</div>`
+        : `<div class="tiny muted">📊 No closed demo batches yet - no results to show (nothing simulated here).</div>`;
+      const safeHtml = rc.safe_mode ? `<div class="tiny neg-v">🛡 ${esc(rc.safe_reason)} · resumes in ${rc.safe_resume_in_s ?? "—"}s (the bot keeps running)</div>`
+        : rc.probe_batches_left ? `<div class="tiny muted">🛡 after safe mode: next ${rc.probe_batches_left} batch(es) single min-lot</div>` : "";
+      $("engine").insertAdjacentHTML("beforeend", `<details class="small" open><summary>⚡ Pre-Burst Short Scalping engine: ${gs.length} open basket(s) · margin used ${rc.margin_used ?? "—"} (${rc.margin_use_pct ?? "—"}% of equity, cap ${rc.max_margin_use_pct}%)${rc.exec_halt ? ' · <span class="neg-v">entries halted: close failures</span>' : ""}</summary>` +
+        safeHtml + (gs.length ? gs.map(rowG).join("") : `<div class="tiny muted">no open basket - scanning live ticks for a move that is starting</div>`) + latHtml + pfHtml +
+        `<div class="tiny muted">One decision engine, three scanners on the same tick stream (incremental, O(1) per tick): A tick velocity/acceleration/efficiency/sequence · B tick-activity (count, not real volume) &amp; live candle pressure · C micro-structure trigger (compression→expansion, breakout, failed breakout, rebound). Entry needs strength ≥ adaptive threshold ${rc.threshold} AND scanner A ≥ ${rc.scan_support} AND (B or C) ≥ ${rc.scan_support}: no speed-only or volume-only entries; anti-chase ≤ ${rc.max_chase_atr} ATR, exhaustion veto. One batch per signal: up to ${rc.max_orders_per_batch} same-lot orders, batch risk ≤ ${rc.risk_per_batch_pct}% · ≤ ${rc.max_batch_lots} lots, rest cancelled if price runs past the edge; never added to later (no averaging down, no martingale, no grid).</div>` +
+        `<div class="tiny muted">Basket exit (net of costs, tick by tick): short target max(${rc.target_atr} ATR, ${rc.target_spread}× spread); at target it holds while momentum continues, give-back protection, exhaustion / tick reversal, failed breakout, no follow-through in ~${rc.follow_s}s, stale after ${rc.max_hold_s}s. Each close is verified; a closed ticket is never closed twice.</div>` +
+        `<div class="tiny muted rc">Hard risk (overrides everything): broker SL ${esc(rc.broker_sl)} (${esc(rc.sl_rule || "")}) · group loss ${rc.group_loss_pct}% of equity · risk/order ${rc.risk_per_trade_pct}% · open risk ≤ ${rc.max_total_risk_pct}% · exposure ≤ ${rc.max_total_notional_x}× equity · max ${rc.max_positions_total} positions (${rc.max_positions_per_symbol}/symbol) · no daily-loss all-day stop · equity drawdown ${rc.equity_drawdown_pct ? rc.equity_drawdown_pct + "% → SAFE MODE (flatten, pause " + Math.round(rc.safe_pause_s / 60) + "+ min, resume with min lot)" : "OFF"} · ≥ ${rc.min_tick_rate} ticks/s · spread ≤ ${rc.max_spread_bps} bp. Depth: not available from this broker. No profit guarantee.</div></details>`);
     }
     const lr = eng.learning;
     if (lr) {

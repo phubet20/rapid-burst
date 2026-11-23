@@ -4,7 +4,7 @@ import json
 
 from rapidburst.config import EngineConfig
 from rapidburst.engine import MomentumEngine
-from rapidburst.microburst import Micro, analyze, decide, exit_reason
+from rapidburst.microburst import Micro, decide, exit_reason
 from rapidburst.trend import compute_trend
 from tests.harness import Invariants, instrument, make, run
 from tests.paths import T0, _force_signal, _small_account, _start, series_up
@@ -21,7 +21,7 @@ def _analyze_stream(ticks, cfg=None, atr=1.0, after=None):
         if after is not None and t < after:
             continue
         f = eng.features(t)
-        m = analyze(list(eng.buf.ticks), t, atr, f.vol_unit, eng.spreads, [], cfg, [])
+        m = eng.scanner.snapshot(t, atr, f.vol_unit, [], cfg, [])
         out.append((t, m, decide(m, cfg)))
     return out
 
@@ -56,7 +56,10 @@ def test_random_market_trades_are_the_exception():
 def test_strength_is_two_sided_and_explains_itself():
     st = decide(_live(), EngineConfig())
     assert st.side == "BUY" and st.buy > st.threshold and st.sell < st.buy
-    assert st.support["BUY"] >= EngineConfig().mb_min_support and "micro-burst BUY" in st.reason
+    lvl = EngineConfig().mb_scan_support
+    assert st.scan["BUY"]["A"] >= lvl and max(st.scan["BUY"]["B"], st.scan["BUY"]["C"]) >= lvl
+    assert st.reason.startswith("BUY") and "A" in st.reason
+    assert "pre-burst" in decide(_live(early=1), EngineConfig()).reason
     st2 = decide(_live(vel=-0.5, accel=-0.3, eff=-0.8, seq_run=-5, seq_consist=-0.8, burst_dir=-1, body=-0.3,
                        close_loc=0.1, breakout=-1, imbalance=-0.7, bidask=-0.7, chase_up=0.0, chase_dn=0.3,
                        origin_dn=90.0), EngineConfig())
@@ -100,7 +103,13 @@ def test_exit_profit_capture_and_giveback():
     assert "2x target" in exit_reason(_g(), m, 1, 0.7, 2, 0.0, 0.5, 0.8, 0.0, cfg)
     r = exit_reason(_g(), _live(vel=0.05), 1, 0.35, 2, 0.0, 0.5, 0.8, 0.0, cfg)          # target + velocity decay
     assert r and r.startswith("profit capture"), r
-    r = exit_reason(_g(peak_pl=0.5), m, 1, 0.25, 2, 0.0, 0.5, 0.8, 0.0, cfg)             # gave back 50%
+    # momentum still running: a 50% pullback from the peak is NOT closed (no exit on tiny pullbacks)...
+    assert exit_reason(_g(peak_pl=0.5), m, 1, 0.25, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None
+    # ...but the same pullback with momentum fading is protected (give-back)
+    r = exit_reason(_g(peak_pl=0.5), _live(vel=0.1, vel_prev=0.3, accel=-0.2), 1, 0.25, 2, 0.0, 0.5, 0.8, 0.0, cfg)
+    assert r and "give-back" in r, r
+    # a deep give-back closes even while running
+    r = exit_reason(_g(peak_pl=0.5), m, 1, 0.18, 2, 0.0, 0.5, 0.8, 0.0, cfg)
     assert r and "give-back" in r, r
     assert exit_reason(_g(), m, 1, 0.2, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None              # running, below target
 
@@ -153,17 +162,21 @@ def test_loop_enters_the_burst_with_sl_no_tp_and_exits_the_group(tmp_path):
     assert exits and not br.positions_
 
 
-def test_adds_only_same_side_same_lot_capped_and_never_into_a_loser(tmp_path):
+def test_one_batch_per_signal_capped_same_lot_no_adds_later(tmp_path):
     tr, br, inv, orders = _session(tmp_path, series_up(), t_end=T0 + 260)
     groups = {}
     for o in orders:
         groups.setdefault(o["comment"].rsplit("-", 1)[0], []).append(o)
     cfg = EngineConfig()
+    assert groups
     for legs in groups.values():
-        assert len(legs) <= cfg.max_orders_per_group
+        assert len(legs) <= cfg.max_orders_per_batch
         assert len({o["side"] for o in legs}) == 1
-        assert all(o["vol"] <= legs[0]["vol"] + 1e-12 for o in legs)          # no martingale / no size-up
+        assert len({o["vol"] for o in legs}) == 1                              # same lot: no martingale
+        assert sum(o["vol"] for o in legs) <= cfg.max_batch_lots + 1e-9
+        assert max(o["t"] for o in legs) - min(o["t"] for o in legs) < 1e-6    # one loop: never added later
     assert inv.adds_into_loser == 0 and inv.max_pos <= cfg.max_positions_total
+    assert any(l["msg"].startswith("BATCH ") for l in tr.logs)
 
 
 def test_duplicate_burst_is_not_traded_twice(tmp_path):
@@ -204,26 +217,27 @@ def test_hard_risk_exit_overrides_the_micro_exit(tmp_path):
     assert any(l["msg"].startswith("EXIT GROUP") and "hard group loss" in l["msg"] for l in tr.logs)
 
 
-def test_daily_loss_and_drawdown_halts_are_on_by_default(monkeypatch):
+def test_no_daily_loss_halt_and_safe_mode_defaults(monkeypatch):
     for k in ("RB_DAILY_LOSS_PCT", "RB_MAX_DD_PCT", "RB_CONFIG_JSON"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("RB_DAILY_LOSS_PCT", "3")                    # stale env var: ignored
     c = EngineConfig.load()
-    assert c.daily_loss_limit_pct == 5.0 and c.equity_drawdown_pct == 8.0
+    assert not hasattr(c, "daily_loss_limit_pct") and c.equity_drawdown_pct == 8.0
     assert c.max_margin_use_pct == 50.0 and c.risk_per_trade_pct == 0.5 and c.max_total_risk_pct == 3.0
-    monkeypatch.setenv("RB_DAILY_LOSS_PCT", "3")
-    assert EngineConfig.load().daily_loss_limit_pct == 3.0
+    assert c.max_orders_per_batch == 3 and c.risk_per_batch_pct == 1.0
 
 
-def test_daily_loss_halt_flattens_and_blocks_entries(tmp_path):
+def test_safe_mode_flattens_pauses_entries_and_keeps_running(tmp_path):
     tr, br = make(tmp_path, {"BTCUSDm": series_up()})
     _small_account(br, balance=1000.0, margin_per_lot=100.0)
     _start(tr, br, T0 + 1)
     run(tr, br, T0 + 1, T0 + 151)
-    tr.risk.halted, tr.risk.halt_reason = True, "daily loss limit (test)"
+    tr.risk.halted, tr.risk.halt_reason, tr.risk.safe_until = True, "SAFE MODE: (test)", T0 + 10000
     n0 = len([l for l in tr.logs if l["msg"].startswith("ENTRY")])
     run(tr, br, T0 + 151.3, T0 + 200)
-    assert not br.positions_
+    assert not br.positions_ and tr.running
     assert len([l for l in tr.logs if l["msg"].startswith("ENTRY")]) == n0
+    assert "SAFE MODE" in tr.sym_status["BTCUSDm"]["reason"]
 
 
 def test_stop_flattens_bot_positions(tmp_path):
@@ -269,7 +283,9 @@ def test_snapshot_has_one_engine_view(tmp_path):
     e = tr.get_snapshot()["engine"]
     assert "groups" in e and "baskets" not in e and "scalp" not in e
     rc = e["risk_config"]
-    assert rc["engine"].startswith("Rapid Micro-Burst") and rc["broker_sl"] == "ON"
+    assert rc["engine"].startswith("Ultra-Fast Pre-Burst") and rc["broker_sl"] == "ON"
+    assert "daily_loss_limit_pct" not in rc and "latency" in e and "performance" in e
+    assert e["performance"]["source"] == "real broker deals"
     st = e["symbols"]["BTCUSDm"]
     assert "strength" in st and {"buy", "sell", "threshold"} <= set(st["strength"])
 

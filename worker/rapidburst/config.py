@@ -41,8 +41,7 @@ class EngineConfig:
     mb_min_velocity: float = 0.35     # the chosen side needs at least this much live velocity component
     mb_threshold: float = 0.55        # base strength threshold (adapted to regime, spread and slippage risk)
     mb_edge: float = 0.12             # chosen side must beat the other side by this much
-    mb_support_level: float = 0.35    # a signal family 'supports' when its component >= this
-    mb_min_support: int = 3           # independent families that must support the decision
+    mb_scan_support: float = 0.35     # a scanner (A/B/C) supports a side when its score >= this
     mb_max_chase_atr: float = 0.90    # RB_MB_MAX_CHASE_ATR: no entry if price is > x ATR from the recent swing
     mb_max_bar_atr: float = 1.00      # RB_MB_MAX_BAR_ATR: no entry if the live candle body is > x ATR in that direction
     mb_abnormal_range_atr: float = 1.5
@@ -51,16 +50,13 @@ class EngineConfig:
     mb_absorb_activity: float = 1.6   # activity >= x baseline while price stalls = absorption
     mb_max_gap_s: float = 5.0         # feed considered unstable above this gap
     mb_max_spread_target: float = 0.6 # spread must be < x * the capture target
-    # persistence needed before entering, by regime (entry timing adapts to market speed)
-    mb_persist_fast: float = 0.0
-    mb_persist_normal: float = 0.0
-    mb_persist_slow: float = 0.4
-    # exits (one mechanism)
+    # exits (one basket mechanism)
     mb_target_atr: float = 0.20       # adaptive capture target = max(x * ATR * regime factor, mb_target_spread * spread)
     mb_target_spread: float = 2.0
     mb_min_net_spread: float = 0.3    # profit exits need >= x * spread of NET profit
     mb_full_target_mult: float = 2.0  # close at once at x * target
-    mb_giveback: float = 0.40         # close when profit gives back x of its peak (peak >= half target)
+    mb_giveback: float = 0.40         # profit protection: close after giving back x of the peak (peak >= 0.6 target)
+    mb_giveback_running: float = 0.60 # ... while momentum is still running (no close on tiny pullbacks)
     mb_flip_atr: float = 0.02         # tick flip = velocity against >= x ATR (or half a spread)
     mb_decay_frac: float = 0.30       # velocity below x * its peak since entry = decay
     mb_opp_pressure: float = 0.40     # opposing tick / bid-ask proxy >= x
@@ -75,9 +71,12 @@ class EngineConfig:
     sl_atr: float = 0.8               # hard stop distance = max(x * M1 ATR, sl_spread_mult * spread, stops level)
     sl_spread_mult: float = 4.0
     soft_stop_mult: float = 1.15      # engine mirror of the hard stop (if the broker SL fails)
-    max_orders_per_group: int = 3     # RB_MAX_ORDERS_PER_GROUP: orders per symbol/direction group
-    add_interval: float = 1.0         # min seconds between orders of a group (scaled by market speed)
-    add_margin: float = 0.10          # an add needs strength >= threshold + x AND the group in net profit
+    # burst batch: ONE batch per signal, opened at once, same lot per order, never added to later
+    max_orders_per_batch: int = 3     # RB_MAX_ORDERS_PER_BATCH: orders in one batch (more only for stronger signals)
+    batch_step_strength: float = 0.08 # +1 order per x strength above the threshold (up to the cap)
+    risk_per_batch_pct: float = 1.0   # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
+    max_batch_lots: float = 1.0       # lots in one batch
+    batch_run_cancel_frac: float = 0.5  # cancel the rest of a batch if price ran > x * target from the decision
     group_cooldown_seconds: float = 1.0
     max_lot_per_order: float = 1.0
     max_positions_total: int = 6
@@ -89,9 +88,12 @@ class EngineConfig:
     min_margin_level_pct: float = 200.0
     margin_use_max_pct: float = 50.0  # one order may use <= x% of the free margin
     small_account_max_loss_pct: float = 0.0  # 0 = min lot always allowed (free margin permitting)
-    group_loss_pct: float = 2.0       # RB_GROUP_LOSS_PCT: hard exit when one group's floating loss >= x% equity
-    daily_loss_limit_pct: float = 5.0 # RB_DAILY_LOSS_PCT: bot daily P/L <= -x% of day-start balance => flatten + halt
-    equity_drawdown_pct: float = 8.0  # RB_MAX_DD_PCT: equity x% below the day's peak => flatten + halt
+    group_loss_pct: float = 2.0       # RB_GROUP_LOSS_PCT: hard exit when one basket's floating loss >= x% equity
+    # NO all-day daily-loss halt. Equity drawdown => SAFE MODE (flatten, pause new entries, resume reduced)
+    equity_drawdown_pct: float = 8.0  # RB_MAX_DD_PCT: equity x% below the session peak => safe mode (0 = off)
+    safe_pause_s: float = 300.0       # first safe-mode pause; doubles on each repeat in a session ...
+    safe_pause_max_s: float = 1800.0  # ... up to this
+    safe_probe_batches: int = 3       # after a pause: this many single min-lot batches before normal sizing
     emergency_stale_s: float = 15.0   # open positions and no fresh price for x s => emergency close
     exec_fail_max: int = 3            # entry rejects within 60 s before the symbol is paused
     exec_fail_pause_s: float = 60.0
@@ -143,10 +145,12 @@ class EngineConfig:
                 data.update(json.loads(raw))
             except ValueError:
                 pass
-        for env, key in (("RB_BROKER_SL", "broker_sl"), ("RB_DAILY_LOSS_PCT", "daily_loss_limit_pct"),
+        # (RB_DAILY_LOSS_PCT is no longer read: there is no all-day daily-loss halt)
+        for env, key in (("RB_BROKER_SL", "broker_sl"), ("RB_SAFE_PAUSE_S", "safe_pause_s"),
                          ("RB_MAX_DD_PCT", "equity_drawdown_pct"), ("RB_LEARNING_ENABLED", "learning_enabled"),
                          ("RB_RISK_PER_TRADE_PCT", "risk_per_trade_pct"), ("RB_MAX_TOTAL_RISK_PCT", "max_total_risk_pct"),
-                         ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"), ("RB_MAX_ORDERS_PER_GROUP", "max_orders_per_group"),
+                         ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"), ("RB_MAX_ORDERS_PER_GROUP", "max_orders_per_batch"),
+                         ("RB_MAX_ORDERS_PER_BATCH", "max_orders_per_batch"), ("RB_RISK_PER_BATCH_PCT", "risk_per_batch_pct"),
                          ("RB_GROUP_LOSS_PCT", "group_loss_pct"), ("RB_MB_MAX_CHASE_ATR", "mb_max_chase_atr"),
                          ("RB_MB_MAX_BAR_ATR", "mb_max_bar_atr"), ("RB_MB_THRESHOLD", "mb_threshold"),
                          ("RB_SL_ATR", "sl_atr"), ("RB_COMMISSION_PER_LOT", "commission_per_lot")):

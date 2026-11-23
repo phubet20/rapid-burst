@@ -88,39 +88,46 @@ class AccountView:
 
 
 class RiskGuard:
-    """Account-wide guards. Halts are sticky for the trading day."""
+    """Account-wide guards. There is NO all-day daily-loss halt. An equity drawdown from the session peak puts
+    the bot in SAFE MODE: bot positions are flattened, new entries pause (5 min, doubling on repeats, max 30 min),
+    then trading resumes from a new reference peak with reduced size (single min-lot batches for a while)."""
 
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
-        self.day_key: Optional[str] = None
-        self.day_start_balance = 0.0
-        self.day_peak_equity = 0.0
-        self.halted = False
+        self.peak_equity = 0.0
+        self.halted = False            # True while SAFE MODE pauses new entries
         self.halt_reason = ""
+        self.safe_until = 0.0
+        self.safe_count = 0
+        self.probe_left = 0            # batches still forced to one min-lot order after a safe-mode pause
 
-    def new_day(self, day_key: str, balance: float, equity: float) -> None:
-        self.day_key = day_key
-        self.day_start_balance = balance
-        self.day_peak_equity = equity
-        self.halted = False
-        self.halt_reason = ""
+    def reset_session(self, equity: float) -> None:
+        self.peak_equity = equity
+        self.halted, self.halt_reason = False, ""
+        self.safe_until, self.safe_count, self.probe_left = 0.0, 0, 0
 
-    def update(self, day_key: str, acct: AccountView, bot_daily_pnl: float) -> Optional[str]:
-        """Update trackers; returns a halt reason when a hard limit is newly breached."""
-        if self.day_key != day_key:
-            self.new_day(day_key, acct.balance, acct.equity)
-        self.day_peak_equity = max(self.day_peak_equity, acct.equity)
-        if self.halted:
+    def update(self, now: float, acct: AccountView) -> Optional[tuple]:
+        """Returns ("safe", msg) when safe mode starts, ("resume", msg) when it ends, else None."""
+        if acct.equity <= 0:
             return None
-        lim = self.day_start_balance * self.cfg.daily_loss_limit_pct / 100.0
-        if lim > 0 and bot_daily_pnl <= -lim:
-            self.halted, self.halt_reason = True, f"daily loss limit hit ({bot_daily_pnl:.2f} <= -{lim:.2f})"
-            return self.halt_reason
-        dd_floor = self.day_peak_equity * (1 - self.cfg.equity_drawdown_pct / 100.0)
-        if self.cfg.equity_drawdown_pct > 0 and acct.equity < dd_floor:
-            self.halted, self.halt_reason = True, (
-                f"equity drawdown stop ({acct.equity:.2f} < {dd_floor:.2f}, peak {self.day_peak_equity:.2f})")
-            return self.halt_reason
+        if self.halted:
+            if now < self.safe_until:
+                return None
+            self.halted, self.halt_reason = False, ""
+            self.peak_equity = acct.equity                  # new reference: no instant re-trigger
+            self.probe_left = self.cfg.safe_probe_batches
+            return "resume", (f"SAFE MODE ended - entries resume with reduced size ({self.probe_left} single "
+                              f"min-lot batch(es)), new drawdown reference {acct.equity:.2f}")
+        self.peak_equity = max(self.peak_equity, acct.equity)
+        dd = self.cfg.equity_drawdown_pct
+        if dd > 0 and self.peak_equity > 0 and acct.equity < self.peak_equity * (1 - dd / 100.0):
+            pause = min(self.cfg.safe_pause_s * (2 ** self.safe_count), self.cfg.safe_pause_max_s)
+            self.safe_count += 1
+            self.safe_until = now + pause
+            self.halted = True
+            self.halt_reason = (f"SAFE MODE: equity {acct.equity:.2f} is {dd:g}% below the session peak "
+                                f"{self.peak_equity:.2f} - entries paused {pause / 60:.0f} min")
+            return "safe", self.halt_reason
         return None
 
     def check_entry(self, symbol: str, side: str, positions: Iterable[OpenPos], acct: AccountView,
@@ -129,7 +136,7 @@ class RiskGuard:
                     floor_mode: bool = False) -> tuple[bool, str]:
         cfg = self.cfg
         if self.halted:
-            return False, f"halted: {self.halt_reason}"
+            return False, f"safe mode: {self.halt_reason}"
         pos = list(positions)
         if len(pos) >= cfg.max_positions_total:
             return False, f"max positions {cfg.max_positions_total} reached"

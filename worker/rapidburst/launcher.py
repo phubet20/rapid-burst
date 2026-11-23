@@ -469,10 +469,8 @@ class Launcher:
             es = eng.snapshot or {}
             e = es.get("engine") or {}
             positions = es.get("positions") or []
-            if self.phase == "RUNNING" and not e.get("running") and e.get("halted"):
-                self.add_log("WARNING", "Risk halt - stopping and shutting the engine down for today")
-                asyncio.create_task(self.handle("stop", {}))
-            elif self.phase == "STOPPING" and (es.get("conn") or {}).get("state") != "CONNECTED" and (
+            # no all-day risk halt any more: SAFE MODE pauses entries inside the engine, which keeps running
+            if self.phase == "STOPPING" and (es.get("conn") or {}).get("state") != "CONNECTED" and (
                     (es.get("conn") or {}).get("state") == "UNAVAILABLE" or now - self.stopping_since > self.stop_retry):
                 self.add_log("ERROR", "STOP: MT5 unreachable, bot positions cannot be verified - shutting the engine "
                                       "down; any bot positions keep their server-side SL/TP. Press STOP again "

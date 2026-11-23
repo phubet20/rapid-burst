@@ -159,10 +159,10 @@ def test_disconnect_pauses_and_reconnects(tmp_path):
     assert br.login_calls >= 2
 
 
-def test_daily_loss_limit_halts_and_flattens(tmp_path):
+def test_equity_drawdown_enters_safe_mode_but_keeps_running(tmp_path):
     from tests.paths import _force_signal
-    cfg = EngineConfig(daily_loss_limit_pct=0.01)   # $1 on a $10k test account
-    # pure noise + slippage and a FORCED entry signal (test only): losses must trip the daily limit
+    cfg = EngineConfig(equity_drawdown_pct=0.01)   # $1 on a $10k test account
+    # pure noise + slippage and a FORCED entry signal (test only): losses must trip SAFE MODE (no all-day halt)
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 1800, burst_every=1e9)}, cfg, slippage_pts=5)
     assert connect_and_start(tr, br, T0 + 1)["ok"]
     _force_signal(tr, "BUY", origin=0.0)
@@ -176,9 +176,12 @@ def test_daily_loss_limit_halts_and_flattens(tmp_path):
         return m, st
     tr._micro = fresh
     run(tr, br, T0 + 1, T0 + 1800)
-    assert tr.risk.halted and "daily loss" in tr.risk.halt_reason, (tr.risk.halt_reason, tr.daily_realized)
-    assert not [p for p in br.positions_.values() if p["magic"] == cfg.magic]
-    assert not tr.cmd_start()["ok"]
+    logs = [l["msg"] for l in tr.logs]
+    assert any("SAFE MODE" in m for m in logs), logs[-20:]
+    assert tr.running                                  # the bot keeps running after START
+    assert tr.risk.safe_count >= 1
+    assert tr.cmd_start()["ok"]
+    assert not any("halted for today" in m for m in logs)
 
 
 def test_netting_account_does_not_touch_manual_symbol(tmp_path):

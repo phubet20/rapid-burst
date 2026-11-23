@@ -87,17 +87,20 @@ def test_limits():
     assert not ok and "margin" in why
 
 
-def test_daily_loss_and_drawdown_halts():
-    cfg = EngineConfig(daily_loss_limit_pct=3, equity_drawdown_pct=5)
+def test_safe_mode_instead_of_daily_halt():
+    cfg = EngineConfig(equity_drawdown_pct=5, safe_pause_s=300, safe_pause_max_s=1800, safe_probe_batches=3)
     g = RiskGuard(cfg)
-    assert g.update("d1", ACCT, 0.0) is None
-    assert g.update("d1", ACCT, -299) is None
-    assert "daily loss" in g.update("d1", ACCT, -300)
+    g.reset_session(10000)
+    assert g.update(0, ACCT) is None
+    assert g.update(1, AccountView(10000, 9600, 9000, 0)) is None          # -4%: fine (no daily-loss stop)
+    ev = g.update(2, AccountView(10000, 9490, 9000, 0))
+    assert ev[0] == "safe" and g.halted and "SAFE MODE" in ev[1]
     assert not g.check_entry("XAUUSD", "BUY", [], ACCT, 0.1, 1, 1, False)[0]
-    # new day resets
-    assert g.update("d2", ACCT, 0.0) is None and not g.halted
-    g.update("d2", AccountView(10000, 10600, 9000, 0), 0)
-    assert "drawdown" in g.update("d2", AccountView(10000, 10060, 9000, 0), 0)
+    assert g.update(200, AccountView(10000, 9490, 9000, 0)) is None and g.halted
+    ev = g.update(303, AccountView(10000, 9490, 9000, 0))
+    assert ev[0] == "resume" and not g.halted and g.probe_left == 3 and g.peak_equity == 9490
+    g.update(304, AccountView(10000, 9000, 9000, 0))                        # repeat => longer pause
+    assert g.halted and g.safe_until - 304 == 600
 
 
 def test_pacer():
