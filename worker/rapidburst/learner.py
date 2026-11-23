@@ -1,8 +1,10 @@
 """Online learning from REAL closed bot bursts (pure logic + a small JSON journal).
 
-Bucket = signal type x trend relation x spread/ATR regime. Each bucket keeps time-decayed
-statistics of P/L in R (R = realised P/L / risk at open). Decisions:
-  * cold bucket (effective n < min_samples): allowed, MIN LOT only, faster loss-cut;
+Bucket = setup: symbol x side vs the M1 main trend x tape regime x spread/ATR regime. Each bucket keeps
+statistics of P/L in R (R = realised P/L / risk at open). t30u: memory is NEVER reset - no time decay by
+default (half_life_h <= 0) and, besides the local file, a durable remote copy (Render Key Value) survives
+redeploys. Decisions:
+  * cold bucket (n < min_samples): allowed at normal size (learning by trading);
   * losing bucket (shrunk expectancy < disable_r after min_samples): gated by Thompson
     sampling - usually skipped, sometimes re-explored; decay pulls it back to 'cold';
   * proven bucket (lower confidence bound of expectancy > 0): normal risk sizing x a multiplier
@@ -40,8 +42,10 @@ def regime(spread: float, atr: float) -> str:
 class Learner:
     def __init__(self, path: str = "", min_samples: int = 8, prior_n: float = 4.0, prior_r: float = -0.05,
                  disable_r: float = -0.15, half_life_h: float = 36.0, max_mult: float = 2.0,
-                 rng: random.Random | None = None):
+                 rng: random.Random | None = None, remote=None, remote_key: str = "rapidburst:learning"):
         self.path = path
+        self.remote, self.remote_key = remote, remote_key
+        self.remote_status = "off" if remote is None else "connecting"
         self.min_samples, self.prior_n, self.prior_r = min_samples, prior_n, prior_r
         self.disable_r, self.half_life, self.max_mult = disable_r, half_life_h * 3600.0, max_mult
         self.rng = rng or random.Random()
@@ -51,25 +55,48 @@ class Learner:
         self.load()
 
     # ------------------------------------------------------------ storage
+    def _apply(self, d: dict) -> None:
+        self.buckets = d.get("buckets", {})
+        self.journal = d.get("journal", [])[-500:]
+        self.total = int(d.get("total", len(self.journal)))
+
     def load(self) -> None:
-        if not self.path or not os.path.exists(self.path):
-            return
-        try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                d = json.load(fh)
-            self.buckets = d.get("buckets", {})
-            self.journal = d.get("journal", [])[-500:]
-            self.total = int(d.get("total", len(self.journal)))
-        except Exception:  # noqa: BLE001  corrupt file -> start cold, never crash trading
-            self.buckets, self.journal, self.total = {}, [], 0
+        local = None
+        if self.path and os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as fh:
+                    local = json.load(fh)
+            except Exception:  # noqa: BLE001  corrupt file -> ignore, never crash trading
+                local = None
+        remote = None
+        if self.remote is not None:
+            try:
+                raw = self.remote.get(self.remote_key)
+                remote = json.loads(raw) if raw else None
+                self.remote_status = "ok" if remote else "ok (empty)"
+            except Exception as e:  # noqa: BLE001
+                self.remote_status = f"unavailable ({type(e).__name__})"
+        best = max((x for x in (local, remote) if isinstance(x, dict)), key=lambda x: int(x.get("total", 0)),
+                   default=None)
+        if best is not None:
+            self._apply(best)
+
+    def dump(self) -> dict:
+        return {"buckets": self.buckets, "journal": self.journal[-500:], "total": self.total}
 
     def save(self) -> None:
-        if not self.path:
-            return
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"buckets": self.buckets, "journal": self.journal[-500:], "total": self.total}, fh)
-        os.replace(tmp, self.path)
+        data = json.dumps(self.dump())
+        if self.path:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(data)
+            os.replace(tmp, self.path)
+        if self.remote is not None:
+            try:
+                self.remote.set(self.remote_key, data.encode())
+                self.remote_status = "ok"
+            except Exception as e:  # noqa: BLE001  durable copy failed: local copy still kept
+                self.remote_status = f"unavailable ({type(e).__name__})"
 
     # -------------------------------------------------------------- stats
     @staticmethod
@@ -77,6 +104,8 @@ class Learner:
         return f"{sig_type}|{rel}|{reg}"
 
     def _decayed(self, b: dict, now: float) -> dict:
+        if self.half_life <= 0:
+            return {"n": b["n"], "sr": b["sr"], "sr2": b["sr2"], "w": b["w"]}    # never forget
         w = 0.5 ** (max(0.0, now - b.get("t", now)) / self.half_life)
         return {"n": b["n"] * w, "sr": b["sr"] * w, "sr2": b["sr2"] * w, "w": b["w"] * w}
 
@@ -114,8 +143,8 @@ class Learner:
         s = self.stats(key, now)
         n, mean, se = s["n"], s["mean"], s["se"]
         if n < self.min_samples:
-            return Decision(True, True, 1.0, True, "cold",
-                            f"learning {key}: cold start ({n:.1f}/{self.min_samples} trades) - min lot, fast cut")
+            return Decision(True, False, 1.0, False, "cold",
+                            f"learning {key}: new setup ({n:.1f}/{self.min_samples} trades) - normal size")
         if mean < self.disable_r:
             sample = self.rng.gauss(mean, se)
             if sample < 0:
@@ -128,8 +157,8 @@ class Learner:
             mult = min(self.max_mult, 1.0 + mean / 0.5)
             return Decision(True, False, mult, False, "proven",
                             f"learning {key}: proven exp {mean:+.2f}R win {s['win']:.0%} n {n:.1f} - size x{mult:.2f}")
-        return Decision(True, True, 1.0, mean < 0, "neutral",
-                        f"learning {key}: unproven (exp {mean:+.2f}R n {n:.1f}) - min lot")
+        return Decision(True, False, 1.0, False, "neutral",
+                        f"learning {key}: unproven (exp {mean:+.2f}R n {n:.1f}) - normal size")
 
     def summary(self, now: float | None = None, top: int = 3) -> dict:
         rows = []
@@ -142,4 +171,5 @@ class Learner:
         rows.sort(key=lambda x: x["exp_r"], reverse=True)
         return {"trades": self.total, "buckets": len(rows), "top": rows[:top],
                 "bottom": [r for r in rows[::-1][:top] if r not in rows[:top]],
-                "min_samples": self.min_samples}
+                "min_samples": self.min_samples, "memory": self.remote_status,
+                "decay": "none (never reset)" if self.half_life <= 0 else f"half-life {self.half_life / 3600:g} h"}

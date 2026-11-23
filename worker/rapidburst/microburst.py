@@ -1,4 +1,4 @@
-"""Immediate Continuous Score Momentum Scalper: scanners, decision and the basket exit (pure logic).
+"""M1 Rapid Basket Scalper (t30u, M1 only): scanners, decision and the basket exit (pure logic).
 
 ONE engine. Five families are scored on the same moment and feed ONE decision:
   A. tick velocity & acceleration  - tick rate, velocity, acceleration/deceleration, direction sequence,
@@ -584,7 +584,7 @@ def _mtf_scores(m: Micro, d: int) -> tuple:
     if v is None:
         return None, None, 0.0
     dd = v.timing(d) if v.m1.ready else None
-    e = _clip(d * v.bias / 0.6) if v.m5.ready else None
+    e = _clip(d * v.bias / 0.6) if v.m1.ready else None        # E = M1 MAIN TREND (t30u: no M5)
     return dd, e, d * v.bias
 
 
@@ -646,13 +646,16 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
     s = num / den
     vetoes = []
     v = m.mtf
-    if v is not None and v.m5.ready and bias < 0:
-        if bias <= -0.6 and v.supported:
-            vetoes.append(f"M5 clearly against ({v.bias_label})")
-        else:
-            s -= 0.15 * min(1.0, -bias / 0.6)          # soft: ambiguous / weak opposite M5 only costs strength
-    if v is not None and v.m5.ready and v.m5.exhaust == d:
-        s -= 0.08                                      # M5 move in our direction is exhausting
+    if v is not None and v.m1.ready:
+        if bias <= -cfg.m1_trend_veto and not (v.m1.sbreak == d or m.struct_break == d):
+            # trade WITH the M1 main trend; counter-trend only right after a confirmed structure break
+            vetoes.append(f"M1 main trend against ({v.bias_label}) - counter-trend needs a structure break")
+        elif bias < 0:
+            s -= 0.12 * min(1.0, -bias / 0.6)          # weak opposite trend only costs strength
+        elif bias >= 0.3:
+            s += 0.05                                  # with the M1 main trend
+        if v.m1.exhaust == d:
+            s -= 0.06
     if m.early == d:
         s += 0.06                                     # pre-burst: acceleration starting out of compression
     chase = m.chase_up if d > 0 else m.chase_dn
@@ -664,7 +667,7 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
     if d * m.body > cfg.mb_max_bar_atr * (1.3 if m.regime == "fast" else 1.0):
         vetoes.append(f"anti-chase: candle already {d * m.body:.2f} ATR in that direction")
     if m.exhaustion == d:
-        vetoes.append("exhaustion: extended move is decelerating")
+        s -= 0.10                                     # t30u: exhaustion is a penalty, not a veto (no long waits)
     if m.rejection == -d:
         s -= 0.15
     if m.abnormal and d * m.accel < 0:
@@ -786,10 +789,23 @@ def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, t
     retr = peak - net
     retr_min = max(cfg.exit_retrace_atr * atr, cfg.exit_retrace_spread * m.spread)
     retrace = peak > min_net and retr >= retr_min and retr >= cfg.exit_retrace_frac * peak
+    flip = d * m.vel <= -max(cfg.mb_flip_atr, 0.5 * m.spread / atr)
+    press = d * m.imbalance <= -cfg.mb_opp_pressure or d * m.bidask <= -cfg.mb_opp_pressure
+    wick = m.rejection == -d
+    v = m.mtf
+    trend_with = v is not None and v.m1.ready and d * v.bias >= 0.25
     # 1. in profit: hold while momentum continues; close when the evidence agrees
     if net >= min_net:
+        # spike exit: after a real spike the M1 bar starts turning back (velocity flip + opposing tick pressure or
+        # a growing wick against us + a retrace of the spike) -> take it now; the engine re-evaluates at once
+        if (peak >= cfg.exit_spike_atr * atr and retr >= cfg.exit_spike_wick_frac * peak and flip
+                and (press or wick)):
+            return (f"spike turning back: peak {peak:+.4g} -> {net:+.4g} (velocity flip"
+                    f"{' + opposing pressure' if press else ''}{' + wick against' if wick else ''}, {tags})")
         if score >= cfg.exit_min_signals and not continuing:
             return f"momentum exhausted in profit ({score} signals: {tags}): {net:+.4g}"
+        if trend_with and not sig["structure-failure"] and retr < 0.6 * peak and not (flip and press):
+            return None                     # pullback inside the M1 trend: hold (the trailing stop protects)
         if retrace and (score >= cfg.exit_min_signals - 1 or (score >= 1 and not continuing)):
             return (f"profit protection: retraced {retr:.4g} from peak {peak:+.4g} with {tags} "
                     f"(noise floor {retr_min:.4g}): {net:+.4g}")
@@ -799,7 +815,11 @@ def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, t
     # 2. not (yet) in net profit: hold inside the hard stop unless the move clearly turned
     if peak >= min_net and retrace and score >= 1:
         return f"profit gone: peak {peak:+.4g} -> {net:+.4g} ({tags})"
-    if sig["reversal"] and sig["structure-failure"] and score >= 3:
+    # t30u: inside the M1 main trend (no M1 swing break against us) a young basket is not cut on micro noise -
+    # the reversal must be broad (>= 4 signals) and already cost >= 35 % of the stop; the hard stop still rules
+    in_trend = trend_with and v.m1.sbreak != -d
+    if sig["reversal"] and sig["structure-failure"] and score >= 3 and (
+            not in_trend or (score >= 4 and stop_dist > 0 and net <= -0.35 * stop_dist)):
         return f"directional reversal against the basket ({score} signals: {tags}): {net:+.4g}"
     if stop_dist > 0 and net <= -cfg.mb_cut_frac * stop_dist and score >= 2 and not continuing:
         return f"momentum against: {net:+.4g} (>= {cfg.mb_cut_frac:g} of stop) {tags}"

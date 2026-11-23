@@ -1,6 +1,8 @@
-"""Engine / risk configuration (one engine: the Immediate Continuous Score Momentum Scalper).
+"""Engine / risk configuration (one engine: the M1 Rapid Basket Scalper).
 
-All values are conservative defaults intended for a DEMO account.  They can be
+DEMO account only. t30u: the owner asked to remove the risk-amount limits so the account can compound as fast as
+possible; the defaults below are therefore AGGRESSIVE (half the equity at risk per basket if every stop is hit,
+safe mode only at a 50 % drawdown). Every order still carries a hard broker stop.  They can be
 overridden with a JSON file (``RB_CONFIG_FILE``) on the worker machine.  The
 UI cannot change risk limits and can never enable LIVE trading.
 """
@@ -20,7 +22,7 @@ RISK_ENV = (("RB_BROKER_SL", "broker_sl"), ("RB_SAFE_PAUSE_S", "safe_pause_s"),
             ("RB_MB_MAX_BAR_ATR", "mb_max_bar_atr"), ("RB_MB_THRESHOLD", "mb_threshold"),
             ("RB_SL_ATR", "sl_atr"), ("RB_COMMISSION_PER_LOT", "commission_per_lot"))
 INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE", "RB_CONFIG_JSON", "RB_DATA_DIR",
-             "RB_ENV_FILE", "RB_FALLBACK_POLL_MINUTES", "RB_KEEPALIVE_SECONDS", "RB_LINGER_SECONDS",
+             "RB_ENV_FILE", "RB_FALLBACK_POLL_MINUTES", "RB_LEARN_REDIS_URL", "RB_KEEPALIVE_SECONDS", "RB_LINGER_SECONDS",
              "RB_STANDBY_SECONDS", "RB_TEST_BROKER_FACTORY", "RB_UI_PASSWORD", "RB_WAKE_URL"}
 
 
@@ -28,17 +30,23 @@ INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE"
 # Only strategy/sizing knobs inside safe bounds. Never: live trading, broker SL on/off, magic, credentials.
 TUNABLE = {
     "mb_threshold": (0.35, 0.90), "mb_edge": (0.0, 0.40), "mb_min_agree": (2, 5), "mb_scan_support": (0.2, 0.7),
-    "mb_max_chase_atr": (0.3, 2.0), "mb_max_bar_atr": (0.3, 2.5), "loss_streak_threshold_add": (0.0, 0.1),
+    "mb_max_chase_atr": (0.3, 4.0), "mb_max_bar_atr": (0.3, 5.0), "loss_streak_threshold_add": (0.0, 0.1),
+    "mb_min_velocity": (0.05, 0.8), "m1_trend_veto": (0.2, 1.0), "min_orders_per_batch": (1, 8),
+    "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 4),
+    "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
+    "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 64),
+    "max_lot_per_order": (0.01, 100.0), "max_batch_lots": (0.01, 500.0), "max_total_lots": (0.01, 1000.0),
+    "min_margin_level_pct": (50.0, 1000.0), "margin_use_max_pct": (10.0, 100.0), "safe_probe_batches": (0, 5),
     "exit_min_signals": (2, 6), "exit_retrace_atr": (0.05, 1.0), "exit_retrace_spread": (0.5, 6.0),
     "exit_retrace_frac": (0.1, 0.9), "exit_opp_frac": (0.5, 1.5), "mb_cut_frac": (0.2, 1.0),
     "mb_max_hold_seconds": (0, 1800), "mb_min_net_spread": (0.0, 3.0),
     "be_trigger_atr": (0.1, 2.0), "be_trigger_spread": (1.0, 10.0), "be_lock_spread_mult": (0.0, 2.0),
     "trail_atr_frac": (0.05, 1.5), "trail_atr_strong": (0.05, 2.0), "trail_atr_fade": (0.03, 1.0),
     "trail_spread_mult": (1.0, 6.0), "sl_atr": (0.3, 3.0), "sl_spread_mult": (2.0, 12.0),
-    "max_orders_per_batch": (1, 8), "risk_per_trade_pct": (0.1, 2.0), "risk_per_batch_pct": (0.2, 5.0),
-    "small_account_batch_risk_pct": (2.0, 25.0), "max_total_risk_pct": (1.0, 10.0),
-    "equity_drawdown_pct": (3.0, 30.0), "safe_pause_s": (30, 3600), "safe_min_stopouts": (1.0, 3.0),
-    "safe_dd_cap_pct": (10.0, 40.0), "group_loss_pct": (0.5, 30.0), "max_margin_use_pct": (10.0, 80.0),
+    "max_orders_per_batch": (1, 8), "risk_per_trade_pct": (0.1, 100.0), "risk_per_batch_pct": (0.2, 100.0),
+    "small_account_batch_risk_pct": (2.0, 100.0), "max_total_risk_pct": (1.0, 300.0),
+    "equity_drawdown_pct": (0.0, 90.0), "safe_pause_s": (30, 3600), "safe_min_stopouts": (1.0, 3.0),
+    "safe_dd_cap_pct": (10.0, 90.0), "group_loss_pct": (0.5, 100.0), "max_margin_use_pct": (10.0, 95.0),
     "learning_enabled": (0, 1),
 }
 
@@ -95,17 +103,17 @@ class EngineConfig:
     mb_struct_seconds: float = 20.0   # micro high/low window (s)
     mb_swing_seconds: float = 20.0    # swing used for anti-chase and burst identity (s)
     mb_vel_ref_atr: float = 0.25      # velocity (ATR per window) that counts as full strength
-    mb_min_velocity: float = 0.35     # the chosen side needs at least this much live velocity component
+    mb_min_velocity: float = 0.15     # the chosen side needs at least this much live velocity component
     mb_threshold: float = 0.55        # base strength threshold (adapted to regime, spread and slippage risk)
     mb_edge: float = 0.08             # chosen side must beat the other side by this much (each side scored on its own)
     mb_scan_support: float = 0.35     # a family (A/B/C/D/E) supports a side when its score >= this
     mb_min_agree: int = 2             # families that must agree (of A tick, B activity/candle, C structure,
                                       # D M1 timing, E M5 bias), one of them C or D (structure / candle trigger):
                                       # speed+volume alone (A+B) never trades
-    candle_poll_m1_s: float = 20.0    # broker M1 candle refresh (the forming bar comes from live ticks)
+    candle_poll_m1_s: float = 8.0     # broker M1 candle refresh (the forming bar comes from live ticks)
     candle_poll_m5_s: float = 60.0    # broker M5 candle refresh
-    mb_max_chase_atr: float = 0.90    # RB_MB_MAX_CHASE_ATR: no entry if price is > x ATR from the recent swing
-    mb_max_bar_atr: float = 1.00      # RB_MB_MAX_BAR_ATR: no entry if the live candle body is > x ATR in that direction
+    mb_max_chase_atr: float = 1.80    # RB_MB_MAX_CHASE_ATR: no entry if price is > x ATR from the recent swing
+    mb_max_bar_atr: float = 2.20      # RB_MB_MAX_BAR_ATR: no entry if the live candle body is > x ATR in that direction
     mb_abnormal_range_atr: float = 1.5
     mb_wick_reject: float = 0.5       # wick >= x of the candle range = rejection
     mb_compress_ratio: float = 1.2
@@ -122,17 +130,21 @@ class EngineConfig:
     exit_opp_frac: float = 0.9        # opposite-side strength >= x * threshold = directional reversal
     exit_retrace_atr: float = 0.25    # meaningful retracement from the basket peak >= max(x * ATR, ...
     exit_retrace_spread: float = 2.0  # ... x * spread) and >= exit_retrace_frac of the peak (noise-aware)
-    exit_retrace_frac: float = 0.35
+    exit_retrace_frac: float = 0.45
     mb_flip_atr: float = 0.02         # tick flip = velocity against >= x ATR (or half a spread)
     mb_decay_frac: float = 0.30       # velocity below x * its peak since entry = decay
     mb_opp_pressure: float = 0.40     # opposing tick / bid-ask proxy >= x
     mb_stall_seconds: float = 3.0     # no new favourable extreme for x s = stall
     mb_cut_frac: float = 0.50         # losing >= x of the stop distance with >= 2 reversal signals => cut
+    exit_spike_atr: float = 0.5       # spike exit: peak net profit >= x * M1 ATR and the bar turns back ...
+    exit_spike_wick_frac: float = 0.3 # ... (retraced >= x of the peak + velocity flip + opposing pressure/wick)
+    m1_trend_veto: float = 0.45       # M1 main trend this strongly against = no counter-trend entry (unless the
+                                      # M1 / micro structure just broke in the entry direction)
     mb_max_hold_seconds: float = 180.0  # stale guard: not in net profit after x s AND momentum gone => close
     commission_per_lot: float = 0.0   # round-trip commission per lot in account currency (cost in net P/L)
 
     # --- orders, batch & exposure (risk-based; no martingale, no averaging down, no grid) ---
-    risk_per_trade_pct: float = 0.5   # RB_RISK_PER_TRADE_PCT: % of equity lost if one order's stop is hit
+    risk_per_trade_pct: float = 50.0  # RB_RISK_PER_TRADE_PCT: % of equity lost if one order's stop is hit
     sl_atr: float = 0.8               # hard stop distance = max(x * M1 ATR, sl_spread_mult * spread, stops level)
     sl_spread_mult: float = 4.0
     soft_stop_mult: float = 1.15      # engine mirror of the hard stop (if the broker SL fails)
@@ -141,30 +153,36 @@ class EngineConfig:
                                       # follows momentum quality, then equity/lot/margin/exposure limits cut it)
     # order count from the score: n = 1 + round(7 x q), q = (strength - threshold) / (1 - threshold), then cut by
     # risk, margin, stop distance and exposure
-    risk_per_batch_pct: float = 1.0   # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
-    max_batch_lots: float = 1.0       # lots in one batch
-    batch_run_cancel_frac: float = 0.5  # cancel the rest of a batch if price ran > x * target from the decision
-    max_lot_per_order: float = 1.0
-    max_positions_total: int = 10
+    risk_per_batch_pct: float = 50.0  # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
+    max_batch_lots: float = 100.0      # lots in one batch
+    batch_run_cancel_frac: float = 1.0  # cancel the rest of a batch if price ran > x * target from the decision
+    max_lot_per_order: float = 50.0
+    max_positions_total: int = 40
     max_positions_per_symbol: int = 8
-    max_total_lots: float = 2.0
-    max_total_notional_x: float = 500.0  # sum of open notional <= x * equity
-    max_total_risk_pct: float = 3.0   # RB_MAX_TOTAL_RISK_PCT: sum of open stop risk <= x% of equity
-    max_margin_use_pct: float = 50.0  # RB_MAX_MARGIN_USE_PCT: total used margin <= x% of equity
-    min_margin_level_pct: float = 200.0
-    margin_use_max_pct: float = 50.0  # one order may use <= x% of the free margin
+    min_orders_per_batch: int = 2     # never a single order (unless the stop-risk cap cannot fit two min lots)
+    # pyramid ADD into a basket that already has its break-even stop: shallow pullback, then price resumes in the
+    # trade direction with the signal still valid; same lot (no multiplier), total legs <= max_orders_per_batch
+    add_enabled: bool = True
+    add_pullback_atr: float = 0.12    # pullback from the basket's best price >= x * M1 ATR before an add
+    add_max_per_step: int = 2
+    max_total_lots: float = 400.0
+    max_total_notional_x: float = 0.0    # sum of open notional <= x * equity
+    max_total_risk_pct: float = 100.0  # RB_MAX_TOTAL_RISK_PCT: sum of open stop risk <= x% of equity
+    max_margin_use_pct: float = 90.0  # RB_MAX_MARGIN_USE_PCT: total used margin <= x% of equity
+    min_margin_level_pct: float = 110.0
+    margin_use_max_pct: float = 100.0 # one order may use <= x% of the free margin
     small_account_max_loss_pct: float = 0.0  # 0 = min lot always allowed (free margin permitting)
-    small_account_batch_risk_pct: float = 10.0  # min-lot-floor accounts: ALL open bot stops together <= x% of
+    small_account_batch_risk_pct: float = 50.0  # min-lot-floor accounts: ALL open bot stops together <= x% of
                                       # equity (scaled by score 0.6..1.0) -> several min-lot orders per basket
-    group_loss_pct: float = 2.0       # RB_GROUP_LOSS_PCT: hard exit when one basket's floating loss >= x% equity
+    group_loss_pct: float = 60.0      # RB_GROUP_LOSS_PCT: hard exit when one basket's floating loss >= x% equity
     # NO all-day daily-loss halt. Equity drawdown => SAFE MODE (flatten, pause new entries, resume reduced)
-    equity_drawdown_pct: float = 8.0  # RB_MAX_DD_PCT: equity x% below the session peak => safe mode (0 = off)
+    equity_drawdown_pct: float = 50.0 # RB_MAX_DD_PCT: equity x% below the session peak => safe mode (0 = off)
     safe_pause_s: float = 180.0       # first safe-mode pause; doubles on each repeat in a session ...
     safe_pause_max_s: float = 1800.0  # ... up to this
-    safe_probe_batches: int = 3       # after a pause: this many single min-lot batches before normal sizing
+    safe_probe_batches: int = 0       # after a pause: this many single min-lot batches before normal sizing
     safe_min_stopouts: float = 1.5    # min-lot floor accounts: the safe-mode drawdown is never smaller than this
                                       # many full basket stop losses (one normal basket stop must not trip it) ...
-    safe_dd_cap_pct: float = 30.0     # ... but never more than x% of the peak equity
+    safe_dd_cap_pct: float = 50.0     # ... but never more than x% of the peak equity
     emergency_stale_s: float = 15.0   # open positions and no fresh price for x s => emergency close
     exec_fail_max: int = 3            # entry rejects within 60 s before the symbol is paused
     exec_fail_pause_s: float = 60.0
@@ -175,23 +193,23 @@ class EngineConfig:
     be_trigger_atr: float = 0.35      # break-even only after NET basket profit >= max(x * M1 ATR, ...
     be_trigger_spread: float = 3.0    # ... x * spread, stops level + lock) - not so early that noise takes it
     be_lock_spread_mult: float = 0.3  # BE+ level = basket average + costs + x * spread (net profit after costs)
-    trail_atr_frac: float = 0.25      # trailing distance = x * M1 ATR (normal momentum) ...
-    trail_atr_strong: float = 0.40    # ... wider while momentum is strong (let it run) ...
-    trail_atr_fade: float = 0.12      # ... tighter once momentum fades
-    trail_spread_mult: float = 1.5    # never closer than x * spread (or the broker stops/freeze level)
+    trail_atr_frac: float = 0.40      # trailing distance = x * M1 ATR (normal momentum) ...
+    trail_atr_strong: float = 0.65    # ... wider while momentum is strong (let it run) ...
+    trail_atr_fade: float = 0.22      # ... tighter once momentum fades
+    trail_spread_mult: float = 2.0    # never closer than x * spread (or the broker stops/freeze level)
     sl_modify_min_interval: float = 1.0
     protect_fail_max: int = 3         # consecutive failed/unverified SL modifies before the basket is closed
 
     # --- continuous entry / re-entry (no fixed cooldowns; the same unchanged setup is never re-entered) ---
-    max_entries_per_minute: int = 30  # API/abuse guard only (TickerAll allows 300 order writes/min per key)
-    loss_streak_threshold_add: float = 0.03  # each consecutive losing basket raises the bar by x (max 3x);
+    max_entries_per_minute: int = 40  # API/abuse guard only (TickerAll allows 300 order writes/min per key)
+    loss_streak_threshold_add: float = 0.0   # each consecutive losing basket raises the bar by x (max 3x);
                                              # a winning basket resets it. Quality goes up, risk never does.
 
     # --- learning from real closed groups ---
     learning_enabled: bool = True
     learn_min_samples: int = 8
-    learn_half_life_hours: float = 36.0
-    learn_max_mult: float = 1.5
+    learn_half_life_hours: float = 0.0   # 0 = never forget (no decay, memory is never reset)
+    learn_max_mult: float = 2.0
 
 
     # --- loop ---

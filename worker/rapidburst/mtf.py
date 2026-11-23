@@ -93,6 +93,10 @@ class TFState:
     rsi_slope: float = 0.0       # forming RSI - last closed RSI
     rsi_accel: float = 0.0       # change of that slope vs the previous bar (momentum change)
     rsi_ready: bool = False
+    swing: int = 0               # +1 swing HH + HL, -1 swing LH + LL, 0 mixed (pivot highs/lows of closed bars)
+    sbreak: int = 0              # +1 price is above the last swing high (break up), -1 below the last swing low
+    swing_hi: float = 0.0
+    swing_lo: float = 0.0
 
     def brief(self) -> dict:
         r = lambda x, n=2: None if x is None else round(x, n)   # noqa: E731
@@ -100,7 +104,8 @@ class TFState:
                 "body": r(self.body), "range_x": r(self.range_x), "macd": r(self.macd, 3), "hist": r(self.hist, 3),
                 "hist_slope": r(self.hist_slope, 3), "macd_ready": self.macd_ready, "vol_x": r(self.vol_x),
                 "vol_src": self.vol_src, "structure": self.structure, "exhaust": self.exhaust,
-                "rsi": r(self.rsi, 1), "rsi_slope": r(self.rsi_slope, 1), "rsi_ready": self.rsi_ready}
+                "rsi": r(self.rsi, 1), "rsi_slope": r(self.rsi_slope, 1), "rsi_ready": self.rsi_ready,
+                "swing": self.swing, "sbreak": self.sbreak}
 
 
 class TF:
@@ -247,6 +252,24 @@ class TF:
             hh = b3[2]["high"] > b3[1]["high"] > b3[0]["high"] or (b3[2]["high"] > b3[1]["high"] and b3[2]["low"] > b3[1]["low"])
             ll = b3[2]["low"] < b3[1]["low"] < b3[0]["low"] or (b3[2]["low"] < b3[1]["low"] and b3[2]["high"] < b3[1]["high"])
             out.structure = 1 if hh and not ll else -1 if ll and not hh else 0
+        # swing structure from pivot highs/lows (1 bar each side) of the last 30 closed bars: HH/HL, LH/LL
+        bars = list(self.bars)[-30:]
+        ph = [bars[i]["high"] for i in range(1, len(bars) - 1)
+              if bars[i]["high"] >= bars[i - 1]["high"] and bars[i]["high"] >= bars[i + 1]["high"]]
+        pl = [bars[i]["low"] for i in range(1, len(bars) - 1)
+              if bars[i]["low"] <= bars[i - 1]["low"] and bars[i]["low"] <= bars[i + 1]["low"]]
+        if len(ph) >= 2 and len(pl) >= 2:
+            up = ph[-1] > ph[-2] and pl[-1] > pl[-2]
+            dn = ph[-1] < ph[-2] and pl[-1] < pl[-2]
+            out.swing = 1 if up else -1 if dn else 0
+        if ph:
+            out.swing_hi = ph[-1]
+        if pl:
+            out.swing_lo = pl[-1]
+        if ph and lv["close"] > ph[-1]:
+            out.sbreak = 1
+        elif pl and lv["close"] < pl[-1]:
+            out.sbreak = -1
         ext = pos
         if ext > 1.5 and p.hist < h1 and h1 < h2:
             out.exhaust = 1
@@ -257,7 +280,8 @@ class TF:
 
 @dataclass
 class MTFView:
-    """M5 bias + M1 timing for the decision engine (all scores 0..1 per side unless signed)."""
+    """M1-ONLY view (t30u): `bias` = the M1 MAIN TREND (EMA + MACD + HH/HL-LH/LL swing structure), `m1_up/dn` =
+    the M1 intrabar trigger. `m5` is kept as an alias of the M1 state for older callers - no M5 gate anywhere."""
     m5: TFState = field(default_factory=TFState)
     m1: TFState = field(default_factory=TFState)
     bias: float = 0.0            # -1..1 M5 direction bias (signed)
@@ -295,6 +319,26 @@ def m5_bias(s: TFState) -> tuple[float, str, bool]:
     return b, lab, supported
 
 
+def m1_trend(s: TFState) -> tuple[float, str, bool]:
+    """M1 main trend (-1..1): EMA trend, HH/HL vs LH/LL swing structure, last-bars structure, MACD, RSI level."""
+    if not s.ready:
+        return 0.0, "unknown (no M1 bars yet)", False
+    macd = _clip(s.hist / 0.3) * (1.0 if s.macd_ready else 0.5)
+    rsi = _clip((s.rsi - 50.0) / 20.0) * (1.0 if s.rsi_ready else 0.0)
+    b = 0.36 * s.trend + 0.26 * s.swing + 0.12 * s.structure + 0.14 * macd + 0.12 * rsi
+    if s.sbreak and s.sbreak * b < 0:
+        b *= 0.5                                   # price just broke the last swing against the trend
+    exhausting = s.exhaust != 0 and s.exhaust * b > 0
+    if exhausting:
+        b *= 0.7
+    b = _clip(b)
+    supported = abs(b) >= 0.25 and not exhausting
+    lab = ("up" if b > 0 else "down") if abs(b) >= 0.2 else "sideways"
+    lab += {1: " HH/HL", -1: " LH/LL", 0: ""}[s.swing]
+    lab += " (exhausting)" if exhausting else ""
+    return b, "M1 " + lab, supported
+
+
 def rsi_score(s: TFState, d: int) -> float:
     """RSI as a SOFT feature (0..1 for direction d): level on our side of 50, slope and momentum change our
     way; fading when stretched (>75 for BUY, <25 for SELL) and turning back. Never a gate, never a cross wait."""
@@ -326,7 +370,7 @@ def m1_timing(s: TFState, d: int, bias: float) -> float:
 
 
 class MTF:
-    """Per symbol M1 + M5 series."""
+    """Per symbol M1 series (t30u: M1 only; the M5 series is no longer polled or used)."""
 
     def __init__(self):
         self.m1 = TF(60, 300)
@@ -339,8 +383,9 @@ class MTF:
         self.m5.on_tick(t, price)
 
     def view(self, now: float) -> MTFView:
-        v = MTFView(m5=self.m5.state(now), m1=self.m1.state(now))
-        v.bias, v.bias_label, v.supported = m5_bias(v.m5)
+        m1 = self.m1.state(now)
+        v = MTFView(m5=m1, m1=m1)
+        v.bias, v.bias_label, v.supported = m1_trend(m1)
         v.m1_up, v.m1_dn = m1_timing(v.m1, 1, v.bias), m1_timing(v.m1, -1, v.bias)
         return v
 

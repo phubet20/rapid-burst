@@ -5,7 +5,7 @@ import json
 from rapidburst.config import EngineConfig
 from rapidburst.engine import MomentumEngine
 from rapidburst.microburst import Micro, decide, exit_reason
-from tests.harness import Invariants, instrument, make, run
+from tests.harness import conservative, Invariants, instrument, make, run
 from tests.paths import T0, _force_signal, _small_account, _start, series_up
 from tests.synth import burst_series, gen_ticks
 
@@ -49,7 +49,8 @@ def test_up_burst_gives_buy_early_and_down_burst_gives_sell():
 def test_random_market_trades_are_the_exception():
     rows = _analyze_stream(gen_ticks(11, T0, 900), after=T0 + 60)
     fired = sum(st.side != "NO TRADE" for _, _, st in rows)
-    assert rows and fired / len(rows) < 0.12, (fired, len(rows))
+    # t30u: fewer slow filters -> more entries, still a minority of moments on a random walk
+    assert rows and fired / len(rows) < 0.2, (fired, len(rows))
 
 
 def test_strength_is_two_sided_and_explains_itself():
@@ -139,7 +140,7 @@ def test_losing_basket_is_held_inside_the_hard_stop_until_the_move_clearly_turns
 
 # ------------------------------------------------------------------ autonomous loop
 def _session(tmp_path, ticks, cfg=None, balance=1000.0, mpl=100.0, t_end=None):
-    cfg = cfg or EngineConfig()
+    cfg = cfg or conservative()
     tr, br = make(tmp_path, {"BTCUSDm": ticks}, cfg)
     inv = Invariants()
     instrument(br, cfg, inv)
@@ -226,9 +227,10 @@ def test_no_daily_loss_halt_and_safe_mode_defaults(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("RB_DAILY_LOSS_PCT", "3")                    # stale env var: ignored
     c = EngineConfig.load()
-    assert not hasattr(c, "daily_loss_limit_pct") and c.equity_drawdown_pct == 8.0
-    assert c.max_margin_use_pct == 50.0 and c.risk_per_trade_pct == 0.5 and c.max_total_risk_pct == 3.0
-    assert c.max_orders_per_batch == 8 and c.risk_per_batch_pct == 1.0
+    # t30u (owner request): aggressive compounding defaults, catastrophic-only safe mode
+    assert not hasattr(c, "daily_loss_limit_pct") and c.equity_drawdown_pct == 50.0
+    assert c.max_margin_use_pct == 90.0 and c.risk_per_batch_pct == 50.0 and c.max_total_risk_pct == 100.0
+    assert c.max_orders_per_batch == 8 and c.min_orders_per_batch == 2 and c.broker_sl
 
 
 def test_safe_mode_flattens_pauses_entries_and_keeps_running(tmp_path):
@@ -287,7 +289,7 @@ def test_snapshot_has_one_engine_view(tmp_path):
     e = tr.get_snapshot()["engine"]
     assert "groups" in e and "baskets" not in e and "scalp" not in e
     rc = e["risk_config"]
-    assert rc["engine"].startswith("Immediate Continuous Score Momentum Scalper") and rc["broker_sl"] == "ON"
+    assert rc["engine"].startswith("M1 Rapid Basket Scalper") and rc["broker_sl"] == "ON"
     assert "daily_loss_limit_pct" not in rc and "latency" in e and "performance" in e
     assert e["performance"]["source"] == "real broker deals"
     st = e["symbols"]["BTCUSDm"]

@@ -68,7 +68,7 @@ def test_sizing_respects_budget_step_and_limits(name):
 
 
 def test_sizing_refuses_when_tick_value_unknown_or_min_lot_too_risky():
-    cfg = EngineConfig()
+    cfg = EngineConfig(max_lot_per_order=1.0)
     r = size_position(EQUITY, cfg, 100.0, 0.01, 0.0, 0.01, 20, 0.01)
     assert r.volume == 0 and "invalid" in r.note
     r = size_position(EQUITY, cfg, 5_000.0, 0.01, 0.01, 2.0, 20, 2.0)   # broker min lot above max_lot_per_order

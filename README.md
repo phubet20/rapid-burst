@@ -47,7 +47,39 @@ Oracle Cloud Always Free and Google Cloud free tiers have no free Windows. AWS/A
 Windows VM for a limited period with a card on file (1 GB RAM is tight for MT5) – the same installer works
 there; nothing in this repo buys or starts cloud resources.
 
-## Trading engine: ONE Immediate Continuous Score Momentum Scalper (microburst.py + mtf.py + trader.py)
+## t30u: M1 Rapid Basket Scalper (current engine, refactored in place)
+
+Owner request (t30u): faster, M1 only, continuous baskets, no risk-amount limits. Changes on top of the engine
+described below:
+* **M1 only.** No M5 polling or gating. Family E is the **M1 main trend**: EMA trend + **HH/HL vs LH/LL swing
+  structure** (pivot highs/lows of the last 30 M1 bars) + MACD + RSI. Trade with the trend; counter-trend only
+  right after a confirmed structure break (price beyond the last M1 swing, or a micro structure break). Broker
+  M1 candles (2 h) are loaded at START and refreshed every 8 s; decisions every loop (~0.1 s).
+* **Fewer slow filters** (from the real "why no trade" counts: no live force 1045, exhaustion 205, anti-chase
+  161, risk cap 72 in 17 min): exhaustion is a score penalty (no veto), anti-chase 1.8 ATR / bar 2.2 ATR,
+  minimum live velocity 0.15, loss-streak threshold raise 0, batch run-cancel 1.0 x target.
+* **Baskets of 2-8 orders** (never a single order unless the risk budget cannot hold two min lots), count from
+  the score edge and the learner. **Pyramid ADD** (same lot, max 8 legs, <= 2 per step) only when the basket's
+  stop is already at break-even/trailing, every leg is in profit, price pulled back >= 0.12 ATR from its best and
+  is resuming with a valid signal for that side. Never averaging down, no martingale.
+* **Re-entry**: unlimited cycles per M1 bar; a basket closed at break-even / by the trail never blocks the same
+  signal (only a real losing basket does).
+* **Exits**: spike exit - after a peak >= 0.5 ATR the basket closes when the bar turns back (velocity flip +
+  opposing tick pressure or a wick against + >= 30 % retrace). Pullbacks inside the M1 trend (no structure
+  failure, < 60 % of the peak) are held; looser trail 0.65 / 0.40 / 0.22 x ATR, >= 2 x spread.
+* **Risk (AGGRESSIVE, owner request, DEMO only)**: basket stop risk <= 50 % of equity x score scale (0.6-1.0),
+  all open baskets (all symbols) <= 100 %, used margin <= 90 % of equity, lots compound with equity, safe mode only
+  at a 50 % drawdown, basket loss backup cap 60 %. Hard broker SL on every order, emergency exit, execution and
+  duplicate protection stay. All are runtime-tunable (`config.TUNABLE`).
+* **Multi-asset**: every selected symbol (UI: up to 6) trades at the same time, sharing margin and the total cap.
+* **Learning never resets**: setup = symbol | side vs M1 trend (+swing) | tape | spread regime; no time decay;
+  proven setups get more orders/size (x up to 2), losing setups are mostly skipped (Thompson re-exploration at
+  min lot). Memory is stored locally AND in a Render Key Value instance (`RB_LEARN_REDIS_URL`, internal URL
+  only, never logged) so it survives redeploys; the newer copy (more trades) wins on start.
+* MT5 app indicators: TickerAll exposes candles/ticks/orders only - indicators added inside the MT5 app cannot
+  be read; any named indicator can be computed from the broker candles instead.
+
+## Trading engine (t29u base): Immediate Continuous Score Momentum Scalper (microburst.py + mtf.py + trader.py)
 
 One engine, refactored in place (Rapid Micro-Burst -> Pre-Burst -> Continuous Directional -> Fast Candle
 Momentum Batch Scalper -> this). START evaluates after ~1 s / 3 live ticks (warm-up reduced from 2.5 s).

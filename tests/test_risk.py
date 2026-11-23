@@ -1,5 +1,6 @@
 """Unit tests for sizing, exposure limits, halts and pacing."""
 from rapidburst.config import EngineConfig
+from tests.harness import conservative
 from rapidburst.risk import (AccountView, EntryPacer, OpenPos, RiskGuard, floor_to_step, normalize_volume,
                              size_position)
 
@@ -22,44 +23,43 @@ def test_size_xauusd():
 
 
 def test_size_min_lot_too_risky_is_rejected():
-    cfg = EngineConfig(risk_per_trade_pct=0.25)
+    cfg = conservative(risk_per_trade_pct=0.25)
     r = size_position(200, cfg, 15.0, 0.01, 1.0, 0.01, 100, 0.01)  # min lot risk $15 = 7.5% of $200
     assert r.volume == 0.01 and "min lot floor" in r.note           # no minimum-balance rule
-    r = size_position(200, EngineConfig(small_account_max_loss_pct=5), 15.0, 0.01, 1.0, 0.01, 100, 0.01)
+    r = size_position(200, conservative(small_account_max_loss_pct=5), 15.0, 0.01, 1.0, 0.01, 100, 0.01)
     assert r.volume == 0.0 and "small-account cap" in r.note        # optional cap still available
 
 
 def test_size_small_account_min_lot_fallback():
     # $10 Exness demo, BTCUSDm: tick 0.01, $0.01/tick/lot, SL $25 -> min lot 0.01 loses $0.25 (2.5%)
-    cfg = EngineConfig()
+    cfg = conservative()
     r = size_position(10.0, cfg, 25.0, 0.01, 0.01, 0.01, 200, 0.01)
     assert r.volume == 0.01 and abs(r.risk_money - 0.25) < 1e-9 and "min lot floor" in r.note
     # SL $60 -> $0.60 = 6% of $10: still trades (no minimum balance); $2 account too
     assert size_position(10.0, cfg, 60.0, 0.01, 0.01, 0.01, 200, 0.01).volume == 0.01
     assert size_position(2.0, cfg, 25.0, 0.01, 0.01, 0.01, 200, 0.01).volume == 0.01
     # optional configurable cap
-    capped = EngineConfig(small_account_max_loss_pct=5)
+    capped = conservative(small_account_max_loss_pct=5)
     r = size_position(10.0, capped, 60.0, 0.01, 0.01, 0.01, 200, 0.01)
     assert r.volume == 0.0 and "0.60" in r.note
-    assert size_position(10.0, EngineConfig(small_account_max_loss_pct=10), 60.0, 0.01, 0.01, 0.01, 200, 0.01).volume == 0.01
+    assert size_position(10.0, conservative(small_account_max_loss_pct=10), 60.0, 0.01, 0.01, 0.01, 200, 0.01).volume == 0.01
     # lots scale up automatically as equity grows
     assert size_position(10_000.0, cfg, 25.0, 0.01, 0.01, 0.01, 200, 0.01).volume > 0.01
 
 
-def test_floor_mode_basket_cap_and_free_margin():
+def test_floor_mode_total_risk_cap_and_free_margin():
     from rapidburst.risk import AccountView, RiskGuard
-    g = RiskGuard(EngineConfig())
+    g = RiskGuard(EngineConfig(max_total_risk_pct=10))
     ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 2.0, 0.0), 0.01, 0.4, 0.45, True, 900.0,
                             floor_mode=True)
-    assert not ok and "small-account basket cap" in why     # 13% of equity > 10% basket cap
-    g = RiskGuard(EngineConfig(small_account_batch_risk_pct=15))
+    assert not ok and "total stop-risk cap" in why          # 13% of equity > 10% total cap
+    g = RiskGuard(EngineConfig())                           # t30u default: 100% of equity across all baskets
     ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 2.0, 0.0), 0.01, 0.4, 0.45, True, 900.0,
                             floor_mode=True)
-    assert ok, why      # margin use 22% would fail the normal rules
+    assert ok, why
     ok, why = g.check_entry("BTCUSDm", "BUY", [], AccountView(3.0, 3.0, 0.3, 0.0), 0.01, 0.4, 0.45, True, 900.0,
                             floor_mode=True)
     assert not ok and "insufficient free margin for the minimum lot" in why
-
 
 def test_size_capped_by_max_lot():
     cfg = EngineConfig(risk_per_trade_pct=5, max_lot_per_order=0.5)
@@ -68,7 +68,7 @@ def test_size_capped_by_max_lot():
 
 
 def test_limits():
-    cfg = EngineConfig(max_positions_total=3, max_positions_per_symbol=2, max_total_lots=1.0, max_total_risk_pct=1.0)
+    cfg = conservative(max_positions_total=3, max_positions_per_symbol=2, max_total_lots=1.0, max_total_risk_pct=1.0)
     g = RiskGuard(cfg)
     win = OpenPos("XAUUSD", "BUY", 0.2, 5.0, 10)
     lose = OpenPos("XAUUSD", "BUY", 0.2, -5.0, 10)
@@ -127,18 +127,16 @@ def test_pacer_has_no_fixed_cooldowns_and_streak_only_raises_the_bar():
     assert "in flight" in p.can_enter("X", 9999)[1]
 
 
-def test_min_lot_floor_allows_a_capped_multi_order_basket_and_safe_mode_tolerates_it():
-    cfg = EngineConfig(equity_drawdown_pct=8, safe_min_stopouts=1.5, safe_dd_cap_pct=30, small_account_batch_risk_pct=10)
+def test_min_lot_floor_total_cap_and_catastrophic_safe_mode():
+    cfg = EngineConfig()                                  # t30u aggressive defaults
     g = RiskGuard(cfg)
     g.reset_session(13.0)
     small = AccountView(13, 13, 12, 0)
-    one = OpenPos("BTCUSDm", "BUY", 0.01, -0.1, 0.6)
-    assert g.check_entry("BTCUSDm", "BUY", [], small, 0.01, 0.6, 1.0, True, floor_mode=True)[0]
-    ok, why = g.check_entry("BTCUSDm", "BUY", [one], small, 0.01, 0.6, 1.0, True, batch_leg=True, floor_mode=True)
-    assert ok, why                                       # 2 x 0.6 = 1.2 <= 1.3 (10% of 13)
-    ok, why = g.check_entry("BTCUSDm", "BUY", [one, one], small, 0.01, 0.6, 1.0, True, batch_leg=True, floor_mode=True)
-    assert not ok and "small-account basket cap" in why  # a third would exceed the cap
-    g.floor_risk = 1.2
-    assert abs(g.dd_limit() - 1.8) < 1e-9                # 1.5 x the basket risk, not 8% (= 1.04)
-    assert g.update(1, AccountView(13, 11.8, 11, 0)) is None          # one full basket stop: keep going
-    assert g.update(2, AccountView(13, 11.1, 11, 0))[0] == "safe"
+    one = OpenPos("BTCUSDm", "BUY", 0.01, -0.1, 4.0)
+    assert g.check_entry("BTCUSDm", "BUY", [one, one], small, 0.01, 4.0, 1.0, True, batch_leg=True, floor_mode=True)[0]
+    ok, why = g.check_entry("BTCUSDm", "BUY", [one, one, one], small, 0.01, 2.0, 1.0, True, batch_leg=True, floor_mode=True)
+    assert not ok and "total stop-risk cap" in why       # 14 > 100% of 13
+    g.floor_risk = 4.0
+    assert abs(g.dd_limit() - 6.5) < 1e-9                # safe mode only at a 50% drawdown
+    assert g.update(1, AccountView(13, 7.0, 6, 0)) is None
+    assert g.update(2, AccountView(13, 6.4, 6, 0))[0] == "safe"

@@ -9,6 +9,18 @@ from rapidburst.secure_store import SecureStore
 from rapidburst.trader import Trader
 from tests.sim_broker import SimBroker
 
+# Pre-t30u risk limits. The engine defaults are now AGGRESSIVE (owner request); mechanism tests (BE/trail,
+# protection, exits, adds) run with these moderate limits unless a test passes its own config.
+CONSERVATIVE = dict(risk_per_trade_pct=0.5, risk_per_batch_pct=1.0, small_account_batch_risk_pct=10.0,
+                    max_total_risk_pct=3.0, max_margin_use_pct=50.0, margin_use_max_pct=50.0,
+                    min_margin_level_pct=200.0, max_total_lots=2.0, max_lot_per_order=1.0, max_batch_lots=1.0,
+                    max_total_notional_x=500.0, max_positions_total=10, group_loss_pct=2.0,
+                    equity_drawdown_pct=8.0, safe_dd_cap_pct=30.0, safe_probe_batches=3)
+
+
+def conservative(**kw) -> EngineConfig:
+    return EngineConfig(**dict(CONSERVATIVE, **kw))
+
 
 class Invariants:
     def __init__(self):
@@ -49,7 +61,7 @@ def instrument(broker: SimBroker, cfg: EngineConfig, inv: Invariants):
 
 
 def make(tmp_path, ticks_by_symbol, cfg=None, **broker_kw):
-    cfg = cfg or EngineConfig()
+    cfg = cfg or conservative()
     broker = SimBroker(ticks_by_symbol, **broker_kw)
     store = SecureStore(str(tmp_path))
     store.save_credentials({"login": 12345678, "password": "test-only", "server": "Sim-Demo"})

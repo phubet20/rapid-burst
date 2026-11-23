@@ -193,7 +193,7 @@ def test_parallel_batch_send_on_a_thread_safe_broker(tmp_path):
     assert len(new) >= 2 and all(t.startswith("rb-io") for t in threads), (new, threads)
 
 
-def test_open_basket_is_never_added_to(tmp_path):
+def test_basket_without_break_even_is_never_added_to(tmp_path):
     tr, br = make(tmp_path, {"BTCUSDm": series_up()})
     _small_account(br, balance=1000.0, margin_per_lot=100.0)
     _start(tr, br, T0 + 1)
@@ -206,7 +206,7 @@ def test_open_basket_is_never_added_to(tmp_path):
     tr._hard_risk_exit = lambda *a, **k: None
     run(tr, br, T0 + 100.9, T0 + 110)
     assert len(br.positions_) == n
-    assert "no adds" in tr.sym_status["BTCUSDm"]["reason"]
+    assert "waits for the break-even stop" in tr.sym_status["BTCUSDm"]["reason"]   # never averaging down
 
 
 def test_verified_closed_ticket_is_never_closed_twice(tmp_path):

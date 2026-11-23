@@ -7,7 +7,7 @@ import math
 import rapidburst.microburst as mb
 from rapidburst.config import TUNABLE, EngineConfig, validate_tune
 from rapidburst.microburst import Micro, decide
-from tests.harness import make, run
+from tests.harness import conservative, make, run
 from tests.paths import T0, _force_signal, _small_account, _start, series_up
 
 
@@ -62,7 +62,7 @@ def _entries(tr):
 
 
 def test_small_account_opens_several_min_lots_inside_the_basket_cap(tmp_path):
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()})
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, conservative(max_total_risk_pct=10.0))
     _small_account(br, balance=20.0, margin_per_lot=10.0)
     _start(tr, br, T0 + 1)
     _force_signal(tr, "BUY", origin=T0 + 99.0)
@@ -72,13 +72,13 @@ def test_small_account_opens_several_min_lots_inside_the_basket_cap(tmp_path):
 
 
 def test_small_account_refuses_a_min_lot_that_breaks_the_basket_cap(tmp_path):
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()})
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, conservative(max_total_risk_pct=10.0))
     _small_account(br, balance=5.0, margin_per_lot=10.0)
     _start(tr, br, T0 + 1)
     _force_signal(tr, "BUY", origin=T0 + 99.0)
     run(tr, br, T0 + 1, T0 + 20)
     assert not _entries(tr)
-    assert any("small-account basket cap" in json.dumps(d) for d in tr.decisions)
+    assert any("basket risk budget" in json.dumps(d) for d in tr.decisions)
 
 
 def test_backend_accepts_only_numeric_tune_values():

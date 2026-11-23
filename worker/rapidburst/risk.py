@@ -1,7 +1,8 @@
 """Position sizing, exposure limits and entry pacing (pure logic).
 
 Hard rules enforced here:
-  * every order has a protective stop; size is derived from the stop distance
+  * every order has a protective stop; size is derived from the stop distance (t30u: aggressive defaults
+    requested by the owner - up to 50 % of equity per basket, 100 % across all open baskets, margin <= 90 %)
   * never add to a losing position (no martingale / averaging / grid)
   * bounded positions per symbol and in total, bounded lots and open risk
   * NO all-day daily-loss halt: equity drawdown => SAFE MODE (flatten, pause new entries, resume reduced)
@@ -173,18 +174,18 @@ class RiskGuard:
             if sum(p.notional for p in pos) + new_notional > cap_n + 1e-9:
                 return False, f"max total exposure {cfg.max_total_notional_x:.0f}x equity would be exceeded"
         if floor_mode:
-            # broker-minimum lot on a tiny account: the per-order % cannot apply (the lot cannot be smaller), so
-            # the SMALL-ACCOUNT BASKET CAP applies instead: the stop risk of every open bot order plus this one
-            # must stay <= small_account_batch_risk_pct of equity (all hard stops hit = at most that loss)
-            cap = acct.equity * cfg.small_account_batch_risk_pct / 100.0
+            # broker-minimum lot on a small account: the per-order % cannot apply (the lot cannot be smaller); the
+            # basket budget is sized by the trader, here only the TOTAL stop risk of all open bot orders (every
+            # symbol) plus this one must stay <= max_total_risk_pct of equity
+            cap = acct.equity * cfg.max_total_risk_pct / 100.0
             tot = sum(p.risk_money for p in pos) + new_risk
             if tot > cap + 1e-9:
-                return False, (f"small-account basket cap: open stop risk {tot:.2f} > {cfg.small_account_batch_risk_pct:g}% "
+                return False, (f"total stop-risk cap: open stop risk {tot:.2f} > {cfg.max_total_risk_pct:g}% "
                                f"of equity ({cap:.2f})")
             if new_margin > acct.margin_free + 1e-9:
                 return False, (f"insufficient free margin for the minimum lot: needs {new_margin:.2f}, "
                                f"free {acct.margin_free:.2f}")
-            return True, "ok (min-lot floor, small-account basket cap)"
+            return True, "ok (min-lot floor, total stop-risk cap)"
         risk_cap = acct.equity * cfg.max_total_risk_pct / 100.0
         if sum(p.risk_money for p in pos) + new_risk > risk_cap + 1e-9:
             return False, f"max open risk {risk_cap:.2f} would be exceeded"

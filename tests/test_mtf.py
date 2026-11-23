@@ -96,14 +96,17 @@ def _view(bias, supported=True, slope=0.1, accel=0.05, vol=1.5, exhaust=0):
     return v
 
 
-def test_m5_is_a_filter_not_a_gate():
+def test_m1_main_trend_filters_and_counter_trend_needs_a_structure_break():
     cfg = EngineConfig()
-    with_m5 = decide(_live(mtf=_view(0.7)), cfg)
+    with_trend = decide(_live(mtf=_view(0.7)), cfg)
     amb = decide(_live(mtf=_view(-0.3, supported=False)), cfg)
     against = decide(_live(mtf=_view(-0.8, supported=True)), cfg)
-    assert with_m5.side == "BUY" and "D" in with_m5.reason and "E" in with_m5.reason
-    assert amb.buy < with_m5.buy                       # ambiguous / weak opposite M5 only costs strength
-    assert against.side == "NO TRADE" and "M5 clearly against" in against.reason
+    assert with_trend.side == "BUY" and "D" in with_trend.reason and "E" in with_trend.reason
+    assert amb.buy < with_trend.buy                    # weak opposite M1 trend only costs strength
+    assert against.side == "NO TRADE" and "M1 main trend against" in against.reason
+    v = _view(-0.8, supported=True)
+    v.m1.sbreak = 1                                    # price just broke the last M1 swing high
+    assert "M1 main trend against" not in decide(_live(mtf=v), cfg).reason
 
 
 def test_exit_needs_combined_exhaustion_in_profit_not_one_signal():
@@ -134,7 +137,7 @@ def test_candles_polled_at_a_sensible_rate_not_every_loop(tmp_path):
     run(tr, br, T0 + 1, T0 + 121)                    # 400 loops
     m1 = [c for c in calls if c[1] == "M1"]
     m5 = [c for c in calls if c[1] == "M5"]
-    assert 5 <= len(m1) <= 8 and 2 <= len(m5) <= 3, (len(m1), len(m5))
+    assert 12 <= len(m1) <= 17 and not m5, (len(m1), len(m5))       # t30u: M1 only, every ~8 s
     assert all(isinstance(h, int) for _, _, h in calls)   # integer look-back hours
 
 

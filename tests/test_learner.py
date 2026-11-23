@@ -18,23 +18,26 @@ def _feed(lr, key, rs, now=NOW):
         lr.record({"bucket": key, "r": r, "symbol": "X"}, now=now)
 
 
-def test_cold_start_is_min_lot_and_fast_cut():
+def test_cold_start_trades_at_normal_size():
     lr = Learner(rng=random.Random(1))
-    d = lr.decide("impulse|aligned|tight", now=NOW)
-    assert d.allow and d.min_lot and d.fast_cut and d.state == "cold"
+    d = lr.decide("BTCUSDm|with|fast|tight", now=NOW)
+    assert d.allow and not d.min_lot and d.state == "cold"
 
 
-def test_few_losses_do_not_disable_but_many_do_and_decay_reexplores():
-    lr = Learner(min_samples=8, rng=random.Random(2))
-    k = "momentum|counter|wide"
+def test_few_losses_do_not_disable_but_many_do_and_memory_is_never_reset():
+    lr = Learner(min_samples=8, half_life_h=0, rng=random.Random(2))
+    k = "BTCUSDm|counter|normal|wide"
     _feed(lr, k, [-1.0] * 5)
     assert lr.decide(k, now=NOW).allow                      # under the minimum sample: never disabled
     _feed(lr, k, [-1.0, -0.8, -1.0, -0.9, -1.0, -1.0, -0.7])
     allows = sum(lr.decide(k, now=NOW).allow for _ in range(200))
     assert allows < 10                                      # clearly losing -> skipped
-    later = NOW + 10 * 36 * 3600                            # 10 half-lives later
-    d = lr.decide(k, now=later)
-    assert d.allow and d.state == "cold" and d.min_lot      # decayed back to exploration at min lot
+    later = NOW + 365 * 24 * 3600                           # a year later: still remembered (no decay)
+    assert sum(lr.decide(k, now=later).allow for _ in range(200)) < 10
+    assert lr.summary(now=later)["decay"].startswith("none")
+    old = Learner(min_samples=8, half_life_h=36, rng=random.Random(2))   # optional decay still works
+    _feed(old, k, [-1.0] * 12)
+    assert old.decide(k, now=NOW + 10 * 36 * 3600).state == "cold"
 
 
 def test_only_proven_positive_expectancy_scales_size_and_is_capped():
@@ -44,9 +47,9 @@ def test_only_proven_positive_expectancy_scales_size_and_is_capped():
     d = lr.decide(k, now=NOW)
     assert d.state == "proven" and not d.min_lot and 1.0 < d.mult <= 2.0
     lr2 = Learner(min_samples=8, rng=random.Random(3))
-    _feed(lr2, k, [0.5, -0.5] * 6)                         # ~zero expectancy -> stays min lot
+    _feed(lr2, k, [0.5, -0.5] * 6)                         # ~zero expectancy -> normal size, no boost
     d2 = lr2.decide(k, now=NOW)
-    assert d2.allow and d2.min_lot and d2.mult == 1.0
+    assert d2.allow and not d2.min_lot and d2.mult == 1.0
 
 
 def test_outliers_are_clipped_and_journal_persists(tmp_path):
@@ -67,7 +70,7 @@ def test_regime_buckets():
     assert regime(0.1, 0.0) == "unknown"
 
 
-def test_trader_cold_start_min_lot_journals_closed_bursts(tmp_path):
+def test_trader_journals_closed_baskets_by_setup(tmp_path):
     cfg = EngineConfig()
     cfg.learn_min_samples = 100                          # stay in cold start for this run
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
@@ -75,9 +78,10 @@ def test_trader_cold_start_min_lot_journals_closed_bursts(tmp_path):
     _start(tr, br, T0 + 1)
     run(tr, br, T0 + 1, T0 + 200)
     entries = [l["msg"] for l in tr.logs if l["msg"].startswith("ENTRY")]
-    assert entries and all(float(m.split()[2]) == 0.01 for m in entries), entries[:3]
+    assert entries
     assert tr.learner.total >= 1
     j = tr.learner.journal[0]
+    assert j["bucket"].startswith("BTCUSDm|")
     for k in ("symbol", "side", "bucket", "type", "rel", "regime", "hour", "comps", "hold_s", "exit", "pl", "r"):
         assert k in j, k
     for k in ("velocity", "accel", "efficiency", "sequence", "candle", "structure", "flow"):
@@ -93,11 +97,79 @@ def test_trader_skips_a_disabled_bucket_with_visible_reason(tmp_path):
     cfg = EngineConfig()
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=1.0)
-    for rel in ("fast", "normal", "quiet", "chop"):
-        for reg in ("tight", "mid", "wide", "unknown"):
-            _feed(tr.learner, f"micro|{rel}|{reg}", [-1.0] * 15, now=T0)
+    for rel in ("with", "counter", "flat", "trend?"):
+        for sw in ("", "+swing", "-swing"):
+            for tape in ("fast", "normal", "quiet", "chop"):
+                for reg in ("tight", "mid", "wide", "unknown"):
+                    _feed(tr.learner, f"BTCUSDm|{rel}{sw}|{tape}|{reg}", [-1.0] * 15, now=T0)
     tr.decisions = collections.deque(maxlen=10_000)
     _start(tr, br, T0 + 1)
     run(tr, br, T0 + 1, T0 + 200)
     assert not [l for l in tr.logs if l["msg"].startswith("ENTRY")]
     assert any("losing bucket" in d["outcome"] for d in tr.decisions)
+
+
+class _FakeKV:
+    def __init__(self):
+        self.d = {}
+
+    def get(self, k):
+        return self.d.get(k)
+
+    def set(self, k, v):
+        self.d[k] = v
+
+
+def test_memory_survives_a_redeploy_through_the_remote_store(tmp_path):
+    kv = _FakeKV()
+    lr = Learner(path=str(tmp_path / "learning.json"), remote=kv)
+    _feed(lr, "BTCUSDm|with|fast|tight", [0.8, -0.2, 0.5])
+    assert kv.d and lr.remote_status == "ok"
+    fresh = Learner(path=str(tmp_path / "new-disk.json"), remote=kv)     # new instance, empty disk
+    assert fresh.total == 3 and "BTCUSDm|with|fast|tight" in fresh.buckets
+    assert fresh.summary()["memory"] == "ok"
+
+
+def test_resp_client_against_a_tiny_server():
+    import socket
+    import threading
+
+    from rapidburst.kvstore import RedisKV
+    store, seen = {}, []
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+
+    def serve():
+        for _ in range(3):
+            c, _ = srv.accept()
+            f = c.makefile("rb")
+            try:
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    n = int(line[1:])
+                    args = []
+                    for _ in range(n):
+                        ln = int(f.readline()[1:])
+                        args.append(f.read(ln + 2)[:-2])
+                    seen.append(args[0])
+                    if args[0] in (b"AUTH", b"SELECT"):
+                        c.sendall(b"+OK\r\n")
+                    elif args[0] == b"SET":
+                        store[args[1]] = args[2]
+                        c.sendall(b"+OK\r\n")
+                    elif args[0] == b"GET":
+                        v = store.get(args[1])
+                        c.sendall(b"$-1\r\n" if v is None else b"$%d\r\n%s\r\n" % (len(v), v))
+            finally:
+                c.close()
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    kv = RedisKV(f"redis://user:pw@127.0.0.1:{srv.getsockname()[1]}/1")
+    assert kv.get("k") is None
+    kv.set("k", b'{"total": 1}')
+    assert kv.get("k") == b'{"total": 1}'
+    assert seen.count(b"AUTH") == 3 and b"SELECT" in seen
+    srv.close()
