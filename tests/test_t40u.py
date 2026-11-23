@@ -138,13 +138,14 @@ def test_t41u_profit_lock_closes_before_red(tmp_path):
     tr._micro_exit = lambda *a, **k: None
     tr._reversal_check = lambda *a, **k: None
     tr._zone_target = lambda *a, **k: None
+    tr.cfg.tp_target_money = 1e7                                      # target far away: test the lock alone
     tr._net = lambda legs, live: 1000.0                               # profit -> locked (peak 1000)
     run(tr, br, T0 + 3.3, T0 + 4)
     assert held <= set(br.positions_)
     tr._net = lambda legs, live: 500.0                                # gave back 50% (> 40%) -> close at once
     run(tr, br, T0 + 4.3, T0 + 5.2)
     assert not (held & set(br.positions_))
-    assert any("PROFIT LOCK" in l["msg"] for l in tr.logs if l["msg"].startswith("EXIT GROUP"))
+    assert any(("PROFIT LOCK" in l["msg"] or "TAKE PROFIT" in l["msg"]) for l in tr.logs if l["msg"].startswith("EXIT GROUP"))
 
 
 def test_t42u_never_self_stops_and_guardian_watches(tmp_path):
@@ -159,3 +160,42 @@ def test_t42u_never_self_stops_and_guardian_watches(tmp_path):
     run(tr, br, T0 + 3.3, T0 + 6)
     assert tr.running and br.positions_                               # red, still running, nothing closed
     assert any(l["msg"].startswith("GUARD BTCUSDm") for l in tr.logs) and "BTCUSDm" in tr.guardian.view
+
+
+def _green_session(tmp_path):
+    tr, br, ctl = _session(tmp_path, hedge_enabled=False, avg_enabled=False)
+    ctl["side"] = "BUY"
+    run(tr, br, T0 + 1.3, T0 + 3)
+    ctl["side"] = "NO TRADE"
+    tr._micro_exit = lambda *a, **k: None
+    tr._reversal_check = lambda *a, **k: None
+    tr._zone_target = lambda *a, **k: None
+    return tr, br, ctl, set(br.positions_)
+
+
+def test_t43u_take_profit_at_target_grab(tmp_path):
+    tr, br, ctl, held = _green_session(tmp_path)
+    tr._net = lambda legs, live: 1e6                                   # far beyond 1.5x any target -> grab now
+    run(tr, br, T0 + 3.3, T0 + 4.2)
+    assert not (held & set(br.positions_))
+    assert any("TAKE PROFIT" in l["msg"] for l in tr.logs if l["msg"].startswith("EXIT GROUP"))
+
+
+def test_t43u_early_close_on_opposite_signal_while_green(tmp_path):
+    tr, br, ctl, held = _green_session(tmp_path)
+    g = tr.bursts[next(iter(tr.pos_state.values())).batch_id]
+    g["lock_peak"] = 0.0
+    tr._net = lambda legs, live: 0.02                                  # thin green, below every lock level
+    ctl["side"] = "SELL"
+    tr.cfg.hedge_enabled = False
+    run(tr, br, T0 + 3.3, T0 + 4.2)
+    assert any("EARLY CLOSE" in l["msg"] for l in tr.logs if l["msg"].startswith("EXIT GROUP"))
+
+
+def test_t43u_no_break_even_close_and_red_never_closed(tmp_path):
+    tr, br, ctl, held = _green_session(tmp_path)
+    for ps in tr.pos_state.values():                                   # an engine BE level that price is below
+        ps.vsl, ps.sl_state = 1e9, "BE"
+    tr._net = lambda legs, live: -0.5
+    run(tr, br, T0 + 3.3, T0 + 6)
+    assert held <= set(br.positions_)                                  # red: never closed (no BE close, no SL)

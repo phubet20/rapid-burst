@@ -37,7 +37,8 @@ TUNABLE = {
     "regime_chase_atr": (0.5, 6.0), "regime_bonus": (0.0, 0.3), "hedge_enabled": (0, 1), "recovery_after_s": (5.0, 3600.0),
     "recovery_loss_pct": (0.2, 50.0), "avg_enabled": (0, 1), "avg_spacing_atr": (0.2, 10.0), "avg_max_layers": (0, 10),
     "avg_lot_mult": (1.0, 3.0), "cycle_tp_pct": (0.01, 10.0), "tp_min_money": (0.0, 100.0),
-    "profit_lock_min_money": (0.0, 100.0), "profit_lock_spread_x": (0.5, 10.0), "profit_lock_giveback": (0.1, 0.9),
+    "tp_target_atr": (0.05, 3.0), "tp_target_money": (0.0, 1000.0), "tp_target_giveback": (0.05, 0.9),
+    "tp_grab_x": (1.0, 5.0), "profit_lock_min_money": (0.0, 100.0), "profit_lock_spread_x": (0.5, 10.0), "profit_lock_giveback": (0.1, 0.9),
     "profit_lock_floor_frac": (0.0, 0.9), "profit_lock_confirm_s": (0.0, 3.0), "zones_enabled": (0, 1), "zone_weight": (0.0, 0.3), "zone_impulse_atr": (0.5, 3.0),
     "pullback_hold": (0, 1), "exit_confirm_s": (0.0, 5.0), "exit_confirm_ticks": (1, 20), "exit_outlier_atr": (0.2, 5.0), "exit_stale_s": (0.5, 10.0),
     "candle_poll_m5_s": (5, 120),
@@ -205,6 +206,12 @@ class EngineConfig:
     # t41u fast PROFIT LOCK: once a basket's net > max(profit_lock_min_money, profit_lock_spread_x x its spread cost)
     # the profit is locked; it closes at once (short anti-jitter confirm) when the net gives back
     # profit_lock_giveback of its peak or falls to the floor (profit_lock_floor_frac x the lock level) - before red
+    # t43u profit TARGET (not tiny): basket net >= max(tp_target_money, tp_target_atr x M1 ATR on its lots); after it
+    # the profit is grabbed when it gives back tp_target_giveback of its peak, or at once at tp_grab_x x the target
+    tp_target_atr: float = 0.4
+    tp_target_money: float = 0.10
+    tp_target_giveback: float = 0.2
+    tp_grab_x: float = 1.5
     profit_lock_min_money: float = 0.03
     profit_lock_spread_x: float = 2.0
     profit_lock_giveback: float = 0.4

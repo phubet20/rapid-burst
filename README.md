@@ -470,3 +470,18 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   in profit (`CYCLE TAKE PROFIT`).
 * REPLAY on real Binance data (simulated broker, t40u settings before the t41u lock): BTCUSDT 4h - 75 baskets, 90.7%
   winners but profit factor 0.22 and equity 56.60 -> 0.42 (-99%): small wins, a few huge losses with no stop.
+
+## t43u — profit target, fast grab, no break-even close
+
+* **Profit target** per basket: net >= max(`tp_target_money` 0.10, `tp_target_atr` 0.4 x M1 ATR on its lots, the lock
+  level). Once reached the profit is grabbed when it gives back `tp_target_giveback` (20%) of its peak, or at once at
+  `tp_grab_x` (1.5x) the target. Below the target the t41u PROFIT LOCK still closes a fading profit before red.
+* **EARLY CLOSE**: a green basket closes at once (0.3 s confirm) when the opposite side signals or price turns
+  against it while the profit is thin - before it turns red.
+* **No break-even close** in owner mode (it ended at ~0 / slightly negative after costs). Engine BE/trail levels no
+  longer close anything; every soft exit requires the basket net > 0.
+* **Loss-closing rules that still exist (all modes of owner mode):** only (1) the user's STOP, (2) the emergency
+  close at margin level < `emergency_margin_level_pct` (110%), (3) the data-feed-loss emergency
+  (`emergency_stale_s`). A red basket is never closed by the strategy: the loss guardian hedges / layers it and the
+  cycle closes when the combined net is in profit. This cannot guarantee the account never decreases: open losses
+  can grow without a stop until the margin emergency closes them.

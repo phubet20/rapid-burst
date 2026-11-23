@@ -1799,23 +1799,34 @@ class Trader:
             if money > lock:
                 g["lock_peak"] = max(float(g.get("lock_peak", 0.0)), money)
             peak = float(g.get("lock_peak", 0.0))
-            if peak > 0 and green:
-                floor = max(cfg.tp_min_money, cfg.profit_lock_floor_frac * lock)
-                if money <= max(floor, peak * (1.0 - cfg.profit_lock_giveback)):
-                    lk = (f"PROFIT LOCK: basket net {money:+.2f} fell from its peak {peak:+.2f} (lock {lock:.2f}) - "
-                          f"taking the profit before it turns red")
-                    reason = self._confirm_soft_exit(key, sym, lk, m, now_wall, cfg.profit_lock_confirm_s, 1)
-                    if reason and self._net(legs, live) > cfg.tp_min_money:
-                        return reason, legs
-                    return None, None
+            vol = sum(ps.volume for ps in legs)
+            # t43u profit TARGET: a reasonable profit (>= tp_target_atr x M1 ATR on the basket's lots, not tiny)
+            tgt = max(cfg.tp_target_money, lock,
+                      (cfg.tp_target_atr * m.atr / ts * tv * vol) if ts and tv and getattr(m, "atr", 0) else 0.0)
+            g["tp_target"] = round(tgt, 2)
+            fast = None
+            if green and money >= cfg.tp_grab_x * tgt:
+                fast = f"TAKE PROFIT: basket net {money:+.2f} >= {cfg.tp_grab_x:g}x the target {tgt:.2f} - grab it now"
+            elif green and peak >= tgt and money <= peak * (1.0 - cfg.tp_target_giveback):
+                fast = (f"TAKE PROFIT: target {tgt:.2f} reached (peak {peak:+.2f}), net {money:+.2f} gave back "
+                        f"{cfg.tp_target_giveback:.0%} - grab it before it comes back")
+            elif green and peak > 0 and money <= max(cfg.tp_min_money, cfg.profit_lock_floor_frac * lock,
+                                                     peak * (1.0 - cfg.profit_lock_giveback)):
+                fast = (f"PROFIT LOCK: basket net {money:+.2f} fell from its peak {peak:+.2f} (lock {lock:.2f}) - "
+                        f"taking the profit before it turns red")
+            elif green and (st.side == ("SELL" if d > 0 else "BUY")
+                            or (getattr(m, "ready", False) and d * m.vel < 0 and money < 0.5 * max(peak, lock))):
+                # t43u: about to turn negative by the signal (opposite signal, or price moving against while thin)
+                fast = (f"EARLY CLOSE: {'opposite ' + st.side + ' signal' if st.side in ('BUY', 'SELL') else 'price turning against'}"
+                        f" while still green ({money:+.2f}) - close before it turns red")
+            if fast:
+                reason = self._confirm_soft_exit(key, sym, fast, m, now_wall, cfg.profit_lock_confirm_s, 1)
+                if reason and self._net(legs, live) > cfg.tp_min_money:
+                    return reason, legs
+                return None, None
         if green:
-            self._protect_basket(key, legs, live, m, st, now_wall)          # engine-side BE/trail level (no broker SL)
-            for ps in legs:
-                px = self._exec_px(ps, live.get(ps.ticket) or {}, m if getattr(m, "bid", 0) else None, now_wall)
-                if px is not None and ps.vsl and (px - ps.vsl) * d <= 0:
-                    soft = f"{ps.sl_state} profit-protection level hit at {px} (engine trail, basket {money:+.2f})"
-                    break
-            soft = soft or self._zone_target(legs, live, m) or self._micro_exit(key, legs, live, m, st, now_wall)
+            # t43u: no break-even close (it ended at ~0 / slightly negative after costs) - profit exits only
+            soft = self._zone_target(legs, live, m) or self._micro_exit(key, legs, live, m, st, now_wall)
             if not soft:
                 soft = self._reversal_check(legs, m, st)
             if soft and self._pullback_hold(legs, soft, m, now_wall, key):
@@ -2497,6 +2508,8 @@ class Trader:
                 "guardian": dict(self.guardian.view),
                 "emergency_margin_level_pct": c.emergency_margin_level_pct, "learning_enabled": c.learning_enabled,
                 "profit_lock_min_money": c.profit_lock_min_money, "profit_lock_giveback": c.profit_lock_giveback,
+                "tp_target_atr": c.tp_target_atr, "tp_target_money": c.tp_target_money, "tp_grab_x": c.tp_grab_x,
+                "loss_closes": "ONLY: user STOP, margin level < emergency level, data-feed loss",
                 "sl_rule": f"hard stop max({c.sl_atr:g}x M1 ATR, {c.sl_spread_mult:g}x spread) at the broker -> basket BE "
                            f"(avg + costs + {c.be_lock_spread_mult:g}x spread) once net >= max({c.be_trigger_atr:g}x ATR, "
                            f"{c.be_trigger_spread:g}x spread) -> dynamic trail {c.trail_atr_strong:g}/{c.trail_atr_frac:g}/"
