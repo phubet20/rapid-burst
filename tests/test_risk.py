@@ -103,20 +103,36 @@ def test_safe_mode_instead_of_daily_halt():
     assert g.halted and g.safe_until - 304 == 600
 
 
-def test_pacer():
-    cfg = EngineConfig(cooldown_seconds=8, max_entries_per_minute=3, loss_cooldown_seconds=45,
-                       max_consecutive_losses=2, loss_pause_seconds=600)
+def test_pacer_has_no_fixed_cooldowns_and_streak_only_raises_the_bar():
+    cfg = EngineConfig(max_entries_per_minute=3, loss_streak_threshold_add=0.03)
     p = EntryPacer(cfg)
     assert p.can_enter("X", 0)[0]
     p.on_entry("X", 0)
-    assert not p.can_enter("X", 5)[0]
-    p.on_entry("X", 9); p.on_entry("X", 18)
-    ok, why = p.can_enter("X", 27)
-    assert not ok and "minute" in why
+    assert p.can_enter("X", 0.1)[0]                       # immediate re-entry allowed (no cooldown)
+    p.on_entry("X", 1); p.on_entry("X", 2)
+    ok, why = p.can_enter("X", 3)
+    assert not ok and "minute" in why                    # API guard only
     assert p.can_enter("X", 61)[0]
-    p.on_close("X", -10, 100)
-    assert "loss cooldown" in p.can_enter("X", 120)[1]
-    p.on_close("X", -10, 150)
-    assert not p.can_enter("X", 700)[0] and p.can_enter("X", 751)[0]
+    for i in range(5):
+        p.on_close("X", -10, 100 + i)
+        assert p.can_enter("X", 100 + i)[0]               # losses never pause...
+    assert abs(p.threshold_add("X") - 0.09) < 1e-9       # ... they raise the signal bar (max 3 steps)
+    p.on_close("X", +5, 200)
+    assert p.threshold_add("X") == 0.0
     p.inflight.add("X")
     assert "in flight" in p.can_enter("X", 9999)[1]
+
+
+def test_min_lot_floor_is_one_position_at_a_time_and_safe_mode_tolerates_one_stop():
+    cfg = EngineConfig(equity_drawdown_pct=8, safe_min_stopouts=1.25, safe_dd_cap_pct=25)
+    g = RiskGuard(cfg)
+    g.reset_session(13.0)
+    small = AccountView(13, 13, 12, 0)
+    one = OpenPos("XAUUSDm", "BUY", 0.01, -0.1, 2.6)
+    assert g.check_entry("XAUUSDm", "BUY", [], small, 0.01, 2.6, 1.0, True, floor_mode=True)[0]
+    ok, why = g.check_entry("XAUUSDm", "BUY", [one], small, 0.01, 2.6, 1.0, True, batch_leg=True, floor_mode=True)
+    assert not ok and "one position at a time" in why
+    g.floor_risk = 2.6
+    assert abs(g.dd_limit() - 3.25) < 1e-9                # 1.25 stop-outs, not 8% (= 1.04)
+    assert g.update(1, AccountView(13, 10.4, 10, 0)) is None          # one normal stop loss: keep going
+    assert g.update(2, AccountView(13, 9.7, 9, 0))[0] == "safe"

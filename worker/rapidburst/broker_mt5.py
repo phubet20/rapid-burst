@@ -136,7 +136,8 @@ class MT5Broker:
         if rates is None:
             return []
         return [{"time": float(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
-                 "low": float(r["low"]), "close": float(r["close"])} for r in rates]
+                 "low": float(r["low"]), "close": float(r["close"]),
+                 "tick_volume": float(r["tick_volume"])} for r in rates]
 
     def quote_state(self, symbol: str) -> str:
         """MT5 gives server-time ticks only, so freshness cannot be proven here: 'unknown' when a

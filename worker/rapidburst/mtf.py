@@ -1,0 +1,302 @@
+"""M5 direction bias + M1 entry timing from REAL broker candles merged with the live tick stream.
+
+* Closed bars come from the broker (TickerAll GET /candles: OHLC bid + tickVolume); the forming bar is built
+  from live ticks between polls (no candle-close wait). Nothing is synthesised: when the broker sends no
+  bars, only bars observed live from ticks are used and the source says so.
+* EMA(8/21) and MACD(12,26,9) are incremental: committed state advances once per CLOSED bar; the forming
+  bar is evaluated with an O(1) "peek" on every call. A broker refresh that changes history recomputes
+  at most `maxlen` bars once per poll (not per tick).
+* tickVolume = number of price changes the broker counted (tick volume), NOT exchange volume. The live
+  bar's activity is compared with bars measured the SAME way (own live tick counts, or broker tickVolume
+  for the last closed bars) - the two sources are never mixed in one ratio.
+"""
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def _a(n: int) -> float:
+    return 2.0 / (n + 1.0)
+
+
+@dataclass
+class _St:
+    """Committed indicator state after the last closed bar."""
+    n: int = 0
+    e8: float = 0.0
+    e21: float = 0.0
+    e12: float = 0.0
+    e26: float = 0.0
+    sig: float = 0.0
+
+    def step(self, c: float) -> "_St":
+        if self.n == 0:
+            return _St(1, c, c, c, c, 0.0)
+        e12 = self.e12 + _a(12) * (c - self.e12)
+        e26 = self.e26 + _a(26) * (c - self.e26)
+        m = e12 - e26
+        sig = m if self.n == 1 else self.sig + _a(9) * (m - self.sig)
+        return _St(self.n + 1, self.e8 + _a(8) * (c - self.e8), self.e21 + _a(21) * (c - self.e21), e12, e26, sig)
+
+    @property
+    def macd(self) -> float:
+        return self.e12 - self.e26
+
+    @property
+    def hist(self) -> float:
+        return self.macd - self.sig
+
+
+@dataclass
+class TFState:
+    """What one timeframe says right now (forming bar included)."""
+    ready: bool = False
+    src: str = "none"
+    bars: int = 0
+    dir: int = 0                 # EMA trend direction (+1 up / -1 down / 0 flat)
+    trend: float = 0.0           # -1..1 EMA slope + price vs EMA, in average-range units
+    body: float = 0.0            # forming bar body / average range (signed)
+    range_x: float = 0.0         # forming bar range / average range
+    macd: float = 0.0            # in average-range units
+    hist: float = 0.0
+    hist_slope: float = 0.0      # forming hist - last closed hist (avg-range units)
+    hist_accel: float = 0.0      # change of that slope vs the previous bar
+    macd_ready: bool = False
+    vol_x: Optional[float] = None    # forming-bar activity vs comparable previous bars (time-normalised)
+    vol_src: str = "n/a"
+    structure: int = 0           # +1 HH/HL, -1 LH/LL, 0 mixed (last closed bars)
+    exhaust: int = 0             # +1 up move exhausting, -1 down move exhausting
+    avg_range: float = 0.0
+
+    def brief(self) -> dict:
+        r = lambda x, n=2: None if x is None else round(x, n)   # noqa: E731
+        return {"ready": self.ready, "src": self.src, "bars": self.bars, "dir": self.dir, "trend": r(self.trend),
+                "body": r(self.body), "range_x": r(self.range_x), "macd": r(self.macd, 3), "hist": r(self.hist, 3),
+                "hist_slope": r(self.hist_slope, 3), "macd_ready": self.macd_ready, "vol_x": r(self.vol_x),
+                "vol_src": self.vol_src, "structure": self.structure, "exhaust": self.exhaust}
+
+
+class TF:
+    def __init__(self, sec: int, maxlen: int = 300):
+        self.sec = sec
+        self.maxlen = maxlen
+        self.bars: deque = deque(maxlen=maxlen)     # closed: {"time","open","high","low","close","vol","own"}
+        self.st = _St()
+        self.hists: deque = deque(maxlen=4)         # committed hist values (last closed bars)
+        self.e21s: deque = deque(maxlen=4)
+        self.live: Optional[dict] = None
+        self.own: dict = {}                          # bar time -> own live tick count (bars observed live)
+        self.broker_ok = False
+
+    # ------------------------------------------------------------ building
+    def _commit(self, b: dict) -> None:
+        self.bars.append(b)
+        self.st = self.st.step(b["close"])
+        self.hists.append(self.st.hist)
+        self.e21s.append(self.st.e21)
+
+    def _rebuild(self, closed: list) -> None:
+        self.bars = deque(maxlen=self.maxlen)
+        self.st = _St()
+        self.hists.clear()
+        self.e21s.clear()
+        for b in closed[-self.maxlen:]:
+            self._commit(b)
+
+    def load(self, candles: list, now: float) -> None:
+        """Merge a broker poll (oldest -> newest). Recomputes only when closed history changed."""
+        if not candles:
+            return
+        self.broker_ok = True
+        closed, forming = [], None
+        for c in candles:
+            b = {"time": float(c["time"]), "open": float(c["open"]), "high": float(c["high"]),
+                 "low": float(c["low"]), "close": float(c["close"]),
+                 "vol": float(c["tick_volume"]) if c.get("tick_volume") is not None else None}
+            if b["time"] + self.sec <= now:
+                b["own"] = self.own.get(b["time"])
+                closed.append(b)
+            else:
+                forming = b
+        if closed:
+            if not self.bars or closed[0]["time"] < self.bars[0]["time"]:
+                self._rebuild(closed)                 # first poll / broker has older history than we have
+            else:
+                mine = {b["time"]: b for b in list(self.bars)[-6:]}
+                changed = any(abs(b["close"] - mine[b["time"]]["close"]) > 1e-9
+                              or abs(b["high"] - mine[b["time"]]["high"]) > 1e-9
+                              or abs(b["low"] - mine[b["time"]]["low"]) > 1e-9
+                              for b in closed if b["time"] in mine)
+                if changed:                           # broker corrected a recent bar (e.g. one built from ticks)
+                    keep = [b for b in self.bars if b["time"] < closed[0]["time"]]
+                    self._rebuild(keep + closed)
+                else:
+                    for b in closed:
+                        if b["time"] > self.bars[-1]["time"]:
+                            self._commit(b)
+                        elif b["time"] in mine and b["vol"] is not None:
+                            mine[b["time"]]["vol"] = b["vol"]
+        if forming is not None:
+            lv = self.live
+            if lv is None or lv["time"] < forming["time"]:
+                self.live = dict(forming, own=0)
+            elif lv["time"] == forming["time"]:
+                lv["open"] = forming["open"]
+                lv["high"] = max(lv["high"], forming["high"])
+                lv["low"] = min(lv["low"], forming["low"])
+                lv["vol"] = forming["vol"]
+
+    def on_tick(self, t: float, price: float) -> None:
+        bt = t - (t % self.sec)
+        lv = self.live
+        if lv is None or bt > lv["time"]:
+            if lv is not None and (not self.bars or self.bars[-1]["time"] < lv["time"]):
+                self.own[lv["time"]] = lv["own"]
+                self._commit({k: lv[k] for k in ("time", "open", "high", "low", "close", "vol", "own")})
+            elif lv is not None:
+                self.own[lv["time"]] = lv["own"]
+                if self.bars and self.bars[-1]["time"] == lv["time"]:
+                    self.bars[-1]["own"] = lv["own"]
+            if len(self.own) > 2 * self.maxlen:
+                for k in sorted(self.own)[: len(self.own) - self.maxlen]:
+                    del self.own[k]
+            self.live = lv = {"time": bt, "open": price, "high": price, "low": price, "close": price,
+                              "vol": None, "own": 0}
+        elif bt < lv["time"]:
+            return
+        lv["close"] = price
+        if price > lv["high"]:
+            lv["high"] = price
+        if price < lv["low"]:
+            lv["low"] = price
+        lv["own"] += 1
+
+    # ------------------------------------------------------------ reading
+    def state(self, now: float) -> TFState:
+        out = TFState(src="broker+ticks" if self.broker_ok else "ticks only", bars=len(self.bars))
+        lv = self.live
+        if lv is None or len(self.bars) < 6:
+            return out
+        recent = list(self.bars)[-10:]
+        ar = sum(b["high"] - b["low"] for b in recent) / len(recent)
+        if ar <= 0:
+            return out
+        out.avg_range = ar
+        out.ready = True
+        p = self.st.step(lv["close"])                 # O(1) peek with the forming bar
+        out.macd_ready = self.st.n >= 35
+        out.macd = p.macd / ar
+        out.hist = p.hist / ar
+        h1 = self.hists[-1] if self.hists else 0.0
+        h2 = self.hists[-2] if len(self.hists) >= 2 else h1
+        out.hist_slope = (p.hist - h1) / ar
+        out.hist_accel = ((p.hist - h1) - (h1 - h2)) / ar
+        slope = (p.e21 - (self.e21s[-2] if len(self.e21s) >= 2 else p.e21)) / ar
+        pos = (lv["close"] - p.e21) / ar
+        out.trend = _clip(0.6 * _clip(slope / 0.3) + 0.4 * _clip(pos / 1.5) + 0.3 * _clip((p.e8 - p.e21) / ar))
+        out.dir = 1 if out.trend > 0.2 else -1 if out.trend < -0.2 else 0
+        out.body = (lv["close"] - lv["open"]) / ar
+        out.range_x = (lv["high"] - lv["low"]) / ar
+        frac = max(0.25, min(1.0, (now - lv["time"]) / self.sec))
+        own_prev = [b["own"] for b in recent if b.get("own")]
+        vol_prev = [b["vol"] for b in recent if b.get("vol")]
+        if len(own_prev) >= 3 and lv["own"]:
+            out.vol_x, out.vol_src = (lv["own"] / frac) / (sum(own_prev) / len(own_prev)), "live tick count"
+        elif lv.get("vol") and len(vol_prev) >= 3:
+            out.vol_x, out.vol_src = (lv["vol"] / frac) / (sum(vol_prev) / len(vol_prev)), "broker tickVolume"
+        elif len(vol_prev) >= 4:
+            out.vol_x, out.vol_src = vol_prev[-1] / (sum(vol_prev[:-1]) / (len(vol_prev) - 1)), "broker tickVolume (last closed)"
+        b3 = recent[-3:]
+        if len(b3) == 3:
+            hh = b3[2]["high"] > b3[1]["high"] > b3[0]["high"] or (b3[2]["high"] > b3[1]["high"] and b3[2]["low"] > b3[1]["low"])
+            ll = b3[2]["low"] < b3[1]["low"] < b3[0]["low"] or (b3[2]["low"] < b3[1]["low"] and b3[2]["high"] < b3[1]["high"])
+            out.structure = 1 if hh and not ll else -1 if ll and not hh else 0
+        ext = pos
+        if ext > 1.5 and p.hist < h1 and h1 < h2:
+            out.exhaust = 1
+        elif ext < -1.5 and p.hist > h1 and h1 > h2:
+            out.exhaust = -1
+        return out
+
+
+@dataclass
+class MTFView:
+    """M5 bias + M1 timing for the decision engine (all scores 0..1 per side unless signed)."""
+    m5: TFState = field(default_factory=TFState)
+    m1: TFState = field(default_factory=TFState)
+    bias: float = 0.0            # -1..1 M5 direction bias (signed)
+    bias_label: str = "unknown"
+    supported: bool = False
+    m1_up: float = 0.0           # M1 timing score for BUY 0..1
+    m1_dn: float = 0.0
+
+    def timing(self, d: int) -> float:
+        return self.m1_up if d > 0 else self.m1_dn
+
+    def brief(self) -> dict:
+        return {"bias": round(self.bias, 2), "label": self.bias_label, "supported": self.supported,
+                "m1_up": round(self.m1_up, 2), "m1_dn": round(self.m1_dn, 2),
+                "m5": self.m5.brief(), "m1": self.m1.brief()}
+
+
+def m5_bias(s: TFState) -> tuple[float, str, bool]:
+    if not s.ready:
+        return 0.0, "unknown (no M5 bars yet)", False
+    macd = _clip(s.hist / 0.3) * (1.0 if s.macd_ready else 0.5)
+    mom = _clip(s.hist_slope / 0.15) * (1.0 if s.macd_ready else 0.5)
+    body = _clip(s.body / 0.6) * min(1.0, s.range_x)
+    vol = 0.0 if s.vol_x is None else _clip(s.vol_x - 1.0)
+    b = 0.35 * s.trend + 0.2 * macd + 0.15 * mom + 0.15 * body + 0.15 * s.structure
+    b *= 1.0 + 0.25 * max(0.0, vol) * (1 if b * body > 0 else 0)        # activity supporting the move
+    exhausting = s.exhaust != 0 and s.exhaust * b > 0
+    if exhausting:
+        b *= 0.5
+    b = _clip(b)
+    supported = abs(b) >= 0.25 and not exhausting and (mom * b >= 0)
+    lab = ("up" if b > 0 else "down") if abs(b) >= 0.2 else "ambiguous"
+    lab += " (exhausting)" if exhausting else " (supported)" if supported else ""
+    return b, lab, supported
+
+
+def m1_timing(s: TFState, d: int, bias: float) -> float:
+    if not s.ready:
+        return 0.0
+    body = _clip(d * s.body / 0.5, 0.0, 1.0) * min(1.0, 0.5 + s.range_x)
+    hist_exp = _clip(d * s.hist_slope / 0.12, 0.0, 1.0)               # histogram expanding our way (no cross needed)
+    turn = 1.0 if d * s.hist_accel > 0 and d * s.hist_slope > 0 else 0.0
+    vol = 0.0 if s.vol_x is None else _clip((s.vol_x - 1.0) / 1.0, 0.0, 1.0)
+    trend = _clip(d * s.trend, 0.0, 1.0)
+    cont = _clip(d * bias / 0.5, 0.0, 1.0)
+    x = 0.28 * body + 0.24 * hist_exp + 0.1 * turn + 0.14 * vol + 0.1 * trend + 0.14 * cont
+    if s.exhaust == d:
+        x -= 0.2
+    return _clip(x, 0.0, 1.0)
+
+
+class MTF:
+    """Per symbol M1 + M5 series."""
+
+    def __init__(self):
+        self.m1 = TF(60, 300)
+        self.m5 = TF(300, 300)
+        self.polled = {"M1": 0.0, "M5": 0.0}
+        self.poll_err = ""
+
+    def on_tick(self, t: float, price: float) -> None:
+        self.m1.on_tick(t, price)
+        self.m5.on_tick(t, price)
+
+    def view(self, now: float) -> MTFView:
+        v = MTFView(m5=self.m5.state(now), m1=self.m1.state(now))
+        v.bias, v.bias_label, v.supported = m5_bias(v.m5)
+        v.m1_up, v.m1_dn = m1_timing(v.m1, 1, v.bias), m1_timing(v.m1, -1, v.bias)
+        return v
+
+    def closed_m1(self) -> list:
+        return list(self.m1.bars)

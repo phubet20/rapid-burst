@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from .config import EngineConfig
@@ -100,11 +100,22 @@ class RiskGuard:
         self.safe_until = 0.0
         self.safe_count = 0
         self.probe_left = 0            # batches still forced to one min-lot order after a safe-mode pause
+        self.floor_risk = 0.0          # largest single min-lot-floor order stop risk this session (money)
 
     def reset_session(self, equity: float) -> None:
         self.peak_equity = equity
         self.halted, self.halt_reason = False, ""
         self.safe_until, self.safe_count, self.probe_left = 0.0, 0, 0
+        self.floor_risk = 0.0
+
+    def dd_limit(self) -> float:
+        """Drawdown (money) that triggers safe mode: x% of the peak, but on a min-lot-floor account never
+        smaller than `safe_min_stopouts` single stop losses (capped at `safe_dd_cap_pct` of the peak)."""
+        cfg = self.cfg
+        lim = self.peak_equity * cfg.equity_drawdown_pct / 100.0
+        if self.floor_risk > 0:
+            lim = max(lim, min(cfg.safe_min_stopouts * self.floor_risk, self.peak_equity * cfg.safe_dd_cap_pct / 100.0))
+        return lim
 
     def update(self, now: float, acct: AccountView) -> Optional[tuple]:
         """Returns ("safe", msg) when safe mode starts, ("resume", msg) when it ends, else None."""
@@ -120,13 +131,14 @@ class RiskGuard:
                               f"min-lot batch(es)), new drawdown reference {acct.equity:.2f}")
         self.peak_equity = max(self.peak_equity, acct.equity)
         dd = self.cfg.equity_drawdown_pct
-        if dd > 0 and self.peak_equity > 0 and acct.equity < self.peak_equity * (1 - dd / 100.0):
+        lim = self.dd_limit()
+        if dd > 0 and self.peak_equity > 0 and acct.equity < self.peak_equity - lim:
             pause = min(self.cfg.safe_pause_s * (2 ** self.safe_count), self.cfg.safe_pause_max_s)
             self.safe_count += 1
             self.safe_until = now + pause
             self.halted = True
-            self.halt_reason = (f"SAFE MODE: equity {acct.equity:.2f} is {dd:g}% below the session peak "
-                                f"{self.peak_equity:.2f} - entries paused {pause / 60:.0f} min")
+            self.halt_reason = (f"SAFE MODE: equity {acct.equity:.2f} is {lim:.2f} ({lim / self.peak_equity * 100:.1f}%) "
+                                f"below the session peak {self.peak_equity:.2f} - entries paused {pause / 60:.0f} min")
             return "safe", self.halt_reason
         return None
 
@@ -160,7 +172,9 @@ class RiskGuard:
                 return False, f"max total exposure {cfg.max_total_notional_x:.0f}x equity would be exceeded"
         if floor_mode:
             # broker-minimum lot on a tiny account: risk %/margin-use rules cannot apply (the lot cannot be
-            # smaller); only real free margin matters - the broker would reject the order otherwise
+            # smaller), so exposure is limited to ONE min-lot position at a time; free margin must cover it
+            if pos:
+                return False, "min-lot floor: one position at a time (one min lot already exceeds the risk caps)"
             if new_margin > acct.margin_free + 1e-9:
                 return False, (f"insufficient free margin for the minimum lot: needs {new_margin:.2f}, "
                                f"free {acct.margin_free:.2f}")
@@ -176,45 +190,32 @@ class RiskGuard:
 
 
 class EntryPacer:
-    """Per-symbol pacing: cooldowns, entries/minute cap, loss streak pause, in-flight lock."""
+    """Per-symbol pacing for CONTINUOUS re-entry: no fixed cooldowns. In-flight lock, an entries/minute
+    API guard, and a loss streak that only raises the signal threshold (never the size)."""
 
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
         self.last_entry: dict[str, float] = {}
         self.recent: dict[str, deque] = {}
-        self.loss_until: dict[str, float] = {}
         self.streak: dict[str, int] = {}
         self.inflight: set[str] = set()
 
     def can_enter(self, symbol: str, now: float) -> tuple[bool, str]:
-        cfg = self.cfg
         if symbol in self.inflight:
             return False, "order in flight"
-        until = self.loss_until.get(symbol, 0.0)
-        if now < until:
-            return False, f"loss cooldown {until - now:.0f}s"
-        last = self.last_entry.get(symbol)
-        if last is not None and now - last < cfg.cooldown_seconds:
-            return False, f"cooldown {cfg.cooldown_seconds - (now - last):.0f}s"
         q = self.recent.setdefault(symbol, deque())
         while q and now - q[0] > 60.0:
             q.popleft()
-        if len(q) >= cfg.max_entries_per_minute:
+        if len(q) >= self.cfg.max_entries_per_minute:
             return False, "entries/minute cap"
         return True, "ok"
+
+    def threshold_add(self, symbol: str) -> float:
+        return self.cfg.loss_streak_threshold_add * min(3, self.streak.get(symbol, 0))
 
     def on_entry(self, symbol: str, now: float) -> None:
         self.last_entry[symbol] = now
         self.recent.setdefault(symbol, deque()).append(now)
 
     def on_close(self, symbol: str, profit: float, now: float) -> None:
-        cfg = self.cfg
-        if profit < 0:
-            n = self.streak.get(symbol, 0) + 1
-            self.streak[symbol] = n
-            pause = cfg.loss_pause_seconds if n >= cfg.max_consecutive_losses else cfg.loss_cooldown_seconds
-            self.loss_until[symbol] = max(self.loss_until.get(symbol, 0.0), now + pause)
-            if n >= cfg.max_consecutive_losses:
-                self.streak[symbol] = 0
-        else:
-            self.streak[symbol] = 0
+        self.streak[symbol] = self.streak.get(symbol, 0) + 1 if profit < 0 else 0

@@ -99,6 +99,7 @@ class TickerAllBroker:
         self._acct_ts = 0.0
         self._list_row: dict = {}
         self._srv_off = 0
+        self.candle_error = ""
         self._hot = False
         self._specs: dict[str, dict] = {}
         self._spec_rows: Optional[dict] = None
@@ -547,20 +548,33 @@ class TickerAllBroker:
         feed = (recv - src) * 1000.0 if src else None
         return {"recv": recv, "feed_ms": round(feed, 1) if feed is not None and 0.0 <= feed <= 10000.0 else None}
 
-    def candles(self, symbol: str, timeframe: str = "M1", hours: float = 0.5) -> list[dict]:
-        """Real broker OHLC bars (oldest -> newest); [] when unavailable (never synthesised)."""
+    concurrent_io = True          # urllib per request: batch orders / closes may be sent in parallel threads
+
+    def candle_offset(self) -> float:
+        """Seconds to subtract from tick times (broker server clock) to match candle times (UTC)."""
+        return float(self._srv_off or 0)
+
+    def candles(self, symbol: str, timeframe: str = "M1", hours: float = 1) -> list[dict]:
+        """Real broker OHLC (bid) bars with tickVolume (oldest -> newest, open time UTC); [] when unavailable
+        (never synthesised). The last bar may be the one still forming."""
         if not self.account_id:
             return []
         try:
             res = self._req("GET", f"/v1/accounts/{self.account_id}/candles",
-                            query={"symbol": symbol, "timeframe": timeframe, "hours": hours}, timeout=20)
-        except Exception:  # noqa: BLE001
+                            query={"symbol": symbol, "timeframe": timeframe, "hours": max(1, int(math.ceil(hours)))},
+                            timeout=10)
+        except Exception as exc:  # noqa: BLE001
+            self.candle_error = f"{type(exc).__name__}: {str(exc)[:120]}"
             return []
+        self.candle_error = ""
         out = []
         for c in res.get("candles") or []:
             try:
+                tv = c.get("tickVolume")
                 out.append({"time": float(c["timestamp"]), "open": float(c["open"]), "high": float(c["high"]),
-                            "low": float(c["low"]), "close": float(c["close"])})
+                            "low": float(c["low"]), "close": float(c["close"]),
+                            "tick_volume": float(tv) if tv is not None else None,
+                            "spread": float(c["spread"]) if c.get("spread") is not None else None})
             except (KeyError, TypeError, ValueError):
                 continue
         out.sort(key=lambda x: x["time"])
@@ -704,7 +718,8 @@ class TickerAllBroker:
     def close_position(self, ticket: int, deviation: int, magic: int) -> dict:
         if not self.account_id:
             return {"ok": False, "msg": "TickerAll not connected", "verified": False}
-        if self.position(ticket) is None:
+        # pre-check from the (<= 1 s) account cache; only a cache miss costs a fresh read
+        if not any(p["ticket"] == int(ticket) for p in self.positions()) and self.position(ticket) is None:
             return {"ok": True, "msg": "already closed", "verified": True}
         idem, msg, price = uuid.uuid4().hex, "", None
         for _ in range(3):

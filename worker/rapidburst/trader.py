@@ -24,7 +24,8 @@ from . import __version__
 from .config import EngineConfig
 from .engine import MomentumEngine, PositionState
 from .risk import AccountView, EntryPacer, OpenPos, RiskGuard, size_position
-from .trend import Trend, compute_trend
+from .mtf import MTF
+from concurrent.futures import ThreadPoolExecutor
 from .microburst import Micro, Strength, decide, exit_reason
 from .learner import Learner, regime as vol_regime
 from .risk import normalize_volume
@@ -78,12 +79,15 @@ class Trader:
         self.stopping = False
         self.flatten_pending = False
         self.unverified_entry: Optional[str] = None
-        # higher-timeframe trend per symbol (from real broker M1/M5 bars)
-        self.trends: dict[str, Trend] = {}
-        self.trend_ts: dict[str, float] = {}
+        # M5 direction bias + M1 timing per symbol (real broker candles + forming bar from live ticks)
+        self.mtf: dict[str, MTF] = {}
+        self._candle_jobs: dict[tuple, Future] = {}
+        self._candle_log: dict[str, str] = {}
+        self._io = ThreadPoolExecutor(max_workers=6, thread_name_prefix="rb-io")
+        self._last_close_wall: dict[str, float] = {}  # symbol -> when its last basket was fully closed
+        self.reentry: deque = deque(maxlen=200)      # measured basket close -> next entry (s), real clocks
         # burst batches: id -> {symbol, side, opened, peak_units, mode, realized}
         self.bursts: dict[str, dict] = {}
-        self.group_cooldown: dict[str, float] = {}
         self.atr_m1: dict[str, float] = {}          # M1 ATR from real broker bars
         self.m1_bars: dict[str, list] = {}          # completed broker M1 bars (candle context)
         self._mcache: dict[str, tuple] = {}          # per-loop micro analysis cache
@@ -94,6 +98,7 @@ class Trader:
         self.lat_exits: deque = deque(maxlen=200)
         self.perf: list = []                         # closed batches with real broker P/L (after costs)
         self._closed_tickets: dict[int, float] = {}  # verified-closed tickets: never closed twice
+        self._floor_tickets: set = set()             # opened at the broker minimum lot (risk above the % caps)
         self._deals_cache: tuple = (0.0, [])
         self.exec_fails: dict[str, deque] = {}
         self.exec_pause: dict[str, float] = {}
@@ -237,7 +242,8 @@ class Trader:
     def _reset_engines(self) -> None:
         """Discard any previous tick history: the engine only uses ticks that arrive after START."""
         self.sym_status = {}
-        self.trend_ts = {}
+        self.mtf = {}
+        self._candle_jobs = {}
         self.skip_window = {}
         for s in list(dict.fromkeys(list(self.selected) + list(self.engines))):
             info = self.sym_info.get(s)
@@ -577,18 +583,20 @@ class Trader:
                 continue
             b["realized"] = float(b.get("realized", 0.0)) + (profit or 0.0)
             if not any(x.batch_id == ps.batch_id for x in self.pos_state.values()):
-                # whole group is flat: one win/loss for the pacer, then the short post-group cooldown
+                # whole basket is flat: one win/loss for the pacer; NO cooldown - the next loop re-evaluates at once
                 now = getattr(self, "now_wall", None) or time.time()
                 self.pacer.on_close(ps.symbol, b["realized"], now)
                 if b["realized"] < 0:
                     self.no_up_after_loss[ps.symbol] = float(b.get("lot", ps.volume))   # never size up after a loss
                 else:
                     self.no_up_after_loss.pop(ps.symbol, None)
-                self.group_cooldown[ps.symbol] = now + self.cfg.group_cooldown_seconds
+                self._last_close_wall[ps.symbol] = now
                 self._learn_from(ps, b, now)
                 self.perf.append({"ts": now, "symbol": ps.symbol, "side": b["side"], "pl": round(b["realized"], 2),
                                   "legs": b.get("legs"), "hold_s": round(now - float(b.get("opened", now)), 1),
-                                  "exit": b.get("exit_reason", "broker SL/close")})
+                                  "exit": b.get("exit_reason", "broker SL/close"), "attr": b.get("attr") or {},
+                                  "spread_pts": b.get("spread_pts"), "slip_pts": b.get("slip_pts") or [],
+                                  "reentry_s": b.get("reentry_s"), "tickets": b.get("tickets") or []})
                 self.add_log("INFO", f"GROUP {ps.batch_id} {b['side']} {ps.symbol} fully closed: "
                                      f"P/L {b['realized']:+.2f} over {b.get('legs', '?')} order(s) "
                                      f"[{b.get('exit_reason', 'broker SL/close')}]")
@@ -688,8 +696,11 @@ class Trader:
         for s, eng in self.engines.items():
             ticks = self.broker.ticks_since(s, self.last_msc.get(s, 0))
             if ticks:
+                mt = self.mtf.setdefault(s, MTF())
+                off = self._candle_off()
                 for t, bid, ask, msc in ticks:
                     eng.on_tick(t, bid, ask)
+                    mt.on_tick(t - off, bid)          # candles are bid bars on the UTC clock
                 self.last_msc[s] = ticks[-1][3]
                 self.last_receipt[s] = now_wall
                 meta = self._tick_meta(s)
@@ -701,6 +712,13 @@ class Trader:
                     if off != self.server_offset:
                         self.server_offset = off
                         self._save_state()
+
+    def _candle_off(self) -> float:
+        fn = getattr(self.broker, "candle_offset", None)
+        try:
+            return float(fn()) if fn else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     def _tick_meta(self, s: str) -> dict:
         fn = getattr(self.broker, "tick_meta", None)
@@ -736,7 +754,16 @@ class Trader:
             atr, src = self._atr(s)
             slips = [v for (ts_, v) in self.slippage.get(s, ()) if now_wall - ts_ <= cfg.slippage_window_s]
             m = eng.scanner.snapshot(now, atr, f.vol_unit, self.m1_bars.get(s, []), cfg, slips)
+            mt = self.mtf.get(s)
+            if mt is not None:
+                m.mtf = mt.view(now - self._candle_off())
             st = decide(m, cfg)
+            add = self.pacer.threshold_add(s)
+            if add and st.side != "NO TRADE":
+                best = st.buy if st.side == "BUY" else st.sell
+                if best < st.threshold + add:
+                    st.side, st.reason = "NO TRADE", (f"loss streak raises the bar: {best:.2f} < "
+                                                      f"{st.threshold:.2f}+{add:.2f}")
             if st.side != "NO TRADE" and src != "M1" and atr <= 0:
                 # no broker M1 history and < 60 s of live ticks: volatility scale unknown, entries wait
                 st.side, st.reason = "NO TRADE", "warming up: measuring volatility (no M1 history yet)"
@@ -750,7 +777,6 @@ class Trader:
 
     def _status(self, s: str, m, st, now_wall: float) -> dict:
         info = self.sym_info.get(s) or {}
-        tr = self.trends.get(s)
         return {"signal": st.side if st.side in ("BUY", "SELL") else "HOLD", "score": round(st.score, 3),
                 "reason": st.reason, "features": m.brief() if m.ready else {"reason": m.reason},
                 "strength": {"buy": st.buy, "sell": st.sell, "threshold": round(st.threshold, 3),
@@ -758,7 +784,7 @@ class Trader:
                              "comps": st.comps},
                 "spread_pts": round(m.spread / float(info["point"]), 1) if info.get("point") and m.spread else None,
                 "tick_age": round(now_wall - self.last_receipt[s], 1) if s in self.last_receipt else None,
-                "trend": tr.brief() if tr else None}
+                "mtf": m.mtf.brief() if getattr(m, "mtf", None) is not None else None}
 
     def _acct(self) -> AccountView:
         return AccountView(float(self.account.get("balance", 0)), float(self.account.get("equity", 0)),
@@ -808,10 +834,6 @@ class Trader:
             if len(sl_hist) >= 3 and sum(sl_hist) / len(sl_hist) > cfg.max_avg_slippage_vu:
                 self._skip(s, status, "paused: poor execution quality (slippage)", now_wall, sig)
                 continue
-            cd = self.group_cooldown.get(s, 0.0) - now_wall
-            if cd > 0:
-                self._skip(s, status, f"{side} blocked: group cooldown {cd:.1f}s", now_wall, sig)
-                continue
             last = self.last_burst.get(s)
             if last and last.get("side") == side and abs(float(last.get("origin", 0.0)) - st.origin) < 0.5:
                 self._skip(s, status, f"{side} skipped: duplicate - this burst was already traded", now_wall, sig)
@@ -832,9 +854,10 @@ class Trader:
 
     def _open_batch(self, s: str, side: str, m, st, info: dict, status: dict, now_wall: float, t_dec: float,
                     learn=None) -> bool:
-        """ONE burst batch for ONE signal: n same-lot market orders sent back to back, each fill verified.
-        n grows with the signal's edge over the threshold (capped); batch risk/lot caps apply; the remaining
-        orders are cancelled when price has run past the edge, the spread widens or an order fails.
+        """ONE burst batch for ONE signal: n same-lot market orders, each fill verified. n grows with the
+        signal's edge over the threshold (capped); batch risk/lot caps apply; min-lot-floor accounts trade one
+        order at a time. With a thread-safe broker the orders go out in parallel (one round trip for the
+        batch); otherwise back to back, the rest cancelled when price runs past the edge or the spread widens.
         Never martingale, never averaging down, never added to later."""
         cfg = self.cfg
         d = 1 if side == "BUY" else -1
@@ -847,7 +870,6 @@ class Trader:
         sig = Signal(side, st.score, st.reason, self.engines[s].last)
 
         def refuse(why: str) -> bool:
-            self.pacer.on_entry(s, now_wall)
             self._skip(s, status, f"{side} batch blocked: {why}", now_wall, sig)
             return False
 
@@ -864,10 +886,12 @@ class Trader:
         if size.volume <= 0:
             return refuse(size.note)
         floor = size.note.startswith("min lot floor")
+        if floor:
+            n = 1                                   # one min lot already exceeds the % caps: never stack more
         if (probe or (learn is not None and learn.min_lot)) and size.volume > vmin:
             size = type(size)(vmin, size.risk_money * vmin / size.volume,
                               size.note + ("; safe-mode probe: min lot" if probe else "; learning: min lot"))
-        elif learn is not None and learn.mult > 1.0:
+        elif learn is not None and learn.mult > 1.0 and not floor:
             v = normalize_volume(min(size.volume * learn.mult, cfg.max_lot_per_order), vmin, vmax, vstep)
             if v > size.volume:
                 size = type(size)(v, size.risk_money * v / size.volume, size.note + f"; learning x{learn.mult:.2f}")
@@ -875,54 +899,109 @@ class Trader:
         if cap_lot and size.volume > cap_lot:
             size = type(size)(cap_lot, size.risk_money * cap_lot / size.volume, size.note + f"; capped {cap_lot:g} after a loss")
         budget = acct.equity * cfg.risk_per_batch_pct / 100.0
-        while n > 1 and (n * size.volume > cfg.max_batch_lots + 1e-9 or (not floor and n * size.risk_money > budget + 1e-9)):
+        while n > 1 and (n * size.volume > cfg.max_batch_lots + 1e-9 or n * size.risk_money > budget + 1e-9):
             n -= 1
         if size.volume > cfg.max_batch_lots + 1e-9:
             v = normalize_volume(cfg.max_batch_lots, vmin, vmax, vstep)
             if v <= 0:
                 return refuse(f"min lot {vmin:g} > max batch lots {cfg.max_batch_lots:g}")
             size = type(size)(v, size.risk_money * v / size.volume, size.note + "; batch lot cap")
-        gid = uuid.uuid4().hex[:6]
         ref = m.ask if side == "BUY" else m.bid
         run_cap = cfg.batch_run_cancel_frac * m.target
-        opened, why_stop = 0, ""
+        q = self.broker.last_tick(s) or {}
+        px = float((q.get("ask") if side == "BUY" else q.get("bid")) or 0.0)
+        if px > 0 and (px - ref) * d > run_cap:
+            return refuse(f"price ran {(px - ref) * d:.5g} past the edge before send (> {run_cap:.5g}) - anti-chase")
+        if px > 0 and (px - ref) * d < -run_cap:
+            return refuse(f"price moved {(px - ref) * d:.5g} against the signal before send")
+        # validate every order of the batch up front (risk, exposure, margin incl. the batch's own orders)
+        plans: list = []
         for i in range(n):
-            if i > 0:
-                q = self.broker.last_tick(s) or {}
-                px = float(q.get("ask") if side == "BUY" else q.get("bid") or 0.0)
-                sp = float(q.get("ask") or 0.0) - float(q.get("bid") or 0.0)
-                typ = max(m.spread, self.engines[s].scanner.spread_ema)
-                if px <= 0:
-                    why_stop = "no fresh quote"
-                elif (px - ref) * d > run_cap:
-                    why_stop = f"price ran {(px - ref) * d:.5g} past the edge (> {run_cap:.5g})"
-                elif (px - ref) * d < -run_cap:
-                    why_stop = f"price moved {(px - ref) * d:.5g} against the signal"
-                elif sp > cfg.spread_spike_ratio * typ:
-                    why_stop = f"spread widened to {sp:.5g}"
-                if why_stop:
-                    break
-            r = self._send_one(s, side, i, n, gid, size, sl_dist, m, st, info, status, now_wall, t_dec, floor)
-            if not r:
-                why_stop = why_stop or "order not filled"
+            ok, why, margin = self._check_order(s, side, i, size, m, floor, plans)
+            if not ok:
+                if not plans:
+                    return refuse(why)
                 break
-            opened += 1
+            plans.append((i, margin))
+        n = len(plans)
+        gid = uuid.uuid4().hex[:6]
+        sl = (ref - d * sl_dist) if cfg.broker_sl else 0.0
+        dev = self._deviation(s, m.spread, m.vu)
+        opened, why_stop = 0, ""
+        self.pacer.inflight.add(s)
+        try:
+            if bool(getattr(self.broker, "concurrent_io", False)) and n > 1:
+                futs = [self._io.submit(self._send_raw, s, side, size.volume, sl, dev, f"{cfg.comment_prefix}-{gid}-{i + 1}")
+                        for i, _ in plans]
+                for (i, _), fu in zip(plans, futs):
+                    r, t_send, t_fill = fu.result()
+                    if self._book_fill(s, side, i, n, gid, size, sl, sl_dist, m, st, info, now_wall, t_dec, r, t_send, t_fill, floor):
+                        opened += 1
+                    else:
+                        why_stop = why_stop or str(r.get("msg"))
+            else:
+                for i, _ in plans:
+                    if i > 0:
+                        q = self.broker.last_tick(s) or {}
+                        px = float((q.get("ask") if side == "BUY" else q.get("bid")) or 0.0)
+                        sp = float(q.get("ask") or 0.0) - float(q.get("bid") or 0.0)
+                        typ = max(m.spread, self.engines[s].scanner.spread_ema)
+                        if px <= 0:
+                            why_stop = "no fresh quote"
+                        elif (px - ref) * d > run_cap:
+                            why_stop = f"price ran {(px - ref) * d:.5g} past the edge (> {run_cap:.5g})"
+                        elif (px - ref) * d < -run_cap:
+                            why_stop = f"price moved {(px - ref) * d:.5g} against the signal"
+                        elif sp > cfg.spread_spike_ratio * typ:
+                            why_stop = f"spread widened to {sp:.5g}"
+                        if why_stop:
+                            break
+                    r, t_send, t_fill = self._send_raw(s, side, size.volume, sl, dev, f"{cfg.comment_prefix}-{gid}-{i + 1}")
+                    if not self._book_fill(s, side, i, n, gid, size, sl, sl_dist, m, st, info, now_wall, t_dec, r, t_send, t_fill, floor):
+                        why_stop = why_stop or "order not filled"
+                        break
+                    opened += 1
+        finally:
+            self.pacer.inflight.discard(s)
+        self.pacer.on_entry(s, now_wall)
         if opened == 0:
-            self.pacer.on_entry(s, now_wall)
+            # the broker rejected this setup: never resend the SAME unchanged signal (no retry loop)
+            self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t}
             return False
         g = self.bursts[gid]
         g["planned"] = n
-        self.pacer.on_entry(s, now_wall)
         self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t}
         if probe:
             self.risk.probe_left -= 1
+        if floor:
+            self.risk.floor_risk = max(self.risk.floor_risk, size.risk_money)
+        v = m.mtf
+        v1 = v.m1 if v is not None and v.m1.ready else None
+        fam = st.scan.get(side, {})
+        g["attr"] = {
+            "m5": ("n/a" if v is None or not v.m5.ready else "aligned" if d * v.bias >= 0.2
+                   else "against" if d * v.bias <= -0.2 else "neutral"),
+            "macd": ("n/a" if v1 is None else "expanding with" if d * v1.hist_slope > 0.03
+                     else "turning against" if d * v1.hist_slope < -0.03 else "flat"),
+            "volume": ("n/a" if v1 is None or v1.vol_x is None else "expanding" if v1.vol_x >= 1.3
+                       else "low" if v1.vol_x < 0.8 else "normal"),
+            "tick": "strong" if (fam.get("A") or 0) >= 0.6 else "moderate",
+            "agree": "".join(k for k, x in fam.items() if x is not None and x >= cfg.mb_scan_support),
+            "regime": m.regime}
+        g["spread_pts"] = round(m.spread / point, 1) if point else None
+        last_close = self._last_close_wall.pop(s, None)
+        if last_close is not None:
+            g["reentry_s"] = round(now_wall - last_close, 2)
+            self.reentry.append(g["reentry_s"])
         if learn is not None:
             comps = dict(st.comps.get(side, {}))
             comps["spread_atr"] = round(m.spread / m.atr, 3) if m.atr else None
             g.update(bucket=getattr(learn, "bucket", ""), type="micro", rel=m.regime,
                      regime=vol_regime(m.spread, m.atr), hour=time.gmtime(now_wall).tm_hour,
                      learn_state=learn.state, comps=comps)
-        msg = f"BATCH {gid} {side} {s}: {opened}/{n} order(s) filled, {opened * size.volume:g} lots"
+        msg = (f"BATCH {gid} {side} {s}: {opened}/{n} order(s) filled, {opened * size.volume:g} lots | M5 {g['attr']['m5']}, "
+               f"M1 MACD {g['attr']['macd']}, volume {g['attr']['volume']}, agree {g['attr']['agree']}"
+               + (f" | re-entry {g['reentry_s']:.2f}s after the last basket closed" if "reentry_s" in g else ""))
         if opened < n:
             msg += f" - rest cancelled: {why_stop}"
         self.add_log("INFO", msg)
@@ -932,40 +1011,42 @@ class Trader:
         self._save_state()
         return True
 
-    def _send_one(self, s, side, i, n, gid, size, sl_dist, m, st, info, status, now_wall, t_dec, floor):
-        """Validate and send one order of a batch; verify the fill; measure latency on real clocks."""
+    def _check_order(self, s, side, i, size, m, floor, plans) -> tuple:
+        """Risk / exposure / margin check for order i of a batch, counting the batch's earlier orders."""
         cfg = self.cfg
-        d = 1 if side == "BUY" else -1
-        point = float(info["point"])
         acct = self._acct()
         price = m.ask if side == "BUY" else m.bid
         margin = self.broker.calc_margin(side, s, size.volume, price)
         if margin is None:
-            self._skip(s, status, f"{side} order {i + 1}/{n} blocked: margin calc unavailable", now_wall)
-            return None
+            return False, "margin calc unavailable", 0.0
         open_pos = [OpenPos(p["symbol"], self._side(p), float(p["volume"]), float(p["profit"]), self._pos_risk(p),
                             self._notional(p["symbol"], float(p["volume"]), float(p.get("price_current") or p["price_open"])))
                     for p in self.own_positions]
+        open_pos += [OpenPos(s, side, size.volume, 0.0, size.risk_money, self._notional(s, size.volume, price))
+                     for _ in plans]
         ok, why = self.risk.check_entry(s, side, open_pos, acct, size.volume, size.risk_money, margin, True,
                                         self._notional(s, size.volume, price), batch_leg=i > 0, floor_mode=floor)
         if ok:
             cap = acct.equity * cfg.max_margin_use_pct / 100.0
-            used = self._margin_used()
+            used = self._margin_used() + sum(mg for _, mg in plans)
             if used + margin > cap + 1e-9:
                 ok, why = False, (f"margin use cap: {used:.2f} + {margin:.2f} > {cfg.max_margin_use_pct:g}% "
                                   f"of equity ({cap:.2f})")
-        if not ok:
-            self._skip(s, status, f"{side} order {i + 1}/{n} blocked: {why}", now_wall)
-            return None
-        sl = price - d * sl_dist if cfg.broker_sl else 0.0
-        comment = f"{cfg.comment_prefix}-{gid}-{i + 1}"[:31]
-        self.pacer.inflight.add(s)
+        return ok, why, margin
+
+    def _send_raw(self, s, side, volume, sl, dev, comment):
         t_send = time.time()
         try:
-            r = self.broker.market_order(s, side, size.volume, sl, 0.0, self._deviation(s, m.spread, m.vu), cfg.magic, comment)
-        finally:
-            self.pacer.inflight.discard(s)
-        t_fill = time.time()
+            r = self.broker.market_order(s, side, volume, sl, 0.0, dev, self.cfg.magic, comment[:31])
+        except Exception as exc:  # noqa: BLE001
+            r = {"ok": False, "msg": f"{type(exc).__name__}: {exc}"}
+        return r, t_send, time.time()
+
+    def _book_fill(self, s, side, i, n, gid, size, sl, sl_dist, m, st, info, now_wall, t_dec, r, t_send, t_fill, floor) -> bool:
+        """Register one verified fill (or count a rejection) and log its measured latency."""
+        cfg = self.cfg
+        d = 1 if side == "BUY" else -1
+        point = float(info["point"])
         if not r.get("ok"):
             q = self.exec_fails.setdefault(s, deque(maxlen=20))
             q.append(now_wall)
@@ -980,7 +1061,7 @@ class Trader:
                 self.unverified_entry = r["msg"]
                 self.running = False
                 self._save_state()
-            return None
+            return False
         fill = float(r["price"])
         slip = (fill - float(r["req_price"])) * d / point
         self.slippage.setdefault(s, deque(maxlen=10)).append((now_wall, max(0.0, slip * point / max(m.vu, point))))
@@ -995,6 +1076,8 @@ class Trader:
                "feed_ms": self._feed_ms.get(s), "slip_pts": round(slip, 1)}
         self.lat_entries.append(lat)
         ticket = int(r["ticket"])
+        if floor:
+            self._floor_tickets.add(ticket)
         self.pos_state[ticket] = PositionState(ticket=ticket, symbol=s, side=side, volume=float(r["volume"]),
                                                open_price=fill, open_time=now_wall, sl=sl, tp=0.0, entry_vu=m.vu,
                                                reason=st.reason, batch_id=gid,
@@ -1004,10 +1087,13 @@ class Trader:
             g = self.bursts[gid] = {"symbol": s, "side": side, "opened": now_wall, "mode": "micro", "micro": True,
                                     "realized": 0.0, "legs": 0, "target": m.target, "peak_pl": 0.0,
                                     "peak_vel": max(0.0, d * m.vel), "ext_px": m.mid, "last_ext_t": m.t,
-                                    "origin": st.origin, "regime": m.regime, "stop_dist": sl_dist, "adds": 0}
+                                    "origin": st.origin, "regime": m.regime, "stop_dist": sl_dist, "adds": 0,
+                                    "slip_pts": [], "tickets": []}
         g["legs"] = int(g.get("legs", 0)) + 1
         g.setdefault("lot", float(r["volume"]))
         g["risk"] = float(g.get("risk", 0.0)) + size.risk_money
+        g.setdefault("slip_pts", []).append(round(slip, 1))
+        g.setdefault("tickets", []).append(ticket)
         dg = int(info["digits"])
         strength = st.buy if side == "BUY" else st.sell
         self.add_log("INFO", f"ENTRY {side} {r['volume']} {s} @ {fill} #{ticket} batch {gid} order {i + 1}/{n} "
@@ -1018,7 +1104,7 @@ class Trader:
                              f"{lat['decision_to_send_ms']:.0f}ms, send->fill verified {lat['send_to_fill_verified_ms']:.0f}ms"
                              + (f" (ack {lat['send_to_ack_ms']:.0f}ms)" if lat["send_to_ack_ms"] else "")
                              + (f", feed {lat['feed_ms']:.0f}ms" if lat["feed_ms"] is not None else ""))
-        return r
+        return True
 
     # ---------------------------------------------------------------- exits
     def _manage_exits(self, now_wall: float) -> None:
@@ -1070,12 +1156,21 @@ class Trader:
                 continue
             closed = []
             t_dec = time.time()
-            for ps in legs:
-                if ps.ticket in self._closed_tickets:
-                    continue
+            todo = [ps for ps in legs if ps.ticket not in self._closed_tickets]
+            dev = self._close_dev(sym)
+
+            def _close(ticket):
                 t0 = time.time()
-                r = self.broker.close_position(ps.ticket, self._close_dev(sym), cfg.magic)
-                t1 = time.time()
+                try:
+                    r = self.broker.close_position(ticket, dev, cfg.magic)
+                except Exception as exc:  # noqa: BLE001
+                    r = {"ok": False, "verified": False, "msg": f"{type(exc).__name__}: {exc}"}
+                return r, t0, time.time()
+            if bool(getattr(self.broker, "concurrent_io", False)) and len(todo) > 1:
+                res = [f.result() for f in [self._io.submit(_close, ps.ticket) for ps in todo]]   # one round trip
+            else:
+                res = [_close(ps.ticket) for ps in todo]
+            for ps, (r, t0, t1) in zip(todo, res):
                 ok = r["ok"] and r.get("verified")
                 closed.append(f"#{ps.ticket} {'ok' if ok else 'FAIL ' + str(r['msg'])} {(t1 - t0) * 1000:.0f}ms")
                 if ok:
@@ -1095,6 +1190,7 @@ class Trader:
                          f"EXIT GROUP {key} {legs[0].side} {sum(p.volume for p in legs):g} {sym}: {reason} -> "
                          + ", ".join(closed))
             self._refresh_account()
+            self._adopt_positions()          # book the closed basket now: the same loop can re-enter on a fresh signal
 
     def _group_pl(self, legs: list, live: dict, m, now_wall: float):
         """(executable P/L per unit in price, floating money) for a group, from the broker's prices."""
@@ -1141,7 +1237,10 @@ class Trader:
             return f"hard group loss {money:+.2f} <= -{lim:.2f} ({cfg.group_loss_pct:g}% of equity)"
         if eq > 0 and cfg.max_total_risk_pct > 0:
             open_risk = sum(self._pos_risk(p) for p in self.own_positions)
-            if open_risk > eq * cfg.max_total_risk_pct / 100.0 * 1.5:
+            # a single position opened at the broker MINIMUM lot (admitted by the entry check because the lot
+            # cannot be smaller) is not an exposure breach - closing it at once would only pay the spread
+            floor_only = len(self.own_positions) == 1 and int(self.own_positions[0]["ticket"]) in self._floor_tickets
+            if open_risk > eq * cfg.max_total_risk_pct / 100.0 * 1.5 and not floor_only:
                 newest = max(self.pos_state.values(), key=lambda x: x.open_time, default=None)
                 if newest is not None and newest.batch_id == legs[0].batch_id:
                     return f"max exposure breach: open risk {open_risk:.2f} > 1.5x cap - closing newest group"
@@ -1355,34 +1454,66 @@ class Trader:
         except Exception as e:  # noqa: BLE001  learning must never break trading
             log.warning("learner record failed: %s", e)
 
-    def _update_trends(self, now_wall: float) -> None:
+    def _update_candles(self, now_wall: float) -> None:
+        """Refresh real broker M1 (every ~20 s) and M5 (every ~60 s) bars per symbol. With a thread-safe
+        broker the HTTP call runs in the background so the tick loop never waits on it."""
         fn = getattr(self.broker, "candles", None)
+        if fn is None:
+            return
+        cfg = self.cfg
+        conc = bool(getattr(self.broker, "concurrent_io", False))
         for s in self.selected:
-            if now_wall - self.trend_ts.get(s, 0.0) < self.cfg.trend_refresh_seconds:
+            if not self._tradable(s)[0]:
                 continue
-            self.trend_ts[s] = now_wall
-            if fn is None or not self._tradable(s)[0]:
-                self.trends[s] = Trend(label="unknown (no bar history from this broker)")
-                continue
-            try:
-                m1 = fn(s, "M1", 0.75)     # one history call: M5 fetch removed (trend is display-only)
-                m5 = []
-            except Exception as e:  # noqa: BLE001
-                m1, m5 = [], []
-                log.debug("candles %s failed: %s", s, e)
-            prev = self.trends.get(s)
-            tr = compute_trend(m1, m5, self.cfg.trend_min_strength)     # context/display only, never an entry gate
-            if m1:
-                self.m1_bars[s] = m1
-            rngs = [b["high"] - b["low"] for b in m1[-15:-1] if b.get("high") is not None and b["high"] > b["low"]]
+            mt = self.mtf.setdefault(s, MTF())
+            for tf, every, hours in (("M1", cfg.candle_poll_m1_s, 1), ("M5", cfg.candle_poll_m5_s, 4)):
+                key = (s, tf)
+                job = self._candle_jobs.get(key)
+                if job is not None:
+                    if not job.done():
+                        continue
+                    self._candle_jobs.pop(key, None)
+                    try:
+                        bars = job.result()
+                    except Exception:  # noqa: BLE001
+                        bars = []
+                    self._apply_candles(s, tf, bars)
+                    continue
+                if now_wall - mt.polled[tf] < every:
+                    continue
+                mt.polled[tf] = now_wall
+                if conc:
+                    self._candle_jobs[key] = self._io.submit(fn, s, tf, hours)
+                else:
+                    try:
+                        bars = fn(s, tf, hours)
+                    except Exception:  # noqa: BLE001
+                        bars = []
+                    self._apply_candles(s, tf, bars)
+
+    def _apply_candles(self, s: str, tf: str, bars: list) -> None:
+        mt = self.mtf.setdefault(s, MTF())
+        eng = self.engines.get(s)
+        now = (eng.scanner.last[0] - self._candle_off()) if eng is not None and eng.scanner.last else time.time()
+        if not bars:
+            err = getattr(self.broker, "candle_error", "") or "no bars returned"
+            if self._candle_log.get(f"{s}{tf}") != err:
+                self._candle_log[f"{s}{tf}"] = err
+                self.add_log("WARNING", f"CANDLES {s} {tf}: {err} - using bars built from live ticks only")
+            return
+        (mt.m1 if tf == "M1" else mt.m5).load(bars, now)
+        if self._candle_log.get(f"{s}{tf}") != "ok":
+            self._candle_log[f"{s}{tf}"] = "ok"
+            vol = sum(1 for b in bars if b.get("tick_volume") is not None)
+            self.add_log("INFO", f"CANDLES {s} {tf}: {len(bars)} broker bars ({vol} with tickVolume)")
+        if tf == "M1":
+            closed = mt.closed_m1()
+            self.m1_bars[s] = closed
+            rngs = [b["high"] - b["low"] for b in closed[-14:] if b["high"] > b["low"]]
             if rngs:
                 self.atr_m1[s] = sum(rngs) / len(rngs)
-                if s in self.engines:
-                    self.engines[s].seed_vu = 0.15 * self.atr_m1[s]
-            tr.detail["m1_bars"], tr.detail["m5_bars"] = float(len(m1)), float(len(m5))
-            self.trends[s] = tr
-            if prev is None or prev.label.split(" ")[0] != tr.label.split(" ")[0]:
-                self.add_log("INFO", f"TREND {s}: {tr.label} (M1 {len(m1)} bars, M5 {len(m5)} bars)")
+                if eng is not None:
+                    eng.seed_vu = 0.15 * self.atr_m1[s]
 
     @staticmethod
     def _category(reason: str) -> str:
@@ -1418,10 +1549,11 @@ class Trader:
             self._decision(s, sig.action, sig.score, reason)
 
     def _decision(self, s: str, side: str, score, outcome: str) -> None:
-        tr = self.trends.get(s)
+        c = self._mcache.get(s)
+        v = c[1].mtf if c and getattr(c[1], "mtf", None) is not None else None
         self.decisions.append({"ts": round(getattr(self, "now_wall", None) or time.time(), 1), "symbol": s, "side": side,
                                "score": None if score is None else round(float(score), 2),
-                               "trend": tr.label if tr else "unknown", "outcome": outcome[:160]})
+                               "m5": v.bias_label if v else "unknown", "outcome": outcome[:160]})
 
     def _log_why(self, now_wall: float) -> None:
         if now_wall - self.last_why_log < 60.0:
@@ -1459,7 +1591,7 @@ class Trader:
             if now_wall - self.last_trade_check > 10.0:
                 self.last_trade_check = now_wall
                 self._validate()
-            self._update_trends(now_wall)
+            self._update_candles(now_wall)
             self._manage_exits(now_wall)
             if self.running:
                 self._log_why(now_wall)
@@ -1500,8 +1632,6 @@ class Trader:
         for s in self.selected:
             ok_t, why_t = self._tradable(s)
             st = out.setdefault(s, {"signal": "HOLD", "score": 0.0, "reason": "", "features": {}})
-            tr = self.trends.get(s)
-            st["trend"] = tr.brief() if tr else None
             st["skips"] = dict(self.skip_counts.get(s, Counter()).most_common(6))
             st["tradable"] = ok_t
             if not ok_t:
@@ -1519,7 +1649,10 @@ class Trader:
         c = self.cfg
         eq = float(self.account.get("equity", 0) or 0) if self.conn_state == "CONNECTED" else 0.0
         used = self._margin_used() if eq else 0.0
-        return {"engine": "Ultra-Fast Pre-Burst Short Scalping (single engine, scanners A/B/C)",
+        return {"engine": "Continuous Directional Short Scalping (single engine: M5 bias + M1 timing + tick A/B/C)",
+                "min_agree": c.mb_min_agree, "candle_poll_s": {"M1": c.candle_poll_m1_s, "M5": c.candle_poll_m5_s},
+                "safe_dd_limit": round(self.risk.dd_limit(), 2) if self.risk.peak_equity else None,
+                "loss_streak_add": round(max((self.pacer.threshold_add(x) for x in self.selected), default=0.0), 2),
                 "risk_per_trade_pct": c.risk_per_trade_pct, "max_total_risk_pct": c.max_total_risk_pct,
                 "daily_loss_limit": "none (removed - no all-day stop)", "equity_drawdown_pct": c.equity_drawdown_pct,
                 "safe_mode": self.risk.halted, "safe_reason": self.risk.halt_reason if self.risk.halted else "",
@@ -1576,8 +1709,10 @@ class Trader:
         return out
 
     def _perf_view(self) -> dict:
-        """Results of closed batches from broker deals (profit + commission + swap + fee) in this process."""
-        pls = [float(r["pl"]) for r in self.perf]
+        """Results of REAL closed baskets in this process (broker deals: profit + commission + swap + fee).
+        Nothing simulated. Attribution = outcome grouped by the state of each family at entry."""
+        rows = list(self.perf)
+        pls = [float(r["pl"]) for r in rows]
         n = len(pls)
         if not n:
             return {"batches": 0, "source": "real broker deals"}
@@ -1589,11 +1724,37 @@ class Trader:
             peak = max(peak, eq)
             dd = max(dd, peak - eq)
         gl = -sum(losses)
+        start = float(getattr(self, "start_wall", 0) or 0)
+        hours = max(1e-9, ((getattr(self, "now_wall", 0) or time.time()) - start) / 3600.0) if start else None
+        slips = [x for r in rows for x in (r.get("slip_pts") or [])]
+        spreads = [r["spread_pts"] for r in rows if r.get("spread_pts") is not None]
+        re = [r["reentry_s"] for r in rows if r.get("reentry_s") is not None]
+
+        def group(key):
+            out = {}
+            for r, pl in zip(rows, pls):
+                k = (r.get("attr") or {}).get(key, "n/a")
+                g = out.setdefault(k, {"n": 0, "wins": 0, "net": 0.0})
+                g["n"] += 1
+                g["wins"] += pl > 0
+                g["net"] = round(g["net"] + pl, 2)
+            for g in out.values():
+                g["win_rate"] = round(g["wins"] / g["n"] * 100, 1)
+            return out
         return {"batches": n, "source": "real broker deals", "wins": len(wins),
                 "win_rate": round(len(wins) / n * 100, 1), "net": round(sum(pls), 2),
                 "expectancy": round(sum(pls) / n, 2),
                 "profit_factor": round(sum(wins) / gl, 2) if gl > 0 else None,
-                "max_drawdown": round(dd, 2), "last": self.perf[-5:]}
+                "max_drawdown": round(dd, 2),
+                "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+                "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+                "orders": sum(int(r.get("legs") or 0) for r in rows),
+                "batches_per_hour": round(n / hours, 1) if hours else None,
+                "reentry_s": {"n": len(re), "p50": self._pct(re, 0.5), "p90": self._pct(re, 0.9)},
+                "avg_spread_pts": round(sum(spreads) / len(spreads), 1) if spreads else None,
+                "avg_slip_pts": round(sum(slips) / len(slips), 1) if slips else None,
+                "attribution": {k: group(k) for k in ("m5", "macd", "volume", "tick")},
+                "last": rows[-5:]}
 
     def _build_snapshot(self, now_wall: float) -> None:
         acct = self.account if self.conn_state == "CONNECTED" else {}

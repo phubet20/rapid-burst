@@ -199,8 +199,11 @@ class FakeTickerAll:
         n = max(1, int(float(q.get("hours", 1)) * 3600 / step))
         self.candle_calls = getattr(self, "candle_calls", 0) + 1
         now = int(time.time()) // step * step
+        if "." in str(q.get("hours", "1")):
+            return web.json_response({"error": {"code": "VALIDATION", "message": "hours must be an integer"}},
+                                     status=400)   # TEST DOUBLE: stricter than needed, catches float look-backs
         rows = [{"timestamp": now - (n - 1 - i) * step, "open": 100 + i, "high": 101 + i, "low": 99.5 + i,
-                 "close": 100.8 + i, "bid": 100.8 + i} for i in range(n)]
+                 "close": 100.8 + i, "bid": 100.8 + i, "tickVolume": 50 + i, "spread": 0.2} for i in range(n)]
         return web.json_response({"candles": rows[::-1], "count": n, "coverage": {}, "truncated": False})
 
     async def h_symbols(self, request):

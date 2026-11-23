@@ -5,7 +5,6 @@ import json
 from rapidburst.config import EngineConfig
 from rapidburst.engine import MomentumEngine
 from rapidburst.microburst import Micro, decide, exit_reason
-from rapidburst.trend import compute_trend
 from tests.harness import Invariants, instrument, make, run
 from tests.paths import T0, _force_signal, _small_account, _start, series_up
 from tests.synth import burst_series, gen_ticks
@@ -188,7 +187,6 @@ def test_duplicate_burst_is_not_traded_twice(tmp_path):
         br.positions_.pop(t)
     tr.pos_state.clear()
     _force_signal(tr, "BUY", origin=T0 + 99.0)
-    tr.group_cooldown.clear()
     tr.pacer = type(tr.pacer)(tr.cfg)
     n0 = len([l for l in tr.logs if l["msg"].startswith("ENTRY")])
     run(tr, br, T0 + 100.3, T0 + 101)
@@ -283,7 +281,7 @@ def test_snapshot_has_one_engine_view(tmp_path):
     e = tr.get_snapshot()["engine"]
     assert "groups" in e and "baskets" not in e and "scalp" not in e
     rc = e["risk_config"]
-    assert rc["engine"].startswith("Ultra-Fast Pre-Burst") and rc["broker_sl"] == "ON"
+    assert rc["engine"].startswith("Continuous Directional") and rc["broker_sl"] == "ON"
     assert "daily_loss_limit_pct" not in rc and "latency" in e and "performance" in e
     assert e["performance"]["source"] == "real broker deals"
     st = e["symbols"]["BTCUSDm"]
@@ -296,12 +294,10 @@ def test_config_json_env_override_ignores_unknown_and_old_keys(monkeypatch):
     assert c.mb_threshold == 0.6 and not hasattr(c, "basket_enabled")
 
 
-def test_trend_is_context_only():
-    def bars(closes, rng=1.0):
-        return [{"time": i * 60.0, "open": c, "high": c + rng / 2, "low": c - rng / 2, "close": c}
-                for i, c in enumerate(closes)]
-    up = compute_trend(bars([100 + i * 0.6 for i in range(30)]), bars([100 + i * 2 for i in range(12)], 3))
-    assert up.known and up.dir == 1
+def test_no_rsi_and_mtf_is_part_of_the_single_decision():
     import inspect
     import rapidburst.microburst as mb
-    assert "trend" not in inspect.getsource(mb.decide)
+    import re
+    src = inspect.getsource(mb)
+    assert not re.search(r"\brsi\b", src.lower())
+    assert "_mtf_scores" in inspect.getsource(mb.side_strength)

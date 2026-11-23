@@ -47,7 +47,31 @@ Oracle Cloud Always Free and Google Cloud free tiers have no free Windows. AWS/A
 Windows VM for a limited period with a card on file (1 GB RAM is tight for MT5) – the same installer works
 there; nothing in this repo buys or starts cloud resources.
 
-## Trading engine: ONE Ultra-Fast Pre-Burst Short Scalping Engine (worker/rapidburst/microburst.py)
+## Trading engine: ONE Continuous Directional Short Scalping Engine (microburst.py + mtf.py)
+
+**M5 direction + M1 timing (mtf.py)** from REAL broker candles (TickerAll `GET /candles`, bid OHLC +
+tickVolume; MT5 `copy_rates`), polled M1 every 20 s / M5 every 60 s in a background thread (integer
+look-back hours; TickerAll allows 600 candle calls/min), with the forming bar built from live ticks between
+polls - no candle-close wait. EMA(8/21) and MACD(12,26,9) are incremental (advance once per closed bar, O(1)
+peek for the forming bar).
+* **E. M5 bias** (-1..1): EMA trend, body/range expansion, MACD direction + histogram + momentum change,
+  tick-volume vs previous bars, HH/HL vs LH/LL, supported vs exhausting. A filter, not a gate: ambiguous or
+  weak-opposite M5 only lowers the score; only a clear, supported opposite M5 vetoes.
+* **D. M1 timing** (0..1 per side): forming-bar direction and body expansion, MACD histogram expansion and
+  slope change (no full cross needed), tick-volume expansion, continuation in the M5 direction.
+Tick volume is compared like-for-like (own live tick counts with own counts, broker tickVolume with broker
+tickVolume) and is never called exchange volume.
+
+**Decision = agreement**: strength = regime-weighted mean of A/B/C/D/E (families without bars drop out);
+trade when strength >= adaptive threshold, it beats the other side, and >= 3 families agree (2 while M1/M5
+have no bars), at least one of them a price family - no single-indicator, speed-only or volume-only entry.
+
+**Continuous entry / re-entry**: scanning never stops; there are NO fixed cooldowns (group cooldown, 1 s
+entry cooldown, loss cooldown and loss-streak pause were removed). A closed basket is booked immediately and
+the same loop may open a new batch on a FRESH setup that passes risk checks; the same unchanged setup (same
+burst origin/side, or a setup the broker rejected) is never re-entered. A losing streak raises the threshold
+(+0.03 per losing basket, max +0.09) - never the size. Entries/minute cap 30 is only an API guard.
+Measured re-entry latency (basket close -> next entry) is logged and shown.
 
 There is exactly one signal/entry/exit system (the earlier Rapid Micro-Burst engine refactored in place;
 old momentum score, impulse detectors, basket/scalp modes, persistence timers, later adds and fixed TPs are
@@ -89,7 +113,8 @@ The basket is never added to later: no martingale, no averaging down, no size-up
    close unless momentum is still continuing (velocity on, no decay, no opposing pressure, no exhaustion);
 3. give-back protection once the peak reached 0.6x target: 40 % give-back, or 60 % while momentum continues
    (so small pullbacks inside a running move are not closed);
-4. exhaustion / tick reversal in profit, failed breakout, structure break, opposite strength, no
+4. exhaustion / tick reversal in profit, M1 MACD histogram turned against with fading momentum or volume,
+   M5 move exhausting, failed breakout, structure break, opposite strength, no
    follow-through within ~4 s, momentum against, stale after 120 s.
 Each close is verified on the broker; a verified-closed ticket is never closed or adopted again and only the
 bot's own live tickets of that basket (same symbol/side/magic) are touched.
@@ -119,8 +144,15 @@ Defaults (all in `worker/rapidburst/config.py`, overridable by env / `RB_CONFIG_
   3 single min-lot batches. The bot keeps running after START;
 * execution protection: 3 rejected opens within 60 s pause the symbol 60 s; 5 failed close attempts halt new entries;
   15 s without a fresh price = emergency exit (REST quote used first when the stream lags);
-* pacing: 1 s cooldown (2 s after a loss), 30 entries/min, 4 losses in a row pause the symbol 30 s,
-  never size up after a losing group.
+* pacing: no fixed cooldowns (continuous re-entry on fresh setups); 30 entries/min API guard; a loss
+  streak raises the signal threshold, never the size; never size up after a losing basket.
+* **min-lot floor accounts** (the broker minimum lot already risks more than the % caps, e.g. XAUUSDm 0.01
+  lot on a ~$13 account = ~18-20 % per stop): one min-lot position at a time (no multi-order batch), that
+  position is not "exposure-breach" closed (which only paid the spread in the first real demo run), and
+  safe mode needs a drawdown of at least 1.25 single stop losses (capped at 25 % of the peak). BTCUSDm has
+  a much smaller min-lot stop risk than XAUUSDm on such an account.
+* batch orders (and basket closes) go out in parallel on TickerAll: one round trip per batch instead of one
+  per order; every fill/close is still verified.
 * `order_check` before every send where the broker supports it; filling mode from the symbol; deviation
   cap; timeouts verified on the server before any retry; only the bot's magic number (26112201) is ever
   touched – manual trades and other EAs are ignored; netting accounts are not traded on a symbol that

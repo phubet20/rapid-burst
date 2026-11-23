@@ -70,12 +70,12 @@ def test_ticker_all_ticks_since_returns_only_new_ticks_without_copying():
     assert len(br.ticks_since("X", 0, max_count=10)) == 10
 
 
-def _decide_with(a, b, c):
+def _decide_with(a, b, c, d=None, e=None):
     cfg = EngineConfig()
     real = mb.side_strength
 
-    def fake(m, d, cfg_):
-        return (0.9, {}, (a, b, c), []) if d > 0 else (0.0, {}, (0.0, 0.0, 0.0), [])
+    def fake(m, side, cfg_):
+        return (0.9, {}, (a, b, c, d, e), []) if side > 0 else (0.0, {}, (0.0, 0.0, 0.0, d and 0.0, e and 0.0), [])
     mb.side_strength = fake
     try:
         return decide(Micro(ready=True, stable=True, regime="fast", spread=0.1, atr=1.0, vu=0.1, target=0.3), cfg)
@@ -83,12 +83,16 @@ def _decide_with(a, b, c):
         mb.side_strength = real
 
 
-def test_no_speed_only_and_no_volume_only_entries():
-    st = _decide_with(0.9, 0.1, 0.1)
-    assert st.side == "NO TRADE" and "no speed-only" in st.reason
-    st = _decide_with(0.1, 0.9, 0.9)
-    assert st.side == "NO TRADE" and "volume/structure-only" in st.reason
-    assert _decide_with(0.9, 0.6, 0.1).side == "BUY" and _decide_with(0.9, 0.1, 0.6).side == "BUY"
+def test_agreement_rule_no_single_indicator_speed_only_or_volume_only():
+    for fam in ((0.9, 0.1, 0.1), (0.1, 0.9, 0.1), (0.9, 0.6, 0.1, 0.1, 0.1), (0.1, 0.9, 0.1, 0.1, 0.9)):
+        st = _decide_with(*fam)
+        assert st.side == "NO TRADE" and "families agree" in st.reason, (fam, st.reason)
+    assert _decide_with(0.9, 0.6, 0.1).side == "BUY"                 # no bars yet: 2 of A/B/C
+    assert _decide_with(0.9, 0.1, 0.6).side == "BUY"
+    st = _decide_with(0.9, 0.6, 0.1, 0.5, 0.1)                       # 3 of 5 incl. M1 timing
+    assert st.side == "BUY" and "agree ABD" in st.reason
+    assert _decide_with(0.2, 0.2, 0.2, 0.6, 0.6).side == "NO TRADE"  # 2 of 5
+    assert _decide_with(0.6, 0.2, 0.2, 0.6, 0.6).side == "BUY"       # tick + M1 + M5 agree, no volume needed
 
 
 def _forced_fast(tr):
@@ -110,7 +114,6 @@ def test_batch_size_caps_latency_and_cancel_if_price_ran(tmp_path):
     for t in list(br.positions_):
         br.close_position(t, 50, tr.cfg.magic)
     run(tr, br, T0 + 100.0, T0 + 100.1)
-    tr.group_cooldown.clear()
     tr.pacer = type(tr.pacer)(tr.cfg)
     k0 = len([l for l in tr.logs if l["msg"].startswith("ENTRY")])
     _forced_fast(tr)
@@ -124,22 +127,69 @@ def test_batch_size_caps_latency_and_cancel_if_price_ran(tmp_path):
     for t in list(br.positions_):
         br.close_position(t, 50, tr.cfg.magic)
     run(tr, br, T0 + 100.9, T0 + 101.5)
-    tr.group_cooldown.clear()
     tr.pacer = type(tr.pacer)(tr.cfg)
     tr.last_burst.clear()
-    real_lt = br.last_tick
+    real_lt, real_mo = br.last_tick, br.market_order
+    sent = []
 
-    def ran(s):
+    def mo(*a, **k):
+        sent.append(1)
+        return real_mo(*a, **k)
+
+    def ran(s):                                    # price runs away right after the first order of the batch
         q = dict(real_lt(s))
-        q["bid"], q["ask"] = q["bid"] + 1000.0, q["ask"] + 1000.0
+        if sent:
+            q["bid"], q["ask"] = q["bid"] + 1000.0, q["ask"] + 1000.0
         return q
-    br.last_tick = ran
+    br.last_tick, br.market_order = ran, mo
     n0 = len([l for l in tr.logs if l["msg"].startswith("ENTRY")])
     run(tr, br, T0 + 101.8, T0 + 102.1)
-    br.last_tick = real_lt
+    br.last_tick, br.market_order = real_lt, real_mo
     new = [l["msg"] for l in tr.logs if l["msg"].startswith("ENTRY")][n0:]
     batches = [l["msg"] for l in tr.logs if l["msg"].startswith("BATCH ")]
     assert len(new) == 1 and "past the edge" in batches[-1], (new, batches[-1:])
+    assert "re-entry" in batches[-1]               # measured close -> next entry
+
+
+def test_anti_chase_before_send_cancels_the_whole_batch(tmp_path):
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()})
+    _small_account(br, balance=1000.0, margin_per_lot=100.0)
+    _start(tr, br, T0 + 1)
+    run(tr, br, T0 + 1, T0 + 100)
+    for t in list(br.positions_):
+        br.close_position(t, 50, tr.cfg.magic)
+    run(tr, br, T0 + 100.0, T0 + 100.1)
+    _forced_fast(tr)
+    real_lt = br.last_tick
+    br.last_tick = lambda s: dict(real_lt(s), bid=real_lt(s)["bid"] + 1000.0, ask=real_lt(s)["ask"] + 1000.0)
+    n0 = len([l for l in tr.logs if l["msg"].startswith("ENTRY")])
+    run(tr, br, T0 + 100.3, T0 + 100.6)
+    assert len([l for l in tr.logs if l["msg"].startswith("ENTRY")]) == n0
+    assert any("before send" in d["outcome"] for d in tr.decisions)
+
+
+def test_parallel_batch_send_on_a_thread_safe_broker(tmp_path):
+    import threading
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()})
+    _small_account(br, balance=1000.0, margin_per_lot=100.0)
+    _start(tr, br, T0 + 1)
+    run(tr, br, T0 + 1, T0 + 100)
+    for t in list(br.positions_):
+        br.close_position(t, 50, tr.cfg.magic)
+    run(tr, br, T0 + 100.0, T0 + 100.1)
+    _forced_fast(tr)
+    lock, real_mo, threads = threading.Lock(), br.market_order, set()
+
+    def mo(*a, **k):
+        threads.add(threading.current_thread().name)
+        with lock:
+            return real_mo(*a, **k)
+    br.market_order = mo
+    br.concurrent_io = True
+    k0 = len([l for l in tr.logs if l["msg"].startswith("ENTRY")])
+    run(tr, br, T0 + 100.3, T0 + 100.6)
+    new = [l["msg"] for l in tr.logs if l["msg"].startswith("ENTRY")][k0:]
+    assert len(new) >= 2 and all(t.startswith("rb-io") for t in threads), (new, threads)
 
 
 def test_open_basket_is_never_added_to(tmp_path):

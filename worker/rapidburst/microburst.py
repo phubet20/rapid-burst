@@ -1,22 +1,29 @@
-"""Ultra-Fast Pre-Burst Short Scalping Engine: scanners, decision and the basket exit (pure logic).
+"""Continuous Directional Short Scalping Engine: scanners, decision and the basket exit (pure logic).
 
-ONE engine. Three scanners run on the SAME real tick stream and feed ONE decision:
+ONE engine. Five families are scored on the same moment and feed ONE decision:
   A. tick velocity & acceleration  - tick rate, velocity, acceleration/deceleration, direction sequence,
                                      directional efficiency, early acceleration, exhaustion
   B. activity burst & candle pressure - relative tick activity, activity expansion, intrabar body expansion,
                                      body/range, wick rejection, consecutive pressure, activity vs price
                                      response, absorption
-  C. micro-structure pre-burst trigger - micro high/low, compression -> expansion, micro breakout, failed
+  C. micro-structure trigger        - micro high/low, compression -> expansion, micro breakout, failed
                                      breakout, structure break, pullback recovery, short rebound, anti-chase
+  D. M1 entry timing (mtf.py)       - forming-bar direction/body expansion, MACD histogram expansion and slope
+                                     change (no full cross needed), tick-volume expansion, continuation with M5
+  E. M5 direction bias (mtf.py)     - EMA trend, body/range expansion, MACD direction/histogram/momentum change,
+                                     tick-volume activity, HH/HL vs LH/LL, supported vs exhausting
+The decision scores how well they AGREE; no single family is mandatory, activity alone never trades, M5 is a
+filter (soft penalty when ambiguous/weak against, veto only when clearly against and supported).
 
-Speed: every measurement is kept INCREMENTALLY by TickScanner.push() (rolling windows with running sums and
-monotonic min/max deques, O(1) amortised per tick). Reading a snapshot never rescans the tick history.
+Speed: tick measurements are kept INCREMENTALLY by TickScanner.push() (rolling windows with running sums and
+monotonic min/max deques, O(1) amortised per tick); EMA/MACD advance once per closed bar and the forming bar
+is an O(1) peek. Reading a snapshot never rescans history.
 
 Honesty notes (also shown in the UI):
-  * "tick volume"/"activity" = number of price updates the broker sent. It is NOT exchange volume.
+  * "tick volume"/"activity" = number of price updates the broker counted/sent. It is NOT exchange volume.
   * "flow"/"imbalance" = up- vs down-ticks and bid/ask changes: a PROXY for pressure, not real order flow.
   * Market depth is not used: neither TickerAll nor this MT5 bridge exposes a reliable book.
-No RSI or other lagging oscillator, no fixed confirmation steps, no waiting for the candle close.
+No lagging oscillator gate, no fixed confirmation steps, no waiting for the candle close.
 """
 from __future__ import annotations
 
@@ -109,6 +116,8 @@ class Micro:
     early: int = 0                  # +1/-1 early acceleration out of compression (pre-burst)
     resp: float = 0.0               # price response per unit of activity (absorption check)
     n_ticks: int = 0
+    # multi-timeframe (real broker M1/M5 candles + forming bar from ticks), set by the trader
+    mtf: Optional[object] = None    # mtf.MTFView
 
     def brief(self) -> dict:
         r = lambda x, n=3: round(x, n)   # noqa: E731
@@ -565,6 +574,18 @@ class Strength:
 
 
 SCAN_W = {"fast": (1.3, 0.9, 0.8), "normal": (1.0, 1.0, 1.0), "quiet": (0.8, 0.8, 1.3), "chop": (0.8, 1.0, 1.2)}
+W_M1, W_M5 = 1.0, 0.8          # D = M1 timing (MACD histogram / body / volume / continuation), E = M5 direction
+FAMILIES = ("A", "B", "C", "D", "E")
+
+
+def _mtf_scores(m: Micro, d: int) -> tuple:
+    """(D, E, M5 bias signed for this side) or None for a family whose timeframe has no data yet."""
+    v = m.mtf
+    if v is None:
+        return None, None, 0.0
+    dd = v.timing(d) if v.m1.ready else None
+    e = _clip(d * v.bias / 0.6) if v.m5.ready else None
+    return dd, e, d * v.bias
 
 
 def _components(m: Micro, d: int, cfg) -> dict:
@@ -608,11 +629,30 @@ def threshold(m: Micro, cfg) -> float:
 
 
 def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
+    """One strength per side from five families scored on the same moment: A tick velocity/acceleration,
+    B activity & candle pressure, C micro-structure, D M1 timing (MACD histogram expansion/turn, body, tick
+    volume, continuation), E M5 direction bias. Families without data (no bars yet) drop out of the mean."""
     c = _components(m, d, cfg)
     a, b, cs = _scanners(c)
+    dd, e, bias = _mtf_scores(m, d)
     wa, wb, wc = SCAN_W.get(m.regime, SCAN_W["normal"])
-    s = (wa * a + wb * b + wc * cs) / (wa + wb + wc)
+    num, den = wa * a + wb * b + wc * cs, wa + wb + wc
+    if dd is not None:
+        num, den = num + W_M1 * dd, den + W_M1
+        c["m1_timing"] = dd
+    if e is not None:
+        num, den = num + W_M5 * e, den + W_M5
+        c["m5_bias"] = e
+    s = num / den
     vetoes = []
+    v = m.mtf
+    if v is not None and v.m5.ready and bias < 0:
+        if bias <= -0.6 and v.supported:
+            vetoes.append(f"M5 clearly against ({v.bias_label})")
+        else:
+            s -= 0.15 * min(1.0, -bias / 0.6)          # soft: ambiguous / weak opposite M5 only costs strength
+    if v is not None and v.m5.ready and v.m5.exhaust == d:
+        s -= 0.08                                      # M5 move in our direction is exhausting
     if m.early == d:
         s += 0.06                                     # pre-burst: acceleration starting out of compression
     chase = m.chase_up if d > 0 else m.chase_dn
@@ -637,12 +677,14 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         vetoes.append(f"spread {m.spread_target:.2f}x the capture target (cost too high)")
     if d * m.vel <= 0 or c["velocity"] < cfg.mb_min_velocity:
         vetoes.append("no live force in that direction now")
-    return _clip(s), c, (round(a, 3), round(b, 3), round(cs, 3)), vetoes
+    fam = (round(a, 3), round(b, 3), round(cs, 3), None if dd is None else round(dd, 3), None if e is None else round(e, 3))
+    return _clip(s), c, fam, vetoes
 
 
 def decide(m: Micro, cfg) -> Strength:
-    """BUY / SELL / NO TRADE from the force that is starting NOW. Needs scanner A (live tick force) AND
-    scanner B or C (activity/candle pressure or a structure trigger): never volume-only, never speed-only."""
+    """BUY / SELL / NO TRADE from how well the families agree NOW. No single indicator is mandatory, but at
+    least `mb_min_agree` families must support the side (2 when the M1/M5 families have no bars yet), price
+    must be moving that way, and activity (B) is never enough on its own: no volume-only, no speed-only."""
     st = Strength()
     if not m.ready:
         st.reason = m.reason
@@ -652,9 +694,9 @@ def decide(m: Micro, cfg) -> Strength:
     s, cs, ss, vs = side_strength(m, -1, cfg)
     st.buy, st.sell = round(b, 3), round(s, 3)
     st.comps = {"BUY": {k: round(v, 2) for k, v in cb.items()}, "SELL": {k: round(v, 2) for k, v in cs.items()}}
-    st.scan = {"BUY": dict(zip("ABC", sb)), "SELL": dict(zip("ABC", ss))}
+    st.scan = {"BUY": dict(zip(FAMILIES, sb)), "SELL": dict(zip(FAMILIES, ss))}
     lvl = cfg.mb_scan_support
-    st.support = {"BUY": sum(x >= lvl for x in sb), "SELL": sum(x >= lvl for x in ss)}
+    st.support = {"BUY": sum(x is not None and x >= lvl for x in sb), "SELL": sum(x is not None and x >= lvl for x in ss)}
     if not m.stable:
         st.reason = f"feed unstable (gap {m.gap_max:.1f}s)"
         return st
@@ -671,17 +713,19 @@ def decide(m: Micro, cfg) -> Strength:
     if best - other < cfg.mb_edge:
         st.reason = f"two-sided: BUY {b:.2f} vs SELL {s:.2f}"
         return st
-    if sc[0] < lvl:
-        st.reason = f"{side} {best:.2f} but scanner A (tick force) only {sc[0]:.2f} - no volume/structure-only entries"
-        return st
-    if sc[1] < lvl and sc[2] < lvl:
-        st.reason = (f"{side} {best:.2f} but only speed: B {sc[1]:.2f} / C {sc[2]:.2f} < {lvl:.2f} "
-                     f"- no speed-only entries")
+    avail = [f for f, x in zip(FAMILIES, sc) if x is not None]
+    agree = [f for f, x in zip(FAMILIES, sc) if x is not None and x >= lvl]
+    need = min(cfg.mb_min_agree, max(2, len(avail) - 2))
+    price_fams = [f for f in agree if f != "B"]
+    if len(agree) < need or not price_fams:
+        st.reason = (f"{side} {best:.2f} but only {len(agree)}/{len(avail)} families agree ({''.join(agree) or '-'}), "
+                     f"need {need} - no single-indicator, speed-only or volume-only entries")
         return st
     st.side = side
     st.origin = m.origin_up if d > 0 else m.origin_dn
     tag = " pre-burst" if m.early == d else ""
-    st.reason = (f"{side} {best:.2f} >= {st.threshold:.2f} [{m.regime}{tag}] A{sc[0]:.2f} B{sc[1]:.2f} C{sc[2]:.2f}")
+    fams = " ".join(f"{f}{x:.2f}" for f, x in zip(FAMILIES, sc) if x is not None)
+    st.reason = f"{side} {best:.2f} >= {st.threshold:.2f} [{m.regime}{tag}] agree {''.join(agree)} | {fams}"
     return st
 
 
@@ -703,10 +747,17 @@ def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, t
     opp_press = d * m.imbalance <= -cfg.mb_opp_pressure or d * m.bidask <= -cfg.mb_opp_pressure
     stall = (m.t - float(g.get("last_ext_t", m.t))) >= cfg.mb_stall_seconds * (0.6 if m.regime == "fast" else 1.0)
     exhausted = m.exhaustion == d
-    continuing = vel > 0 and not decay and not opp_press and not exhausted and d * m.accel > -0.5 * cfg.mb_vel_ref_atr
+    # M1 momentum (MACD histogram slope on the forming bar) and tick-volume activity, when bars exist
+    v1 = m.mtf.m1 if m.mtf is not None and m.mtf.m1.ready else None
+    m1_turn = v1 is not None and d * v1.hist_slope < -0.03 and d * v1.hist_accel < 0
+    vol_fade = v1 is not None and v1.vol_x is not None and v1.vol_x < 0.7
+    m5_exh = m.mtf is not None and m.mtf.m5.ready and m.mtf.m5.exhaust == d
+    continuing = (vel > 0 and not decay and not opp_press and not exhausted and not m1_turn
+                  and d * m.accel > -0.5 * cfg.mb_vel_ref_atr)
     peak = float(g.get("peak_pl", 0.0))
     tags = "+".join(k for k, v in (("velocity-decay", decay), ("tick-flip", flip), ("opposing-pressure", opp_press),
-                                   ("stall", stall), ("exhaustion", exhausted)) if v)
+                                   ("stall", stall), ("exhaustion", exhausted), ("M1-MACD-turn", m1_turn),
+                                   ("volume-fade", vol_fade), ("M5-exhausting", m5_exh)) if v)
     # 1. profit capture on NET basket P/L
     if net >= target * cfg.mb_full_target_mult:
         return f"profit capture: {net:+.4g} >= {cfg.mb_full_target_mult:g}x target (short capture, no long hold)"
@@ -723,6 +774,10 @@ def exit_reason(g: dict, m: Micro, d: int, pl: float, held: float, opp: float, t
         return f"momentum exhaustion in profit: {net:+.4g}"
     if net >= min_net and flip and opp_press:
         return f"tick reversal in profit: {net:+.4g} {tags}"
+    if net >= min_net and m1_turn and (decay or vol_fade or vel <= 0):
+        return f"M1 momentum turned in profit (MACD histogram against, {tags}): {net:+.4g}"
+    if net >= min_net and m5_exh and not continuing:
+        return f"M5 move exhausting, momentum fading: {net:+.4g}"
     # 2. micro-structure failure / reversal (any P/L)
     if m.failed == -d:
         return f"failed breakout against the basket ({net:+.4g})"

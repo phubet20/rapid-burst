@@ -249,18 +249,20 @@ def test_untradable_symbol_explains_why_and_select_revalidates(fake, tmp_path):
     tr.cmd_shutdown()
 
 
-def test_candles_feed_trend_filter(fake, tmp_path):
-    from rapidburst.trend import compute_trend
+def test_candles_feed_m1_m5_with_tick_volume(fake, tmp_path):
+    from rapidburst.mtf import TF, m5_bias
     b = mk(fake, tmp_path)
     ok, msg = b.connect(DEMO["login"], DEMO["password"], DEMO["server"], 20000)
     assert ok, msg
-    m1 = b.candles("BTCUSDm", "M1", 0.75)
-    m5 = b.candles("BTCUSDm", "M5", 1.5)
-    assert len(m1) == 45 and len(m5) == 18
-    assert m1[0]["time"] < m1[-1]["time"]                 # sorted oldest -> newest
-    tr = compute_trend(m1, m5)
-    assert tr.known and tr.dir == 1
-    assert b.candles("NOPE", "M1", 1) == []               # unavailable -> empty, never synthesised
+    m1 = b.candles("BTCUSDm", "M1", 1)
+    m5 = b.candles("BTCUSDm", "M5", 4)
+    assert len(m1) == 60 and len(m5) == 48
+    assert m1[0]["time"] < m1[-1]["time"] and m1[-1]["tick_volume"] is not None
+    assert len(b.candles("BTCUSDm", "M5", 1.5)) == 24      # look-back sent as an integer (ceil)
+    tf = TF(300)
+    tf.load(m5, m5[-1]["time"] + 30)
+    assert m5_bias(tf.state(m5[-1]["time"] + 30))[0] > 0  # rising test bars -> up bias
+    assert b.candles("NOPE", "M1", 1) == [] and b.candle_error   # unavailable -> empty, never synthesised
     b.shutdown()
 
 

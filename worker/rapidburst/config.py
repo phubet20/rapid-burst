@@ -54,7 +54,11 @@ class EngineConfig:
     mb_min_velocity: float = 0.35     # the chosen side needs at least this much live velocity component
     mb_threshold: float = 0.55        # base strength threshold (adapted to regime, spread and slippage risk)
     mb_edge: float = 0.12             # chosen side must beat the other side by this much
-    mb_scan_support: float = 0.35     # a scanner (A/B/C) supports a side when its score >= this
+    mb_scan_support: float = 0.35     # a family (A/B/C/D/E) supports a side when its score >= this
+    mb_min_agree: int = 3             # families that must agree (of A tick, B activity/candle, C structure,
+                                      # D M1 timing, E M5 bias); 2 while the M1/M5 families have no bars
+    candle_poll_m1_s: float = 20.0    # broker M1 candle refresh (the forming bar comes from live ticks)
+    candle_poll_m5_s: float = 60.0    # broker M5 candle refresh
     mb_max_chase_atr: float = 0.90    # RB_MB_MAX_CHASE_ATR: no entry if price is > x ATR from the recent swing
     mb_max_bar_atr: float = 1.00      # RB_MB_MAX_BAR_ATR: no entry if the live candle body is > x ATR in that direction
     mb_abnormal_range_atr: float = 1.5
@@ -90,7 +94,6 @@ class EngineConfig:
     risk_per_batch_pct: float = 1.0   # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
     max_batch_lots: float = 1.0       # lots in one batch
     batch_run_cancel_frac: float = 0.5  # cancel the rest of a batch if price ran > x * target from the decision
-    group_cooldown_seconds: float = 1.0
     max_lot_per_order: float = 1.0
     max_positions_total: int = 6
     max_positions_per_symbol: int = 3
@@ -107,6 +110,9 @@ class EngineConfig:
     safe_pause_s: float = 300.0       # first safe-mode pause; doubles on each repeat in a session ...
     safe_pause_max_s: float = 1800.0  # ... up to this
     safe_probe_batches: int = 3       # after a pause: this many single min-lot batches before normal sizing
+    safe_min_stopouts: float = 1.25   # min-lot floor accounts: the safe-mode drawdown is never smaller than this
+                                      # many single-order stop losses (one normal stop must not trip it) ...
+    safe_dd_cap_pct: float = 25.0     # ... but never more than x% of the peak equity
     emergency_stale_s: float = 15.0   # open positions and no fresh price for x s => emergency close
     exec_fail_max: int = 3            # entry rejects within 60 s before the symbol is paused
     exec_fail_pause_s: float = 60.0
@@ -119,12 +125,10 @@ class EngineConfig:
     trail_spread_mult: float = 1.0
     sl_modify_min_interval: float = 1.0
 
-    # --- entry pacing ---
-    cooldown_seconds: float = 1.0
-    loss_cooldown_seconds: float = 2.0
-    max_entries_per_minute: int = 30
-    max_consecutive_losses: int = 4
-    loss_pause_seconds: float = 30.0
+    # --- continuous entry / re-entry (no fixed cooldowns; the same unchanged setup is never re-entered) ---
+    max_entries_per_minute: int = 30  # API/abuse guard only (TickerAll allows 300 order writes/min per key)
+    loss_streak_threshold_add: float = 0.03  # each consecutive losing basket raises the bar by x (max 3x);
+                                             # a winning basket resets it. Quality goes up, risk never does.
 
     # --- learning from real closed groups ---
     learning_enabled: bool = True
@@ -132,9 +136,6 @@ class EngineConfig:
     learn_half_life_hours: float = 36.0
     learn_max_mult: float = 1.5
 
-    # --- context ---
-    trend_min_strength: float = 0.25   # M1/M5 trend: display/context only, NOT an entry gate
-    trend_refresh_seconds: float = 30.0
 
     # --- loop ---
     loop_interval: float = 0.1
