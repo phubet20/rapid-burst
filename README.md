@@ -232,17 +232,19 @@ returns to the older burst logic). Demo only, bot positions only, no change to a
   The lot is sized so 20 orders fill the margin cap and compounds with equity. Total used margin <= `RB_MAX_MARGIN_USE_PCT`
   (default **100**) of equity from the broker's own numbers, and free margin must stay >= `RB_SCALP_MIN_FREE_MARGIN_PCT` (3%)
   of equity after each order, so orders are not rejected near stop-out.
-- **Exits**: each order has a quick fixed TP (max(0.25 ATR, 2x spread)); the whole group closes the moment the bar's force
-  reverses (velocity flips sign, velocity decays with opposing pressure, or a wick forms against) while in profit; a loser is
-  cut when the reversal says the trade is wrong (>= 1x spread against + flip/pressure, 0.3 ATR hard cut, no profit in 5 s,
-  60 s max hold). BE+/trailing stays; the broker SL is a far emergency stop (8 ATR); group loss stop 10% of equity.
+- **Exits**: a losing group is **held until it is in profit**, then closed: each order has a quick fixed TP
+  (max(0.25 ATR, 2x spread)); the whole group closes the moment the bar's force reverses while in profit (velocity flips,
+  velocity decays with opposing pressure, or a wick forms against). BE+/trailing stays. There is **no time stop** and **no
+  fast loss cut** by default (`RB_SCALP_WRONG_WAY_S`, `RB_SCALP_MAX_HOLD_S`, `RB_SCALP_CUT_SPREAD`, `RB_SCALP_CUT_ATR`; 0 = off).
+  Emergency only: far broker SL (8 ATR) and group loss stop 10% of equity (`RB_SCALP_GROUP_LOSS_PCT`). No averaging-down:
+  adds only fire on a continuing early impulse and never when price is already against the last order.
 - UI: *Scalp* panel (orders, floating P/L, margin used vs cap, live reversal flags). The learner keeps recording every group.
 
-High risk: up to 100% of equity can be in margin across 20 orders; a gap through the far SL can lose a large part of the account.
+High risk: a losing group can be held until the 10% group stop or the far 8-ATR broker SL; up to ~97% of equity can be in margin across 20 orders; a gap through the far SL can lose a large part of the account.
 
 ## Basket mode: averaging, pyramiding, compounding (aggressive - user-accepted risk, DEMO)
 
-Default ON (`RB_BASKET_ENABLED=0` returns to the old tight-SL burst/scalp behaviour). All orders of a symbol/direction
+Default OFF (`RB_BASKET_ENABLED=1` turns it on). All orders of a symbol/direction
 form ONE basket:
 
 - **Entry**: the M1 impulse / momentum signal opens the first order. Further orders: **averaging** when price moves

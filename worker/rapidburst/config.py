@@ -166,10 +166,10 @@ class EngineConfig:
     scalp_rev_pressure: float = 0.40     # reversal: opposing tick pressure >= x
     scalp_decay_frac: float = 0.25       # reversal: velocity decayed below x * its peak (with opposing pressure)
     scalp_wick_atr: float = 0.06         # reversal: price pulled back >= max(x * ATR, spread) from the favourable extreme
-    scalp_cut_spread: float = 1.0        # cut a loser on reversal once it is >= x * spread against
-    scalp_cut_atr: float = 0.30          # hard cut when the group is x * ATR against
-    scalp_wrong_way_s: float = 5.0       # no profit at all after x s => wrong, cut
-    scalp_max_hold_s: float = 60.0       # a scalp never lingers
+    scalp_cut_spread: float = 0.0        # 0 = off (default: hold until profit). >0: cut a loser on reversal once >= x * spread against
+    scalp_cut_atr: float = 0.0           # 0 = off. >0: hard cut when the group is x * ATR against
+    scalp_wrong_way_s: float = 0.0       # 0 = off. >0: no profit at all after x s => cut
+    scalp_max_hold_s: float = 0.0        # 0 = off. >0: max hold seconds
     scalp_group_loss_pct: float = 10.0   # software stop: group floating loss >= x% of equity
     scalp_sl_atr: float = 8.0            # far emergency broker SL = x * ATR
     scalp_trail_atr: float = 0.10        # BE+/trail distance of scalp orders = max(x * ATR, spread)
@@ -203,7 +203,9 @@ class EngineConfig:
                          ("RB_SCALP_MAX_ORDERS", "scalp_max_orders"), ("RB_SCALP_ADD_INTERVAL", "scalp_add_interval"),
                          ("RB_SCALP_MAX_BAR_ATR", "scalp_max_bar_atr"), ("RB_SCALP_MAX_SWING_ATR", "scalp_max_swing_atr"),
                          ("RB_SCALP_MIN_FREE_MARGIN_PCT", "scalp_min_free_margin_pct"),
-                         ("RB_SCALP_TP_ATR", "scalp_tp_atr"), ("RB_SCALP_GROUP_LOSS_PCT", "scalp_group_loss_pct"), ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"),
+                         ("RB_SCALP_TP_ATR", "scalp_tp_atr"), ("RB_SCALP_GROUP_LOSS_PCT", "scalp_group_loss_pct"),
+                         ("RB_SCALP_WRONG_WAY_S", "scalp_wrong_way_s"), ("RB_SCALP_MAX_HOLD_S", "scalp_max_hold_s"),
+                         ("RB_SCALP_CUT_SPREAD", "scalp_cut_spread"), ("RB_SCALP_CUT_ATR", "scalp_cut_atr"), ("RB_MAX_MARGIN_USE_PCT", "max_margin_use_pct"),
                          ("RB_BASKET_MAX_LOSS_PCT", "basket_loss_pct"), ("RB_BASKET_TARGET_PCT", "basket_target_pct"),
                          ("RB_BASKET_MAX_ORDERS", "basket_max_orders"), ("RB_BASKET_AVG_MULT", "basket_avg_mult")):
             if os.environ.get(env, "").strip():

@@ -1241,8 +1241,10 @@ class Trader:
         return True
 
     def _scalp_exit(self, key: str, legs: list, live: dict, f, now_wall: float) -> Optional[str]:
-        """Exit the whole group the moment the bar's force reverses: tick velocity flips / decays with opposing
-        pressure / a wick forms against. Winners are taken short, losers cut fast when the reversal says wrong."""
+        """Exit the whole group when it is in profit and the bar's force reverses (velocity flip / decay with
+        opposing pressure / a wick against), or the quick TP is hit. A losing group is held until it turns
+        profitable (time cuts and fast loss cuts are off by default; 0 = off). The far broker SL and the
+        group-loss stop remain the emergency safeguards."""
         cfg = self.cfg
         b = self.bursts.get(key)
         eng = self.engines.get(legs[0].symbol)
@@ -1276,15 +1278,16 @@ class Trader:
             if rev["vel_flip"] or rev["wick"] or (rev["decay"] and rev["press"]):
                 return f"reversal take-profit +{pl:.2f} px: {'+'.join(why)}"
         else:
-            cut = cfg.scalp_cut_spread * spread
-            if pl <= -cut and (rev["vel_flip"] or rev["press"]):
+            # 0 = off (default): hold a loser until it is in profit; only the far broker SL
+            # and the group-loss stop close it while underwater.
+            if cfg.scalp_cut_spread > 0 and pl <= -cfg.scalp_cut_spread * spread and (rev["vel_flip"] or rev["press"]):
                 return f"reversal cut {pl:+.2f} px: {'+'.join(why)} - trade is wrong"
-            if atr and pl <= -cfg.scalp_cut_atr * atr:
+            if cfg.scalp_cut_atr > 0 and atr and pl <= -cfg.scalp_cut_atr * atr:
                 return f"hard cut {pl:+.2f} px (>= {cfg.scalp_cut_atr:g} ATR against)"
         first = min(p.open_time for p in legs)
-        if now_wall - first >= cfg.scalp_wrong_way_s and b["best_pl"] < min_profit:
+        if cfg.scalp_wrong_way_s > 0 and now_wall - first >= cfg.scalp_wrong_way_s and b["best_pl"] < min_profit:
             return f"wrong way: no profit in {now_wall - first:.0f}s (best {b['best_pl']:+.2f} px, now {pl:+.2f})"
-        if now_wall - first >= cfg.scalp_max_hold_s:
+        if cfg.scalp_max_hold_s > 0 and now_wall - first >= cfg.scalp_max_hold_s:
             return f"scalp time stop {cfg.scalp_max_hold_s:.0f}s ({pl:+.2f} px)"
         return None
 

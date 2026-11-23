@@ -138,8 +138,8 @@ def test_connect_without_start_shuts_down_after_standby(tmp_path):
             r = await cmd(s, base, H, "search", {"q": "XAU"})
             assert r["ok"] and r["symbols"][0]["name"] == "XAUUSD"
             assert engines()
-            assert await wait_for(lambda: not engines() and not find_processes(exe_path=term), 20)
-            assert L.phase == "IDLE"
+            # engines can exit a moment before the launcher flips STANDBY -> IDLE; wait for both
+            assert await wait_for(lambda: not engines() and not find_processes(exe_path=term) and L.phase == "IDLE", 20)
             assert L.last_connect["validation_ok"] is True
             # STOP while idle with no bot positions: quick check, then nothing left running
             r = await cmd(s, base, H, "stop")

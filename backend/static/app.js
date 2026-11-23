@@ -163,7 +163,7 @@
         (x.rev ? ` · reversal: ${["vel_flip", "decay", "press", "wick"].filter((q) => x.rev[q]).join("+") || "none"}` : "") + `</div>`;
       $("engine").insertAdjacentHTML("beforeend", `<details class="small" open><summary>⚡ Scalp: margin used ${sc.margin_used ?? "—"} (${sc.margin_use_pct ?? "—"}% of equity, cap ${sc.max_margin_use_pct}%) · up to ${sc.max_orders} small orders, ${sc.add_interval}s apart</summary>` +
         (its.length ? its.map(rowS).join("") : `<div class="tiny muted">no open scalp group - waiting for an impulse at its start</div>`) +
-        `<div class="tiny muted">Early entry only (refuses if > ${sc.max_bar_atr} ATR from the bar open or > ${sc.max_swing_atr} ATR from the swing, or decelerating) · quick TP ${sc.tp_atr} ATR · exit the moment velocity flips / decays / a wick forms against · group loss stop ${sc.group_loss_pct}% of equity. Higher risk by choice.</div></details>`);
+        `<div class="tiny muted">Early entry only (refuses if > ${sc.max_bar_atr} ATR from the bar open or > ${sc.max_swing_atr} ATR from the swing, or decelerating) · hold until in profit, then close on reversal / quick TP ${sc.tp_atr} ATR · no time stop · emergency: group loss stop ${sc.group_loss_pct}% of equity + far broker SL. Higher risk by choice.</div></details>`);
     }
     const bk = eng.baskets;
     if (bk && bk.enabled) {

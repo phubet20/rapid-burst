@@ -193,7 +193,8 @@ def test_free_margin_guard_and_cap_limit_orders(tmp_path):
     assert seen2["n"] <= 3
 
 
-def test_loser_is_cut_fast_when_the_reversal_says_wrong(tmp_path):
+def _fail_then_recover():
+    """Early BUY impulse, a hard drop (group goes underwater), then a recovery back through entry."""
     rnd = random.Random(9)
     t, mid, out = T0, 2650.0, []
 
@@ -206,16 +207,66 @@ def test_loser_is_cut_fast_when_the_reversal_says_wrong(tmp_path):
     add(130, 0.0, dt=0.3, jitter=0.003)
     add(1.5, 0.012)
     add(1.5, 0.025)                  # early impulse up ...
-    add(12.0, -0.08)                 # ... that immediately fails and reverses hard
-    add(30, 0.0, dt=0.3, jitter=0.003)
-    tr, br = make(tmp_path, {"BTCUSDm": out}, EngineConfig(scalp_enabled=True))
+    add(12.0, -0.08)                 # ... immediately fails (held, not cut)
+    add(20.0, 0.08)                  # recovers through entry into profit
+    add(8.0, -0.04)                  # then fades / reverses so the profit exit can fire
+    add(20, 0.0, dt=0.3, jitter=0.003)
+    return out
+
+
+def test_time_and_fast_loss_cuts_are_off_by_default():
+    f = EngineConfig.__dataclass_fields__
+    assert f["scalp_wrong_way_s"].default == 0.0
+    assert f["scalp_max_hold_s"].default == 0.0
+    assert f["scalp_cut_spread"].default == 0.0
+    assert f["scalp_cut_atr"].default == 0.0
+
+
+def test_time_and_cut_env_overrides(monkeypatch):
+    monkeypatch.setenv("RB_SCALP_WRONG_WAY_S", "5")
+    monkeypatch.setenv("RB_SCALP_MAX_HOLD_S", "60")
+    monkeypatch.setenv("RB_SCALP_CUT_SPREAD", "1")
+    monkeypatch.setenv("RB_SCALP_CUT_ATR", "0.3")
+    c = EngineConfig.load()
+    assert (c.scalp_wrong_way_s, c.scalp_max_hold_s, c.scalp_cut_spread, c.scalp_cut_atr) == (5.0, 60.0, 1.0, 0.3)
+
+
+def test_loser_is_held_until_profit_then_closed(tmp_path):
+    ticks = _fail_then_recover()
+    tr, br = make(tmp_path, {"BTCUSDm": ticks}, EngineConfig(scalp_enabled=True))
+    _small_account(br, balance=1000.0, margin_per_lot=800.0)
+    held = {"while_down": False, "n": 0}
+
+    def watch(t_):
+        tr.atr_m1["BTCUSDm"] = 1.5
+        if br.positions_:
+            held["n"] = max(held["n"], len(br.positions_))
+            # after the drop has started (~t = T0+133+3+12) the group must still be open (no time/fast cut)
+            if T0 + 145 <= t_ <= T0 + 155 and any(p["profit"] < 0 for p in br.positions_.values()):
+                held["while_down"] = True
+    _start(tr, br, T0 + 1)
+    run(tr, br, T0 + 1, T0 + 250, on_step=watch)
+    msgs = [l["msg"] for l in tr.logs]
+    assert any(m.startswith("SCALP OPEN BUY") for m in msgs), msgs[-12:]
+    assert held["while_down"] and held["n"] >= 1, (held, msgs[-15:])
+    # no time-stop / fast-loss exits fired
+    exits = [m for m in msgs if m.startswith("EXIT BATCH")]
+    assert not any(("reversal cut" in m or "hard cut" in m or "wrong way" in m or "time stop" in m) for m in exits), exits
+    # once back in profit, the existing profit exits close the group
+    assert any(("reversal take-profit" in m or "quick take-profit" in m or "SL #" in m) for m in exits + msgs) or any(
+        "fully closed" in m and "P/L +" in m for m in msgs), (exits, msgs[-15:])
+    assert not br.positions_
+
+
+def test_fast_cuts_can_be_reenabled(tmp_path):
+    ticks = _fail_then_recover()
+    cfg = EngineConfig(scalp_enabled=True, scalp_wrong_way_s=5.0, scalp_cut_spread=1.0, scalp_cut_atr=0.3)
+    tr, br = make(tmp_path, {"BTCUSDm": ticks}, cfg)
     _small_account(br, balance=1000.0, margin_per_lot=800.0)
     _start(tr, br, T0 + 1)
     run(tr, br, T0 + 1, T0 + 200, on_step=lambda t_: tr.atr_m1.__setitem__("BTCUSDm", 1.5))
     msgs = [l["msg"] for l in tr.logs]
     exits = [m for m in msgs if m.startswith("EXIT BATCH")]
     assert any(m.startswith("SCALP OPEN BUY") for m in msgs), msgs[-10:]
-    assert any(("reversal cut" in m or "hard cut" in m or "wrong way" in m or "reversal take-profit" in m) for m in exits), exits
+    assert any(("reversal cut" in m or "hard cut" in m or "wrong way" in m) for m in exits), exits
     assert not br.positions_
-    fully = [m for m in msgs if "fully closed" in m]
-    assert fully                     # losses are small: cut within seconds, never held
