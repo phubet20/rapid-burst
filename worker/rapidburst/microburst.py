@@ -825,7 +825,7 @@ def decide(m: Micro, cfg) -> Strength:
         pe_txt = ""
         if prec_on:
             pl = st.plans[side]
-            pe_txt = (f" | PE {pl.score:.2f} {pl.kind} pullback {pl.depth:.2f} [{'+'.join(pl.tags)}] R:R {pl.rr:.1f} "
+            pe_txt = (f" | PE {pl.score:.2f} {pl.kind} {pl.path} depth {pl.depth:.2f} [{'+'.join(pl.tags)}] R:R {pl.rr:.1f} "
                       f"-> {pl.target_kind} {pl.target:.5g}")
         return best, f"{side} {best:.2f} >= {st.threshold:.2f} [{m.regime}{tag}] agree {''.join(agree)} | {fams}{pe_txt}"
     first = 1 if b >= s else -1

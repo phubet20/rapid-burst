@@ -1427,7 +1427,7 @@ class Trader:
             g["plan"] = {"key": plan.key, "kind": plan.kind, "tags": list(plan.tags), "pe": round(plan.score, 3),
                          "inval": plan.inval, "sl": plan.sl, "target": plan.target, "target_kind": plan.target_kind,
                          "rr": round(plan.rr, 2), "risk": plan.risk, "depth": round(plan.depth, 3),
-                         "entry": plan.entry, "atr": float(m.prec.core.atr) if getattr(m, "prec", None) is not None else m.atr,
+                         "entry": plan.entry, "path": plan.path, "atr": float(m.prec.core.atr) if getattr(m, "prec", None) is not None else m.atr,
                          "zone": list(plan.zone), "origin": plan.origin, "extreme": plan.extreme,
                          "mae": 0.0, "mfe": 0.0, "t0": now_wall}
             self._pe_used[(s, plan.key)] = now_wall

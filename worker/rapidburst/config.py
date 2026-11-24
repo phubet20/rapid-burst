@@ -48,7 +48,7 @@ TUNABLE = {
     "mb_max_chase_atr": (0.3, 4.0), "mb_max_bar_atr": (0.3, 5.0), "loss_streak_threshold_add": (0.0, 0.1),
     "mb_min_velocity": (0.05, 0.8), "m1_trend_veto": (0.2, 1.0), "min_orders_per_batch": (1, 8),
     "precision_enabled": (0, 1), "pe_min": (0.3, 0.9), "pe_dir_relax": (0.0, 0.3), "pe_rr_min": (1.0, 4.0), "pe_min_depth": (0.1, 0.5), "pe_zone_chase_atr": (0.1, 1.0),
-    "pe_max_sl_atr": (0.5, 3.0), "pe_min_confluence": (2, 4), "pe_max_cost_frac": (0.05, 0.6), "pe_tgt_min_atr": (0.3, 3.0), "pe_disp_atr": (0.8, 3.0),
+    "pe_max_sl_atr": (0.5, 3.0), "pe_min_confluence": (2, 4), "pe_range_prem_max": (0.6, 1.0), "pe_breakout_enabled": (0, 1), "pe_bo_cont_ext_atr": (0.2, 2.0), "pe_bo_max_bars": (2, 20), "pe_max_cost_frac": (0.05, 0.6), "pe_tgt_min_atr": (0.3, 3.0), "pe_disp_atr": (0.8, 3.0),
     "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
     "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 200), "max_positions_per_symbol": (1, 100),
@@ -277,6 +277,15 @@ class EngineConfig:
     pe_tgt_max_atr: float = 6.0
     pe_near_atr: float = 0.30         # liquidity already within x * M5 ATR in the trade direction = no room
     pe_max_cost_frac: float = 0.30    # spread / stop risk above x = execution cost too high
+    pe_range_prem_max: float = 0.85   # pullback path: no BUY in the top x of the M5 range / no SELL in the bottom x (premium / discount)
+    # confirmed breakout continuation / retest (the alternative to waiting for a deep pullback)
+    pe_breakout_enabled: bool = True
+    pe_bo_max_bars: int = 8           # the break must be at most x closed M5 bars old
+    pe_bo_body_frac: float = 0.5      # break candle body >= x of its range (not a wick spike)
+    pe_bo_beyond_atr: float = 0.1     # ... and closed >= x ATR beyond the broken level
+    pe_bo_range_atr: float = 1.0      # ... with range >= x ATR (range expansion)
+    pe_bo_cont_ext_atr: float = 0.8   # continuation: price <= x ATR beyond the broken level
+    pe_bo_retest_ext_atr: float = 1.5 # after a retest of the level: <= x ATR beyond it
     pe_target_exit: bool = True       # close the basket at the Target LIQ
     pe_invalidation_exit: bool = True # close at once when price takes out the invalidation level (before the wider broker stop)
     max_lot_per_order: float = 50.0

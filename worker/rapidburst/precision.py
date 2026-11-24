@@ -73,6 +73,9 @@ class Event:
     origin_idx: int
     origin_px: float            # the swing the impulse started from (the HL for an up break / the LH for a down break)
     t: float = 0.0              # bar time of the break (setup identity)
+    body_frac: float = 0.0      # break candle: body / range (a wick spike has a small body)
+    beyond: float = 0.0         # break candle close beyond the broken level, in ATR
+    range_atr: float = 0.0      # break candle range in ATR (range expansion)
 
 
 @dataclass
@@ -91,6 +94,9 @@ class Core:
     sweeps: list = field(default_factory=list)    # [(dir, level, idx)] dir +1 = lows swept (bullish)
     swing_lo: list = field(default_factory=list)  # support pivots
     swing_hi: list = field(default_factory=list)  # resistance pivots
+    rng_hi: float = 0.0         # M5 range high / low of the loaded history (higher-frame context)
+    rng_lo: float = 0.0
+    bo_pull: float = 0.0        # counter-move extreme since the break candle (lowest low for up / highest high for down)
     n: int = 0
     last_time: float = 0.0
 
@@ -134,6 +140,11 @@ def analyze_core(bars: list, cfg) -> Core:
         return c
     c.event = ev
     d = ev.dir
+    bb = bars[ev.idx]
+    rg = max(bb["high"] - bb["low"], 1e-12)
+    ev.body_frac, ev.beyond, ev.range_atr = abs(bb["close"] - bb["open"]) / rg, (bb["close"] - ev.level) * d / atr, rg / atr
+    aft = bars[ev.idx + 1:]
+    c.bo_pull = (min(b["low"] for b in aft) if d > 0 else max(b["high"] for b in aft)) if aft else bb["close"]
     # ---- displacement leg: origin -> extreme after the break
     seg = bars[ev.origin_idx:]
     if d > 0:
@@ -174,6 +185,7 @@ def analyze_core(bars: list, cfg) -> Core:
     liq = []
     hi_all = max(b["high"] for b in bars)
     lo_all = min(b["low"] for b in bars)
+    c.rng_hi, c.rng_lo = hi_all, lo_all
     for _, p in c.swing_hi:
         liq.append((p, "swing high", p < hi_all - 1e-12))
     for _, p in c.swing_lo:
@@ -262,6 +274,8 @@ class Plan:
     origin: float = 0.0
     extreme: float = 0.0
     waiting: str = ""             # what the engine is waiting for
+    path: str = "pullback"        # "pullback" | "breakout" (confirmed breakout continuation / retest)
+    prem: float = 0.0             # 0 = deepest discount for this side ... 1 = top premium of the M5 range
 
     def ok(self, cfg) -> bool:
         return self.ready and not self.vetoes and self.score >= float(getattr(cfg, "pe_min", 0.58))
@@ -271,11 +285,49 @@ class Plan:
         return {"side": self.side, "pe": round(self.score, 3), "ok": not self.vetoes, "vetoes": self.vetoes[:3],
                 "tags": self.tags, "rr": round(self.rr, 2), "sl": r(self.sl), "target": r(self.target),
                 "target_kind": self.target_kind, "depth": round(self.depth, 3), "waiting": self.waiting,
+                "path": self.path, "premium": round(self.prem, 2),
                 "comps": {k: round(v, 2) for k, v in self.comps.items()}}
 
 
 W = {"structure": 0.14, "ob": 0.12, "liquidity": 0.08, "fibo": 0.12, "sr": 0.06, "pullback": 0.10, "rejection": 0.08,
-     "reactivation": 0.10, "volume": 0.04, "space": 0.08, "rr": 0.10, "cost": 0.04}
+     "reactivation": 0.10, "volume": 0.04, "space": 0.08, "rr": 0.10, "cost": 0.04, "location": 0.06}
+# confirmed-breakout path: the zone factors (OB / fibo / S-R) do not exist there; the breakout quality replaces them
+W_BO = {"structure": 0.14, "breakout": 0.30, "liquidity": 0.08, "pullback": 0.06, "rejection": 0.04,
+        "reactivation": 0.12, "volume": 0.06, "space": 0.08, "rr": 0.10, "cost": 0.04}
+
+
+def _breakout(c: Core, ev: Event, m, d: int, cfg, view: PrecisionView, mid: float, atr: float):
+    """Confirmed breakout continuation / breakout retest. Returns (info | None, why). Not every spike: the break candle
+    must be a real body that CLOSED beyond the level with range expansion, the break must be fresh, price must not have
+    run far beyond the broken level, and momentum must be pushing in the trade direction right now."""
+    if not getattr(cfg, "pe_breakout_enabled", True):
+        return None, "breakout entries are disabled"
+    nb = c.n - 1 - ev.idx
+    if nb > int(getattr(cfg, "pe_bo_max_bars", 8)):
+        return None, f"the break is {nb} M5 bars old - no fresh breakout to continue"
+    if ev.body_frac < float(getattr(cfg, "pe_bo_body_frac", 0.5)) or ev.beyond < float(getattr(cfg, "pe_bo_beyond_atr", 0.1)) \
+            or ev.range_atr < float(getattr(cfg, "pe_bo_range_atr", 1.0)):
+        return None, (f"the break candle looks like a spike (body {ev.body_frac:.0%} of range, closed {ev.beyond:.2f} ATR beyond, "
+                      f"range {ev.range_atr:.2f} ATR) - not a confirmed breakout")
+    bp = c.bo_pull
+    if d > 0 and view.live_lo:
+        bp = min(bp, view.live_lo)
+    elif d < 0 and view.live_hi:
+        bp = max(bp, view.live_hi)
+    back = (bp - ev.level) * d / atr                      # how far (ATR) the counter-move went relative to the broken level
+    if back < -0.25:
+        return None, "price fell back through the broken level - the breakout failed"
+    retest = back <= 0.35
+    ext = (mid - ev.level) * d / atr
+    lim = float(getattr(cfg, "pe_bo_retest_ext_atr", 1.5)) if retest else float(getattr(cfg, "pe_bo_cont_ext_atr", 0.8))
+    if ext > lim:
+        return None, f"price is {ext:.2f} ATR beyond the broken level (max {lim:g}) - chasing the breakout"
+    if not (d * m.vel > 0 and d * m.accel >= 0):
+        return None, "waiting for momentum to push in the breakout direction"
+    q = _clip(0.4 * _clip((ev.body_frac - 0.3) / 0.5) + 0.2 * _clip(ev.beyond / 0.5) + 0.2 * _clip(ev.range_atr / 1.5)
+              + 0.2 * (1.0 if retest else 0.0))
+    inval = min(ev.level, bp) if d > 0 else max(ev.level, bp)
+    return {"retest": retest, "q": q, "inval": inval}, ""
 
 
 def evaluate(view: PrecisionView, m, d: int, cfg) -> Plan:
@@ -374,34 +426,54 @@ def evaluate(view: PrecisionView, m, d: int, cfg) -> Plan:
     if ob_hit and ob is not None:
         zone_lo, zone_hi = min(zone_lo, ob.lo), max(zone_hi, ob.hi)
     p.zone = (zone_lo, zone_hi)
-    # ---- location vetoes
+    # ---- location: premium / discount of the M5 range, pullback zone or a confirmed breakout (anti-chase)
+    rh, rl = max(c.rng_hi, mid), min(c.rng_lo, mid)
+    rpos = (mid - rl) / max(rh - rl, 1e-12)
+    prem = rpos if d > 0 else 1.0 - rpos
+    p.prem = prem
     top = (zone_hi if d > 0 else zone_lo)
     ran = (mid - top) if d > 0 else (top - mid)           # distance price has already travelled back out of the zone
-    if depth < float(getattr(cfg, "pe_min_depth", 0.30)) or ran > float(getattr(cfg, "pe_zone_chase_atr", 0.35)) * atr:
-        p.vetoes.append(f"price is not in the pullback zone (depth {depth:.2f}, {max(0.0, ran) / atr:.2f} ATR beyond it) - "
-                        f"not chasing")
-        p.waiting = f"a pullback into {fib_lo:.5g}-{fib_hi:.5g}"
-        return p
-    non_fib = [f for f in facs if f != "fibo"]
-    if len(facs) < int(getattr(cfg, "pe_min_confluence", 2)) or not non_fib:
-        p.vetoes.append(f"no confluence in the zone ({'+'.join(facs) or 'none'}): fibo alone is not an entry")
-        p.waiting = "OB / S-R / sweep / FVG overlapping the fibo zone"
-        return p
+    in_zone = not (depth < float(getattr(cfg, "pe_min_depth", 0.30)) or ran > float(getattr(cfg, "pe_zone_chase_atr", 0.35)) * atr)
+    bo = None
+    if in_zone:
+        non_fib = [f for f in facs if f != "fibo"]
+        if len(facs) < int(getattr(cfg, "pe_min_confluence", 2)) or not non_fib:
+            p.vetoes.append(f"no confluence in the zone ({'+'.join(facs) or 'none'}): fibo alone is not an entry")
+            p.waiting = "OB / S-R / sweep / FVG overlapping the fibo zone"
+            return p
+        if prem > float(getattr(cfg, "pe_range_prem_max", 0.85)):
+            p.vetoes.append(f"price is in the {'premium' if d > 0 else 'discount'} extreme of the M5 range ({prem:.0%}) - "
+                            f"{'buying' if d > 0 else 'selling'} into the {'highs' if d > 0 else 'lows'}")
+            p.waiting = f"a pullback away from the M5 range {'high' if d > 0 else 'low'}"
+            return p
+    else:
+        bo, why_bo = _breakout(c, ev, m, d, cfg, view, mid, atr)
+        if bo is None:
+            p.vetoes.append(f"price is not in the pullback zone (depth {depth:.2f}, {max(0.0, ran) / atr:.2f} ATR beyond it) - "
+                            f"not chasing; no breakout alternative: {why_bo}")
+            p.waiting = f"a pullback into {fib_lo:.5g}-{fib_hi:.5g}"
+            return p
+        p.path = "breakout"
+        facs = ["breakout-retest" if bo["retest"] else "breakout"]
+        p.tags = list(facs)
     # ---- trigger: rejection, micro structure change, momentum re-activation (live M1, no bar close)
     rej = (m.rejection == d) or (zv is not None and getattr(zv, "wick", 0) == d)
     micro = d in (m.struct_break, m.breakout, m.failed, m.rebound)
     react = d * m.vel > 0 and d * m.accel >= 0
     p.tags = facs + [t for t, h in (("rejection", rej), ("micro-structure", micro), ("re-activation", react)) if h]
-    if not (rej or micro or react):
+    if bo is None and not (rej or micro or react):
         p.waiting = "a rejection wick / micro structure change / momentum re-activation"
         p.vetoes.append("in the zone, waiting for the trigger (rejection, micro structure change or re-activation)")
     # ---- structural stop (the setup is wrong if price takes this out) - never widened
     buf = max(float(getattr(cfg, "pe_sl_buf_atr", 0.12)) * atr, 2.0 * spread)
     base = pull
-    if ob_hit and ob is not None:
-        base = min(base, ob.lo) if d > 0 else max(base, ob.hi)
-    if sweep_hit:
-        base = min(base, min(s[1] for s in sw)) if d > 0 else max(base, max(s[1] for s in sw))
+    if bo is not None:
+        base = bo["inval"]                      # the breakout fails when price is back through the broken level
+    else:
+        if ob_hit and ob is not None:
+            base = min(base, ob.lo) if d > 0 else max(base, ob.hi)
+        if sweep_hit:
+            base = min(base, min(s[1] for s in sw)) if d > 0 else max(base, max(s[1] for s in sw))
     inval = base
     sl = inval - d * buf
     risk = (ref - sl) * d
@@ -461,9 +533,17 @@ def evaluate(view: PrecisionView, m, d: int, cfg) -> Plan:
         "space": 0.0 if tgt is None else _clip((tgt[2] / atr - 0.8) / 2.0),
         "rr": 0.0 if tgt is None else _clip((tgt[3] - 1.0) / 2.0),
         "cost": _clip(1.0 - cost_frac / max(float(getattr(cfg, "pe_max_cost_frac", 0.30)), 1e-9)),
+        "location": _clip(1.0 - prem),
     }
+    w = W
+    if bo is not None:
+        for k in ("ob", "fibo", "sr", "location"):
+            comps.pop(k, None)
+        comps["breakout"] = bo["q"]
+        comps["pullback"] = 1.0 if bo["retest"] else 0.4
+        w = W_BO
     p.comps = comps
-    p.score = _clip(sum(W[k] * v for k, v in comps.items()) / sum(W.values()))
+    p.score = _clip(sum(w[k] * v for k, v in comps.items()) / sum(w[k] for k in comps))
     p.ready = True
     if not p.vetoes and p.score < float(getattr(cfg, "pe_min", 0.58)):
         p.waiting = f"a better entry: position score {p.score:.2f} < {getattr(cfg, 'pe_min', 0.58):.2f}"

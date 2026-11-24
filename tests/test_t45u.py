@@ -280,3 +280,77 @@ def test_precision_report_has_the_spec_metrics_from_real_closed_rows(tmp_path):
     assert rep["baskets"] == 2 and rep["win_rate"] == 50.0 and rep["net_after_costs"] == 3.0
     assert rep["profit_factor"] == 2.5 and rep["target_liq_reached_pct"] == 50.0 and rep["invalidation_exit_pct"] == 50.0
     assert rep["avg_mae_R"] == 0.65 and rep["avg_mfe_R"] == 1.6 and rep["by_confluence"]["fibo"]["n"] == 2
+
+
+# ------------------------------------------------------------------ t45u+: premium / discount and the breakout exception
+def breakout_setup(spike=False, extra_bars=0, mirror=False):
+    bars = []
+    _walk(bars, [100 + 0.8 * math.sin(k * 2 * math.pi / 8) for k in range(1, 41)])
+    if spike:                                                            # a wick spike: tiny body, long wicks
+        bars.append(_bar(len(bars), 101.9, 104.0, 100.0, 102.1))
+    else:                                                                # a real displacement candle closing far beyond
+        bars.append(_bar(len(bars), 100.3, 102.3, 100.2, 102.1))
+    bars.append(_bar(len(bars), 102.1, 102.55, 101.8, 102.4))
+    _walk(bars, [102.4] * extra_bars, wick=0.1)
+    if mirror:
+        for b in bars:
+            b["open"], b["close"] = 200 - b["open"], 200 - b["close"]
+            b["high"], b["low"] = 200 - b["low"], 200 - b["high"]
+    return bars
+
+
+_BO_CFG = dict(pe_rr_min=0.1, pe_tgt_min_atr=0.3, pe_near_atr=0.05, pe_min=0.4)     # the test candles have no liquidity beyond the extreme
+
+
+def test_confirmed_breakout_continuation_is_allowed_without_a_deep_pullback():
+    v, cfg = _view(breakout_setup(), EngineConfig(**_BO_CFG))
+    assert v.core.event.dir == 1 and v.core.disp_ok and v.core.event.body_frac >= 0.5
+    p = precision.evaluate(v, _m(101.75, vel=0.2), 1, cfg)
+    assert not p.vetoes, p.vetoes
+    assert p.path == "breakout" and "breakout" in p.tags and p.sl < v.core.event.level and p.ok(cfg)
+    assert p.score >= cfg.pe_min and "breakout" in p.comps and "fibo" not in p.comps
+    sell_v, _ = _view(breakout_setup(mirror=True), cfg)
+    q = precision.evaluate(sell_v, _m(200 - 101.75, vel=-0.2), -1, cfg)
+    assert not q.vetoes and q.path == "breakout" and q.sl > sell_v.core.event.level
+
+
+def test_breakout_exception_is_not_every_spike_not_chasing_and_needs_momentum():
+    cfg = EngineConfig(**_BO_CFG)
+    spike, _ = _view(breakout_setup(spike=True), cfg)
+    p = precision.evaluate(spike, _m(101.75, vel=0.2), 1, cfg)
+    assert any("spike" in x or "not a confirmed breakout" in x or "no displacement" in x for x in p.vetoes)
+    v, _ = _view(breakout_setup(), cfg)
+    far = precision.evaluate(v, _m(103.3, vel=0.2), 1, cfg)
+    assert any("chasing the breakout" in x or "beyond the broken level" in x for x in far.vetoes)
+    flat = precision.evaluate(v, _m(101.75, vel=-0.2), 1, cfg)
+    assert any("waiting for momentum" in x for x in flat.vetoes)
+    old, _ = _view(breakout_setup(extra_bars=10), cfg)
+    stale = precision.evaluate(old, _m(102.3, vel=0.2), 1, cfg)
+    assert any("bars old" in x for x in stale.vetoes)
+    # default liquidity rules still apply: no room to a target = no entry even on a clean breakout
+    dflt = precision.evaluate(v, _m(101.75, vel=0.2), 1, EngineConfig())
+    assert any("no liquidity target" in x or "no room" in x for x in dflt.vetoes)
+
+
+def test_a_breakout_that_fell_back_through_the_level_is_not_continued():
+    v, cfg = _view(breakout_setup(), EngineConfig(**_BO_CFG))
+    v.core.bo_pull = v.core.event.level - 0.6 * v.core.atr                # went back through the broken level
+    info, why = precision._breakout(v.core, v.core.event, _m(101.75, vel=0.2), 1, cfg, v, 101.75, v.core.atr)
+    assert info is None and "fell back" in why
+    v.core.bo_pull = v.core.event.level + 0.1                            # retest of the level that held
+    info, _ = precision._breakout(v.core, v.core.event, _m(101.75, vel=0.2), 1, cfg, v, 101.75, v.core.atr)
+    assert info and info["retest"] and info["inval"] <= v.core.event.level
+
+
+def test_pullback_in_the_premium_of_the_range_is_refused():
+    v, _ = _view(up_setup())
+    ok = precision.evaluate(v, _m(102.8, rejection=1, vel=0.2), 1, EngineConfig())
+    assert not ok.vetoes and 0.0 <= ok.prem < 0.85 and ok.path == "pullback"
+    bad = precision.evaluate(v, _m(102.8, rejection=1, vel=0.2), 1, EngineConfig(pe_range_prem_max=0.3))
+    assert any("premium" in x for x in bad.vetoes)
+
+
+def test_breakout_below_the_entry_score_is_not_taken():
+    v, _ = _view(breakout_setup(), EngineConfig(**dict(_BO_CFG, pe_min=0.9)))
+    p = precision.evaluate(v, _m(101.75, vel=0.2), 1, EngineConfig(**dict(_BO_CFG, pe_min=0.9)))
+    assert not p.vetoes and not p.ok(EngineConfig(pe_min=0.9)) and "better entry" in p.waiting
