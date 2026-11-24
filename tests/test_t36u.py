@@ -14,7 +14,7 @@ def _m(t, mid, **k):
 
 
 def _tr(tmp_path):
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig())
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig(precision_enabled=False, add_enabled=True))
     return tr
 
 

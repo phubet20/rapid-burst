@@ -12,7 +12,7 @@ from tests.synth import burst_series, gen_ticks
 
 def _analyze_stream(ticks, cfg=None, atr=1.0, after=None):
     """Feed ticks one by one and return [(t, Micro, Strength)] like the live loop (analysis at every tick)."""
-    cfg = cfg or EngineConfig()
+    cfg = cfg or EngineConfig(precision_enabled=False, add_enabled=True)
     eng = MomentumEngine("XAUUSD", 0.01, cfg)
     out = []
     for t, b, a in ticks:
@@ -54,20 +54,20 @@ def test_random_market_trades_are_the_exception():
 
 
 def test_strength_is_two_sided_and_explains_itself():
-    st = decide(_live(), EngineConfig())
+    st = decide(_live(), EngineConfig(precision_enabled=False, add_enabled=True))
     assert st.side == "BUY" and st.buy > st.threshold and st.sell < st.buy
-    lvl = EngineConfig().mb_scan_support
+    lvl = EngineConfig(precision_enabled=False, add_enabled=True).mb_scan_support
     assert st.scan["BUY"]["A"] >= lvl and max(st.scan["BUY"]["B"], st.scan["BUY"]["C"]) >= lvl
     assert st.reason.startswith("BUY") and "A" in st.reason
-    assert "early-burst" in decide(_live(early=1), EngineConfig()).reason
+    assert "early-burst" in decide(_live(early=1), EngineConfig(precision_enabled=False, add_enabled=True)).reason
     st2 = decide(_live(vel=-0.5, accel=-0.3, eff=-0.8, seq_run=-5, seq_consist=-0.8, burst_dir=-1, body=-0.3,
                        close_loc=0.1, breakout=-1, imbalance=-0.7, bidask=-0.7, chase_up=0.0, chase_dn=0.3,
-                       origin_dn=90.0), EngineConfig())
+                       origin_dn=90.0), EngineConfig(precision_enabled=False, add_enabled=True))
     assert st2.side == "SELL"
 
 
 def test_anti_chase_and_big_bar_veto():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     st = decide(_live(chase_up=5.0), cfg)
     assert st.side == "NO TRADE" and "anti-chase" in st.reason
     st = decide(_live(body=3.0), cfg)
@@ -75,7 +75,7 @@ def test_anti_chase_and_big_bar_veto():
 
 
 def test_no_live_force_and_unstable_feed_and_cost_block():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     assert decide(_live(vel=0.0, accel=0.0), cfg).side == "NO TRADE"            # no candle/volume-only entries
     st = decide(_live(stable=False, gap_max=9.0), cfg)
     assert st.side == "NO TRADE" and "feed unstable" in st.reason
@@ -98,7 +98,7 @@ def _g(**kw):
 
 
 def test_momentum_hold_no_fixed_tp_and_small_retracement_is_held():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     m = _live()                                                   # momentum running
     # far beyond the old "2x target" fixed capture: still held while momentum continues (no fixed TP)
     assert exit_reason(_g(peak_pl=0.7), m, 1, 0.7, 2, 0.0, 0.5, 0.8, 0.0, cfg) is None
@@ -109,14 +109,14 @@ def test_momentum_hold_no_fixed_tp_and_small_retracement_is_held():
 
 
 def test_meaningful_retracement_with_exhaustion_protects_profit():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     fading = _live(vel=0.05, vel_prev=0.3, accel=-0.25, t=110.0)            # decayed + stalled (no new high 10 s)
     r = exit_reason(_g(peak_pl=0.7), fading, 1, 0.35, 12, 0.0, 0.5, 0.8, 0.0, cfg)
     assert r and ("profit protection: retraced" in r or "momentum exhausted" in r), r
 
 
 def test_exit_costs_are_netted():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     fading = _live(vel=0.05, vel_prev=0.3, accel=-0.25, t=110.0, failed=-1, imbalance=-0.7)
     assert "in profit" in exit_reason(_g(peak_pl=0.6), fading, 1, 0.2, 12, 0.0, 0.5, 0.8, 0.0, cfg) or \
         "profit protection" in exit_reason(_g(peak_pl=0.6), fading, 1, 0.2, 12, 0.0, 0.5, 0.8, 0.0, cfg)
@@ -125,7 +125,7 @@ def test_exit_costs_are_netted():
 
 
 def test_losing_basket_is_held_inside_the_hard_stop_until_the_move_clearly_turns():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     # a small loss on noise is NOT cut (the old 4 s "no follow-through" cut is gone)
     assert exit_reason(_g(), _live(vel=-0.01, regime="normal"), 1, -0.05, 5, 0.0, 0.5, 0.8, 0.0, cfg) is None
     # one structure failure alone: held
@@ -138,7 +138,7 @@ def test_losing_basket_is_held_inside_the_hard_stop_until_the_move_clearly_turns
     assert r is None, r
     # ... the legacy momentum cut only when explicitly re-enabled by tuning
     r = exit_reason(_g(), _live(vel=-0.2, imbalance=-0.7, t=110.0, regime="normal"), 1, -0.45, 1, 0.0, 0.5, 0.8, 0.0,
-                    EngineConfig(mb_cut_frac=0.5))
+                    EngineConfig(precision_enabled=False, add_enabled=True, mb_cut_frac=0.5))
     assert r and "momentum against" in r, r
 
 
@@ -179,7 +179,7 @@ def test_one_batch_per_signal_capped_same_lot_no_adds_later(tmp_path):
     groups = {}
     for o in orders:
         groups.setdefault(o["comment"].rsplit("-", 1)[0], []).append(o)
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     assert groups
     for legs in groups.values():
         assert len(legs) <= cfg.max_orders_per_batch
@@ -237,7 +237,7 @@ def test_no_daily_loss_halt_and_safe_mode_defaults(monkeypatch):
     # t32u: ruin-avoiding defaults (10% basket, 25% total, safe mode 30% below the closed-balance peak)
     assert not hasattr(c, "daily_loss_limit_pct") and c.equity_drawdown_pct == 30.0
     assert c.max_margin_use_pct == 90.0 and c.risk_per_batch_pct == 10.0 and c.max_total_risk_pct == 25.0
-    assert c.max_orders_per_batch == 16 and c.min_orders_per_batch == 1 and c.broker_sl and c.no_stop_mode   # t38u
+    assert c.max_orders_per_batch == 16 and c.min_orders_per_batch == 1 and c.broker_sl and not c.no_stop_mode   # t45u: SL on (was t38u no-stop)
 
 
 def test_safe_mode_pauses_entries_keeps_stops_and_keeps_running(tmp_path):
@@ -270,14 +270,14 @@ def test_stop_flattens_bot_positions(tmp_path):
 
 
 def test_margin_cap_and_risk_based_lot(tmp_path):
-    cfg = EngineConfig(max_margin_use_pct=0.5)       # 0.5% of $1000 = $5 < $10 margin per 0.01 lot at 1000/lot
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True, max_margin_use_pct=0.5)       # 0.5% of $1000 = $5 < $10 margin per 0.01 lot at 1000/lot
     tr, br, inv, orders = _session(tmp_path, series_up(), cfg=cfg, mpl=1000.0, t_end=T0 + 200)
     assert not orders
     assert any("margin" in k for k in tr.skip_counts.get("BTCUSDm", {})), dict(tr.skip_counts.get("BTCUSDm", {}))
 
 
 def test_unprotected_positions_flattened_when_engine_not_running(tmp_path):
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     tr, br = make(tmp_path, {"BTCUSDm": series_up()}, cfg)
     _small_account(br, balance=1000.0, margin_per_lot=10.0)
     br.advance(T0 + 200)

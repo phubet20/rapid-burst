@@ -22,7 +22,7 @@ from dataclasses import replace as dc_replace
 from typing import Optional
 
 from . import __version__
-from . import regime, zones
+from . import precision, regime, zones
 from .guardian import LossGuardian
 from .config import TUNABLE, EngineConfig, validate_tune
 from .engine import MomentumEngine, PositionState
@@ -103,6 +103,9 @@ class Trader:
         self._mid_hist: dict = {}         # t36u: symbol -> recent (tick time, mid) for the outlier filter
         self._exit_held_log: dict = {}
         self.exits_filtered = 0
+        self._prec = precision.Analyzer()  # t45u: structure / OB / liquidity cache per closed M5 bar
+        self._pe_used: dict = {}           # t45u: (symbol, setup key) -> wall time of its entry (one entry per structure event)
+        self._pe_log: dict = {}
         self._regime_last: dict = {}      # t40u: symbol -> (state, phase) for the REGIME change log
         self.recoveries = {"hedges": 0, "layers": 0, "cycle_tp": 0}
         self.guardian = LossGuardian(self)
@@ -704,7 +707,7 @@ class Trader:
                           "m1_bar": b.get("m1_bar"), "planned": b.get("planned"), "score_q": b.get("score_q"),
                           "risk": round(float(b.get("risk", 0.0)), 2),
                           "protect": b.get("prot") or "none", "trail_moves": int(b.get("trail_moves", 0)),
-                          "pl_incomplete": b.get("pl_incomplete")})
+                          "pl_incomplete": b.get("pl_incomplete"), "precision": b.get("plan")})
         c = self.bar_cycles.get(ps.symbol)
         if c is not None and b.get("m1_bar") == c.get("bar"):
             c["closed"] += 1
@@ -899,6 +902,12 @@ class Trader:
                             self.add_log("INFO", f"REGIME {s}: {m.trend.label()} [{m.trend.why}]")
                     except Exception:  # noqa: BLE001
                         m.trend = None
+                if cfg.precision_enabled:
+                    try:
+                        m.prec = self._prec.view(s, mt.m5.bars, getattr(mt.m5, "live", None), cfg)
+                    except Exception:  # noqa: BLE001 - no structure view = no entry (decide() reports it), never a crash
+                        log.exception("precision analysis failed for %s", s)
+                        m.prec = None
             st = decide(m, cfg)
             add = self.pacer.threshold_add(s)
             if add and st.side != "NO TRADE":
@@ -930,6 +939,9 @@ class Trader:
                 "ind": m.ind.brief() if getattr(m, "ind", None) is not None else None,
                 "zones": m.zones.brief() if getattr(m, "zones", None) is not None else None,
                 "trend": m.trend.brief() if getattr(m, "trend", None) is not None else None,
+                "precision": ({"structure": m.prec.brief() if getattr(m, "prec", None) is not None else None,
+                               "pe": st.pe, "plans": {k: v.brief() for k, v in st.plans.items()}}
+                              if self.cfg.precision_enabled else None),
                 "m1_cycles": self._cycles(s, now_wall)}
 
     def _m1_bar(self, s: str, now_wall: float) -> float:
@@ -995,6 +1007,11 @@ class Trader:
             ok, why = self.pacer.can_enter(s, now_wall)
             if not ok:
                 self._skip(s, status, f"{side} blocked: {why}", now_wall, sig)
+                continue
+            pl = st.plans.get(side) if cfg.precision_enabled else None
+            if pl is not None and (s, pl.key) in self._pe_used:
+                self._skip(s, status, f"{side} skipped: this setup ({pl.kind} {pl.key}) was already entered - one entry per "
+                                      f"structure event, the next one needs a new break of structure", now_wall, sig)
                 continue
             if self.exec_pause.get(s, 0.0) > now_wall:
                 self._skip(s, status, f"{side} blocked: execution failures - paused "
@@ -1184,6 +1201,24 @@ class Trader:
         def refuse(why: str) -> bool:
             self._skip(s, status, f"{side} batch blocked: {why}", now_wall, sig)
             return False
+
+        plan = st.plans.get(side) if (cfg.precision_enabled and getattr(st, "plans", None)) else None
+        if plan is not None:
+            # t45u: the stop is the STRUCTURAL INVALIDATION of this setup (never a fixed distance, never widened to
+            # "give it room"); stop distance, lot and reward-to-risk are re-checked on the live price before sending
+            ref0 = m.ask if side == "BUY" else m.bid
+            atr5 = float(m.prec.core.atr) if getattr(m, "prec", None) is not None and m.prec.ready else (m.atr or 0.0)
+            dist = (ref0 - plan.sl) * d
+            if dist <= 0:
+                return refuse("price is already beyond the structural invalidation level")
+            dist = max(dist, stops, 3.0 * m.spread)          # broker minimum only: the nearest placeable stop beyond it
+            if atr5 > 0 and dist > cfg.pe_max_sl_atr * atr5 * 1.05:
+                return refuse(f"structural stop {dist:.5g} > {cfg.pe_max_sl_atr:g} ATR(M5) {atr5:.5g} - not widened, skipped")
+            reward = (plan.target - ref0) * d - m.spread
+            if reward <= 0 or reward / dist < cfg.pe_rr_min:
+                return refuse(f"reward-to-risk {max(reward, 0.0) / dist:.2f} < {cfg.pe_rr_min:g} to the Target LIQ "
+                              f"{plan.target:.5g} (stop {dist:.5g}) at the live price")
+            sl_dist, sl_src = dist, f"structural invalidation ({'+'.join(plan.tags)}; {plan.kind})"
 
         # the SCORE drives the order count and the risk: sq = edge over the threshold (0..1)
         strength = st.buy if side == "BUY" else st.sell
@@ -1388,6 +1423,20 @@ class Trader:
         if iv is not None and getattr(iv, "ready", False):
             g["ind_votes"] = {k: round(d * x, 3) for k, x in iv.votes.items()}      # toward the trade side
         g["sl_src"] = sl_src
+        if plan is not None:
+            g["plan"] = {"key": plan.key, "kind": plan.kind, "tags": list(plan.tags), "pe": round(plan.score, 3),
+                         "inval": plan.inval, "sl": plan.sl, "target": plan.target, "target_kind": plan.target_kind,
+                         "rr": round(plan.rr, 2), "risk": plan.risk, "depth": round(plan.depth, 3),
+                         "entry": plan.entry, "atr": float(m.prec.core.atr) if getattr(m, "prec", None) is not None else m.atr,
+                         "zone": list(plan.zone), "origin": plan.origin, "extreme": plan.extreme,
+                         "mae": 0.0, "mfe": 0.0, "t0": now_wall}
+            self._pe_used[(s, plan.key)] = now_wall
+            if len(self._pe_used) > 500:
+                for k_ in sorted(self._pe_used, key=self._pe_used.get)[:200]:
+                    self._pe_used.pop(k_, None)
+            self.add_log("INFO", f"PRECISION {gid} {side} {s}: {plan.kind} pullback {plan.depth:.2f} of the leg [{'+'.join(plan.tags)}] "
+                                 f"PE {plan.score:.2f} | stop {plan.sl:.5g} (invalidation {plan.inval:.5g}) | Target LIQ "
+                                 f"{plan.target_kind} {plan.target:.5g} R:R {plan.rr:.1f}")
         tv_ = getattr(m, "trend", None)
         g["regime"] = tv_.label() if tv_ is not None else "-"
         msg = (f"BATCH {gid} {side} {s}: {opened}/{n} order(s) filled, {opened * size.volume:g} lots | {g['regime']} | M5 {g['attr']['trend']}, "
@@ -1554,12 +1603,20 @@ class Trader:
                 # BE / trailing; its only exit is "protection failed" (stop not confirmed by MT5) = a RISK exit, never delayed
                 reason = self._protect_basket(key, legs, live, m, st, now_wall)
             if not reason and self.running and not cfg.no_stop_mode:
-                soft = self._zone_target(legs, live, m) or self._micro_exit(key, legs, live, m, st, now_wall)
-                if not soft:
-                    soft = self._reversal_check(legs, m, st)
-                if soft and self._pullback_hold(legs, soft, m, now_wall, key):
-                    soft = None                                                     # t37u: pullback into own zone
-                reason = self._confirm_soft_exit(key, sym, soft, m, now_wall)   # t36u: anti-jitter
+                grp = self.bursts.get(key) or {}
+                lq = self._liq_exit(key, legs, live, m, now_wall) if (cfg.precision_enabled and grp.get("plan")) else None
+                if lq and lq.startswith("TARGET LIQ"):
+                    reason = lq                                                 # the target is taken at once
+                else:
+                    # t45u: a precision basket is held to its Target LIQ (no cents-level zone target); the structural
+                    # invalidation (confirmed against jitter) and the momentum / reversal exits still apply
+                    soft = lq or ((None if grp.get("plan") else self._zone_target(legs, live, m))
+                                  or self._micro_exit(key, legs, live, m, st, now_wall))
+                    if not soft:
+                        soft = self._reversal_check(legs, m, st)
+                    if soft and not lq and self._pullback_hold(legs, soft, m, now_wall, key):
+                        soft = None                                                 # t37u: pullback into own zone
+                    reason = self._confirm_soft_exit(key, sym, soft, m, now_wall)   # t36u: anti-jitter
             else:
                 self._exit_pending.pop(key, None)
             if not reason:
@@ -1601,6 +1658,31 @@ class Trader:
                          + ", ".join(closed))
             self._refresh_account()
             self._adopt_positions()          # book the closed basket now: the same loop can re-enter on a fresh signal
+
+    def _liq_exit(self, key: str, legs: list, live: dict, m, now_wall: float) -> Optional[str]:
+        """t45u: exits that belong to a precision basket - the Target LIQ (take it), the structural invalidation (the
+        setup failed: leave now, do not wait for the wider broker stop) - plus MAE / MFE tracking for the report."""
+        cfg = self.cfg
+        g = self.bursts.get(key) or {}
+        pl = g.get("plan")
+        if not pl:
+            return None
+        d = 1 if legs[0].side == "BUY" else -1
+        pxs = [x for x in (self._exec_px(ps, live.get(ps.ticket, {}), m if getattr(m, "bid", 0) else None, now_wall)
+                           for ps in legs) if x]
+        if not pxs:
+            return None
+        px = min(pxs) if d > 0 else max(pxs)
+        fav = (px - pl["entry"]) * d
+        pl["mfe"] = max(float(pl.get("mfe", 0.0)), fav)
+        pl["mae"] = max(float(pl.get("mae", 0.0)), -fav)
+        if cfg.pe_target_exit and (px - pl["target"]) * d >= 0:
+            return (f"TARGET LIQ reached: {pl['target_kind']} {pl['target']:.5g} (price {px:.5g}, R:R planned "
+                    f"{pl['rr']:.1f}, {pl['kind']} setup [{'+'.join(pl['tags'])}])")
+        if cfg.pe_invalidation_exit and (px - pl["inval"]) * d <= 0:
+            return (f"STRUCTURE INVALIDATED: price {px:.5g} took out {pl['inval']:.5g} ({pl['kind']} setup "
+                    f"[{'+'.join(pl['tags'])}]) - the setup failed, leaving now instead of waiting for the stop")
+        return None
 
     def _pullback_hold(self, legs: list, soft: str, m, now_wall: float, key: str) -> bool:
         """t37u: a mere pullback INTO a demand zone / bullish FVG (BUY basket; supply / bearish FVG for SELL) does not
@@ -2512,6 +2594,7 @@ class Trader:
                               f"< {c.emergency_margin_level_pct:g}% or data-feed loss)") if c.no_stop_mode
                              else ("ON" if c.broker_sl else "OFF"), "exec_halt": self.exec_halt,
                 "no_stop_mode": c.no_stop_mode, "nostop_margin_use_pct": c.nostop_margin_use_pct,
+                "precision_enabled": c.precision_enabled, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
                 "batch_margin_pct": c.batch_margin_pct, "avg_max_layers": c.avg_max_layers, "avg_lot_mult": c.avg_lot_mult,
                 "avg_spacing_atr": c.avg_spacing_atr, "hedge_enabled": c.hedge_enabled, "recovery_after_s": c.recovery_after_s,
                 "recovery_loss_pct": c.recovery_loss_pct, "cycle_tp_pct": c.cycle_tp_pct, "recoveries": dict(self.recoveries),
@@ -2566,6 +2649,50 @@ class Trader:
                            "p90": self._pct([r.get("close_ms") for r in x], 0.9)}
         return out
 
+    @staticmethod
+    def _precision_report(rows: list, pls: list) -> dict:
+        """t45u: the entry-quality metrics of the spec for the REAL closed precision baskets (broker P/L after costs).
+        MAE / MFE are sampled by the engine loop (price units and R of the planned stop), not tick-perfect."""
+        sel = [(r, pl) for r, pl in zip(rows, pls) if r.get("precision")]
+        n = len(sel)
+        if not n:
+            return {"baskets": 0}
+        wins = [pl for _, pl in sel if pl > 0]
+        losses = [pl for _, pl in sel if pl <= 0]
+        gl = -sum(losses)
+
+        def avg(xs):
+            xs = [x for x in xs if x is not None]
+            return round(sum(xs) / len(xs), 3) if xs else None
+        mae_r, mfe_r = [], []
+        for r, _ in sel:
+            p = r["precision"]
+            rk = float(p.get("risk") or 0.0)
+            if rk > 0:
+                mae_r.append(float(p.get("mae", 0.0)) / rk)
+                mfe_r.append(float(p.get("mfe", 0.0)) / rk)
+        tags: dict = {}
+        for r, pl in sel:
+            for tg in r["precision"].get("tags", []):
+                g = tags.setdefault(tg, {"n": 0, "wins": 0, "net": 0.0})
+                g["n"] += 1
+                g["wins"] += pl > 0
+                g["net"] = round(g["net"] + pl, 2)
+        ex = [str(r.get("exit", "")) for r, _ in sel]
+        return {"baskets": n, "win_rate": round(len(wins) / n * 100, 1), "net_after_costs": round(sum(pls_ for _, pls_ in sel), 2),
+                "profit_factor": round(sum(wins) / gl, 2) if gl > 0 else None,
+                "avg_win": avg(wins), "avg_loss": avg(losses),
+                "target_liq_reached_pct": round(100.0 * sum(e.startswith("TARGET LIQ") for e in ex) / n, 1),
+                "invalidation_exit_pct": round(100.0 * sum(e.startswith("STRUCTURE INVALIDATED") for e in ex) / n, 1),
+                "broker_stop_pct": round(100.0 * sum(("stop" in e or "SL" in e) and not e.startswith("STRUCTURE") for e in ex) / n, 1),
+                "avg_mae_R": avg(mae_r), "avg_mfe_R": avg(mfe_r),
+                "avg_initial_drawdown_price": avg([float(r["precision"].get("mae", 0.0)) for r, _ in sel]),
+                "avg_planned_rr": avg([r["precision"].get("rr") for r, _ in sel]),
+                "avg_entry_depth": avg([r["precision"].get("depth") for r, _ in sel]),
+                "avg_entry_score": avg([r["precision"].get("pe") for r, _ in sel]),
+                "avg_realised_R": avg([pl / float(r["risk"]) for r, pl in sel if float(r.get("risk") or 0) > 0]),
+                "by_confluence": tags}
+
     def _perf_view(self) -> dict:
         """Results of REAL closed baskets in this process (broker deals: profit + commission + swap + fee).
         Nothing simulated. Attribution = outcome grouped by the state of each family at entry."""
@@ -2613,6 +2740,7 @@ class Trader:
                 "avg_slip_pts": round(sum(slips) / len(slips), 1) if slips else None,
                 "attribution": {k: group(k) for k in ("trend", "macd", "volume", "tick")},
                 "orders_per_basket": round(sum(int(r.get("legs") or 0) for r in rows) / n, 2),
+                "precision": self._precision_report(rows, pls),
                 "entries_per_m1_bar": self._per_bar(rows),
                 "protection": dict(self.prot_stats, baskets_with_be=sum(1 for r in rows if r.get("protect") in ("BE", "trail")),
                                    baskets_trailed=sum(1 for r in rows if r.get("protect") == "trail"),

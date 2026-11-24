@@ -502,3 +502,21 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   in UP / BUY in DOWN) unless a wick tip or demand/supply zone backs it; `regime_chase_atr` 2.0 -> 1.5;
   `regime_mid_penalty` 0.06 -> 0.10 (middle of a sideways range); `mb_edge` 0.03 -> 0.06 (a near-tie BUY/SELL is
   noise). These are reasoned changes, NOT back-tested on real data.
+
+## t45u — Structure-to-Liquidity precision entry (owner spec)
+
+Entry logic of the existing engine changed in place (`worker/rapidburst/precision.py`, wired into `microburst.decide` and the trader; no new engine, no new UI page).
+
+* **Direction from M5 structure**: confirmed swings, BOS / CHOCH (closes beyond the last swing), displacement leg (origin -> impulse extreme, big range + big body). Not entered because RSI / MACD / volume spike.
+* **Order block + liquidity map**: bullish / bearish OB tied to the displacement, equal highs / lows, swing liquidity, previous (range) high / low, internal vs external, liquidity sweeps. **Target LIQ** is chosen before entry; liquidity closer than `pe_tgt_min_atr` is skipped, liquidity right overhead (`pe_near_atr`) vetoes.
+* **Fibo 0.50 / 0.618 / 0.705 / 0.786** of the displacement leg is only one confluence factor: an entry needs >= `pe_min_confluence` factors (fibo, OB, S/R, sweep, FVG-zone) and at least one that is not the fibo.
+* **Pullback, not chasing**: price must be back in the zone (`pe_min_depth`, `pe_zone_chase_atr`), structure not lost (`pe_max_depth`), then a rejection / micro structure change / momentum re-activation on the live M1 triggers the order immediately (no bar-close wait).
+* **Position Entry Score** (`Plan.score`, `pe_min`) is separate from the directional momentum score; right direction + bad location = `NO TRADE (location rejected)`. It weighs structure, OB, liquidity, fibo, S/R, pullback quality, rejection, re-activation, volume, target space, R:R, spread cost.
+* **Stop / target**: broker SL at the structural invalidation (beyond the pullback low / OB / swept low + buffer), never widened (`pe_max_sl_atr`), stop distance + lot + R:R (`pe_rr_min`) re-checked on the live price in `_open_batch`. No fixed TP: the basket is held to its Target LIQ (`TARGET LIQ reached`), protected by the existing break-even + dynamic trailing, and closed at once on `STRUCTURE INVALIDATED`. Cents-level zone targets are off for these baskets.
+* **Management**: no hedge, no averaging, no martingale, no pyramid adds (`add_enabled` default off), one entry per structure event.
+* **`no_stop_mode` is now OFF** and `load()` keeps it off while `precision_enabled` (the precision entry is defined by its stop). `precision_enabled` is tunable (0 = previous behaviour, for A/B).
+
+### Testing - what is and is not proven
+`tests/test_t45u.py` (15 tests) checks the LOGIC on synthetic candles and the simulated broker. It is **not** market evidence. No real historical candles are in the repo and the sandbox had no market-data access, so **no old-vs-new profitability comparison has been run**. The defaults (`pe_*`) are untuned.
+Real evidence comes from the DEMO forward test: the status API (`performance.precision`) reports, from real closed baskets after costs: win rate, profit factor, avg win / loss, Target-LIQ reach %, invalidation / broker-stop %, avg MAE / MFE in R, avg initial drawdown, planned vs realised R, entry depth / score and win rate per confluence tag; each closed basket carries its plan in `performance` rows. Compare it with the previous release on a **later** period than any tuning (run `precision_enabled=0` on the same demo for the old logic).
+

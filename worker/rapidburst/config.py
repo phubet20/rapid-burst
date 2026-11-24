@@ -47,6 +47,8 @@ TUNABLE = {
     "mb_threshold": (0.35, 0.90), "mb_edge": (0.0, 0.40), "mb_min_agree": (2, 5), "mb_scan_support": (0.2, 0.7),
     "mb_max_chase_atr": (0.3, 4.0), "mb_max_bar_atr": (0.3, 5.0), "loss_streak_threshold_add": (0.0, 0.1),
     "mb_min_velocity": (0.05, 0.8), "m1_trend_veto": (0.2, 1.0), "min_orders_per_batch": (1, 8),
+    "precision_enabled": (0, 1), "pe_min": (0.3, 0.9), "pe_dir_relax": (0.0, 0.3), "pe_rr_min": (1.0, 4.0), "pe_min_depth": (0.1, 0.5), "pe_zone_chase_atr": (0.1, 1.0),
+    "pe_max_sl_atr": (0.5, 3.0), "pe_min_confluence": (2, 4), "pe_max_cost_frac": (0.05, 0.6), "pe_tgt_min_atr": (0.3, 3.0), "pe_disp_atr": (0.8, 3.0),
     "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
     "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 200), "max_positions_per_symbol": (1, 100),
@@ -184,7 +186,8 @@ class EngineConfig:
     # confirmed pullback/reversal (volume + momentum + indicators, anti-jitter). The ONLY emergency guards are the
     # margin level (< emergency_margin_level_pct closes the bot's positions) and data-feed loss. BE/trail on winners
     # stays as engine-side profit protection. Set no_stop_mode=0 to restore stop-based sizing + broker SL.
-    no_stop_mode: bool = True         # t40u: LOCKED ON - not tunable, not in the env overrides (owner: never set SL)
+    no_stop_mode: bool = False        # t45u: OFF - every order has a structural broker SL (the precision spec requires it);
+                                      # load() keeps it off while precision_enabled (not tunable, not in the env overrides)
     nostop_margin_use_pct: float = 75.0     # t41u: TOTAL margin of all bot positions (batches+hedge+layers) <= x%
     batch_margin_pct: float = 10.0          # t40u: margin of ONE batch / hedge / recovery layer <= x% of equity
     # t40u market state: UP / DOWN / SIDEWAYS + trend phase counter (M5 forming bars, swings, ADX)
@@ -252,13 +255,37 @@ class EngineConfig:
     risk_per_batch_pct: float = 10.0  # RB_RISK_PER_BATCH_PCT: whole batch loses <= x% equity if every stop is hit
     max_batch_lots: float = 100.0      # lots in one batch
     batch_run_cancel_frac: float = 1.0  # cancel the rest of a batch if price ran > x * target from the decision
+    # t45u STRUCTURE-TO-LIQUIDITY PRECISION ENTRY (precision.py): pullback entry from M5 structure (BOS/CHOCH +
+    # displacement), OB, liquidity targets, fibo as ONE confluence factor, trigger on the live M1, structural stop,
+    # reward-to-risk to the Target LIQ. The Position Entry Score is separate from the directional momentum score.
+    precision_enabled: bool = True
+    pe_min: float = 0.58              # Position Entry Score needed (0..1)
+    pe_dir_relax: float = 0.10        # the directional threshold is lowered by x here (the pullback trigger is the timing)
+    pe_pivot_k: int = 2
+    pe_min_m5_bars: int = 40
+    pe_disp_atr: float = 1.5          # displacement leg >= x * M5 ATR ...
+    pe_disp_body_atr: float = 0.8     # ... with at least one body >= x * M5 ATR
+    pe_min_depth: float = 0.30        # never enter shallower than x of the leg (that is chasing)
+    pe_max_depth: float = 0.886       # deeper than x = the structure is lost
+    pe_zone_chase_atr: float = 0.35   # no entry once price left the pullback zone by > x * M5 ATR
+    pe_min_confluence: int = 2        # factors among fibo / OB / S-R / sweep / FVG-zone, at least one not the fibo
+    pe_liq_tol_atr: float = 0.12      # equal highs / lows tolerance
+    pe_sl_buf_atr: float = 0.12       # structural stop = invalidation level - max(x * M5 ATR, 2 * spread)
+    pe_max_sl_atr: float = 1.6        # stop wider than x * M5 ATR -> skip (never widened)
+    pe_rr_min: float = 1.5            # reward to the Target LIQ >= x * risk
+    pe_tgt_min_atr: float = 0.8       # a target closer than x * M5 ATR is "too near" - the next liquidity is used
+    pe_tgt_max_atr: float = 6.0
+    pe_near_atr: float = 0.30         # liquidity already within x * M5 ATR in the trade direction = no room
+    pe_max_cost_frac: float = 0.30    # spread / stop risk above x = execution cost too high
+    pe_target_exit: bool = True       # close the basket at the Target LIQ
+    pe_invalidation_exit: bool = True # close at once when price takes out the invalidation level (before the wider broker stop)
     max_lot_per_order: float = 50.0
     max_positions_total: int = 128
     max_positions_per_symbol: int = 64   # t40u: batch 16 + 4 recovery layers x 4 + a hedge basket and its layers
     min_orders_per_batch: int = 1     # t35u: 1 (a 2-lot minimum skipped small accounts entirely); never a single order (unless the stop-risk cap cannot fit two min lots)
     # pyramid ADD into a basket that already has its break-even stop: shallow pullback, then price resumes in the
     # trade direction with the signal still valid; same lot (no multiplier), total legs <= max_orders_per_batch
-    add_enabled: bool = True
+    add_enabled: bool = False         # t45u: no adding just because price pulled back
     add_pullback_atr: float = 0.12    # pullback from the basket's best price >= x * M1 ATR before an add
     add_max_per_step: int = 3
     max_total_lots: float = 400.0
@@ -343,6 +370,8 @@ class EngineConfig:
                     setattr(cfg, k, v)
                 else:
                     setattr(cfg, k, type(cur)(v))
+        if cfg.precision_enabled:
+            cfg.no_stop_mode = False       # t45u: the precision entry is defined by its structural stop - never no-SL
         cfg.hedge_enabled = False          # t44u (owner): the hedge / averaging recovery is cancelled - never re-enabled
         cfg.avg_enabled = False            # from a config file, RB_CONFIG_JSON or the runtime tune endpoint
         return cfg

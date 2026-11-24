@@ -19,7 +19,7 @@ def _decide(buy, sell, fam_b, fam_s, veto_b=(), veto_s=()):
     mb.side_strength = fake
     try:
         return decide(Micro(ready=True, stable=True, regime="fast", spread=0.1, atr=1.0, vu=0.1, target=0.3),
-                      EngineConfig())
+                      EngineConfig(precision_enabled=False, add_enabled=True))
     finally:
         mb.side_strength = real
 

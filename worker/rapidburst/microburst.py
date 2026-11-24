@@ -123,6 +123,7 @@ class Micro:
     ind_w: Optional[dict] = None    # learned indicator weights for this symbol
     zones: Optional[object] = None  # zones.ZoneView (t37u: DM/SP zones, FVG, confirmation candle, wick tip)
     trend: Optional[object] = None  # regime.RegimeView (t40u: UP / DOWN / SIDEWAYS + phase)
+    prec: Optional[object] = None   # precision.PrecisionView (t45u: M5 structure, OB, liquidity, displacement)
 
     def brief(self) -> dict:
         r = lambda x, n=3: round(x, n)   # noqa: E731
@@ -576,6 +577,8 @@ class Strength:
     scan: dict = field(default_factory=dict)        # {"BUY": {"A":..,"B":..,"C":..}, "SELL": {...}}
     support: dict = field(default_factory=dict)
     vetoes: list = field(default_factory=list)
+    pe: dict = field(default_factory=dict)         # t45u: Position Entry Score per side (separate from buy/sell momentum)
+    plans: dict = field(default_factory=dict)      # t45u: precision.Plan per side (structural stop, Target LIQ, R:R)
 
     @property
     def score(self) -> float:
@@ -748,6 +751,11 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         vetoes.append("price moving against this side right now")
     elif c["velocity"] < cfg.mb_min_velocity and max(dd or 0.0, e or 0.0) < cfg.mb_scan_support:
         vetoes.append("no live force in that direction now (ticks, M1 and M5 momentum all weak)")
+    if getattr(cfg, "precision_enabled", False) and m.prec is not None and getattr(m.prec, "ready", False):
+        # t45u: chase / counter-structure are judged against the pullback zone and the M5 break (precision.py), not
+        # against the last micro swing - a pullback entry is by definition far from that swing
+        vetoes = [v for v in vetoes if not (v.startswith("anti-chase: already") or v.startswith("already spiked")
+                                            or v.startswith("against the M5 structure"))]
     fam = (round(a, 3), round(b, 3), round(cs, 3), None if dd is None else round(dd, 3),
            None if e is None else round(e, 3), None if f is None else round(f, 3))
     return _clip(s), c, fam, vetoes
@@ -762,6 +770,15 @@ def decide(m: Micro, cfg) -> Strength:
         st.reason = m.reason
         return st
     st.threshold = threshold(m, cfg)
+    prec_on = bool(getattr(cfg, "precision_enabled", False))
+    if prec_on:
+        from . import precision
+        if m.prec is not None:
+            st.plans = {"BUY": precision.evaluate(m.prec, m, 1, cfg), "SELL": precision.evaluate(m.prec, m, -1, cfg)}
+        else:
+            st.plans = {"BUY": precision.Plan("BUY", vetoes=["no M5 structure data"]),
+                        "SELL": precision.Plan("SELL", vetoes=["no M5 structure data"])}
+        st.pe = {k: round(v.score, 3) for k, v in st.plans.items()}
     b, cb, sb, vb = side_strength(m, 1, cfg)
     s, cs, ss, vs = side_strength(m, -1, cfg)
     st.buy, st.sell = round(b, 3), round(s, 3)
@@ -780,8 +797,9 @@ def decide(m: Micro, cfg) -> Strength:
         side = "BUY" if d > 0 else "SELL"
         if vet:
             return None, f"{side} {best:.2f}: " + "; ".join(vet)
-        if best < st.threshold:
-            return None, f"no edge: {side} {best:.2f} < threshold {st.threshold:.2f} ({m.regime})"
+        thr_d = st.threshold - (float(getattr(cfg, "pe_dir_relax", 0.0)) if prec_on else 0.0)
+        if best < thr_d:
+            return None, f"no edge: {side} {best:.2f} < threshold {thr_d:.2f} ({m.regime})"
         if best - other < cfg.mb_edge:
             return None, f"two-sided: BUY {b:.2f} vs SELL {s:.2f}"
         avail = [f for f, x in zip(FAMILIES, sc) if x is not None]
@@ -794,9 +812,22 @@ def decide(m: Micro, cfg) -> Strength:
             return None, (f"{side} {best:.2f} but only {len(agree)}/{len(avail)} families agree "
                           f"({''.join(agree) or '-'}), need {need} incl. the trigger ({'/'.join(trig_fams)}) - no "
                           f"single-indicator, speed-only or volume-only entries")
+        if prec_on:
+            # t45u: right direction is not enough - the LOCATION must pass (structure, confluence, trigger, stop, R:R)
+            pl = st.plans[side]
+            if pl.vetoes or not pl.ready:
+                return None, (f"{side} direction {best:.2f} ok but location rejected (position score {pl.score:.2f}): "
+                              + "; ".join(pl.vetoes[:2]))
+            if pl.score < float(getattr(cfg, "pe_min", 0.58)):
+                return None, f"{side} direction {best:.2f} ok but position score {pl.score:.2f} < {getattr(cfg, 'pe_min', 0.58):.2f}"
         tag = " early-burst" if m.early == d else ""
         fams = " ".join(f"{f}{x:.2f}" for f, x in zip(FAMILIES, sc) if x is not None)
-        return best, f"{side} {best:.2f} >= {st.threshold:.2f} [{m.regime}{tag}] agree {''.join(agree)} | {fams}"
+        pe_txt = ""
+        if prec_on:
+            pl = st.plans[side]
+            pe_txt = (f" | PE {pl.score:.2f} {pl.kind} pullback {pl.depth:.2f} [{'+'.join(pl.tags)}] R:R {pl.rr:.1f} "
+                      f"-> {pl.target_kind} {pl.target:.5g}")
+        return best, f"{side} {best:.2f} >= {st.threshold:.2f} [{m.regime}{tag}] agree {''.join(agree)} | {fams}{pe_txt}"
     first = 1 if b >= s else -1
     res = {d: check(d) for d in (first, -first)}
     ok = [d for d in (first, -first) if res[d][0] is not None]

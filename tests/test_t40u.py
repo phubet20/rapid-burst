@@ -23,7 +23,7 @@ def _zig(points, step=4):
 
 
 def test_stop_loss_is_locked_off():
-    c = EngineConfig()
+    c = EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True)
     assert c.no_stop_mode and "no_stop_mode" not in TUNABLE and "broker_sl" not in TUNABLE
     assert all(k != "broker_sl" for _, k in RISK_ENV)
 
@@ -41,7 +41,7 @@ def test_regime_up_down_sideways_and_phase():
 
 
 def _session(tmp_path, **kw):
-    cfg = EngineConfig(add_enabled=False, **kw)
+    cfg = EngineConfig(precision_enabled=False, no_stop_mode=True, add_enabled=False, **kw)
     tr, br = make(tmp_path, {"BTCUSDm": series_up()}, cfg)
     br.hedging = True
     _small_account(br, balance=1000.0, margin_per_lot=100.0)

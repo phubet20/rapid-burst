@@ -45,7 +45,7 @@ def test_incremental_windows_match_brute_force():
 
 
 def test_scanner_cost_per_tick_does_not_grow_with_history():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
 
     def per_tick(n):
         sc = TickScanner(cfg)
@@ -71,7 +71,7 @@ def test_ticker_all_ticks_since_returns_only_new_ticks_without_copying():
 
 
 def _decide_with(a, b, c, d=None, e=None):
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     real = mb.side_strength
 
     def fake(m, side, cfg_):

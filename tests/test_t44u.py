@@ -13,7 +13,7 @@ from tests.test_t40u import _session
 
 # ---- config: the recovery is off and cannot be switched back on -------------------------------------------------
 def test_hedge_and_averaging_are_off_by_default_and_locked():
-    c = EngineConfig()
+    c = EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True)
     assert c.hedge_enabled is False and c.avg_enabled is False
     for k in ("hedge_enabled", "avg_enabled", "avg_max_layers", "avg_spacing_atr", "avg_lot_mult",
               "recovery_after_s", "recovery_loss_pct"):
@@ -30,7 +30,7 @@ def test_load_forces_recovery_off_even_if_a_config_says_on(monkeypatch):
 
 
 def test_profit_targets_are_longer_than_t43u():
-    c = EngineConfig()
+    c = EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True)
     assert c.tp_target_atr == 0.6 and c.tp_grab_x == 2.0 and c.tp_target_giveback == 0.25
     assert c.tp_target_atr * c.tp_grab_x == 1.2                       # immediate grab at 1.2 ATR (was 0.6)
 
@@ -146,14 +146,14 @@ def _zones(wick=0, holds=False):
 def test_sell_against_an_intact_uptrend_is_vetoed_without_a_wick_or_zone(monkeypatch):
     _patched_components(monkeypatch)
     up = regime.RegimeView(ready=True, state="UP", phase=2, leg="pullback", origin=95.0, atr=1.0)
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True)
     s, c, fam, vetoes = mb.side_strength(_fake_micro(up, _zones()), -1, cfg)
     assert any("against the M5 structure" in v for v in vetoes)
     s, c, fam, vetoes = mb.side_strength(_fake_micro(up, _zones(wick=-1)), -1, cfg)      # a wick tip backs the SELL
     assert not any("against the M5 structure" in v for v in vetoes)
     s, c, fam, vetoes = mb.side_strength(_fake_micro(up, _zones(holds=True)), -1, cfg)   # a supply zone backs it
     assert not any("against the M5 structure" in v for v in vetoes)
-    off = EngineConfig(regime_counter_veto=False)
+    off = EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True, regime_counter_veto=False)
     s, c, fam, vetoes = mb.side_strength(_fake_micro(up, _zones()), -1, off)
     assert not any("against the M5 structure" in v for v in vetoes)
 
@@ -161,7 +161,7 @@ def test_sell_against_an_intact_uptrend_is_vetoed_without_a_wick_or_zone(monkeyp
 def test_a_flipped_state_is_not_blocked_and_with_trend_entries_are_not_vetoed(monkeypatch):
     _patched_components(monkeypatch)
     side = regime.RegimeView(ready=True, state="SIDEWAYS", range_hi=110.0, range_lo=90.0, atr=1.0)
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True)
     _, _, _, vetoes = mb.side_strength(_fake_micro(side, _zones()), -1, cfg)             # structure already broken
     assert not any("against the M5 structure" in v for v in vetoes)
     dn = regime.RegimeView(ready=True, state="DOWN", phase=2, leg="pullback", origin=105.0, atr=1.0)
@@ -173,6 +173,6 @@ def test_the_middle_of_a_sideways_range_costs_the_configured_penalty(monkeypatch
     _patched_components(monkeypatch)
     side = regime.RegimeView(ready=True, state="SIDEWAYS", range_hi=110.0, range_lo=90.0, atr=1.0)
     m = _fake_micro(side, _zones(), mid=100.0)                                             # pos 0.5 = the middle
-    s_none = mb.side_strength(m, -1, EngineConfig(regime_mid_penalty=0.0))[0]
-    s_new = mb.side_strength(m, -1, EngineConfig())[0]
+    s_none = mb.side_strength(m, -1, EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True, regime_mid_penalty=0.0))[0]
+    s_new = mb.side_strength(m, -1, EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True))[0]
     assert abs((s_none - s_new) - 0.10) < 1e-9

@@ -97,7 +97,7 @@ def _view(bias, supported=True, slope=0.1, accel=0.05, vol=1.5, exhaust=0):
 
 
 def test_m1_main_trend_filters_and_counter_trend_needs_a_structure_break():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     with_trend = decide(_live(mtf=_view(0.7)), cfg)
     amb = decide(_live(mtf=_view(-0.3, supported=False)), cfg)
     against = decide(_live(mtf=_view(-0.8, supported=True)), cfg)
@@ -111,7 +111,7 @@ def test_m1_main_trend_filters_and_counter_trend_needs_a_structure_break():
 
 
 def test_exit_needs_combined_exhaustion_in_profit_not_one_signal():
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     g = {"target": 0.3, "peak_pl": 0.12, "peak_vel": 0.5, "last_ext_t": 100.0}
     # MACD histogram turn + volume weakening only (2 signals): momentum hold, no close on that alone
     two = _live(vel=0.1, vel_prev=0.4, accel=-0.3, mtf=_view(0.5, slope=-0.1, accel=-0.05, vol=0.6))

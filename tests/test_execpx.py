@@ -17,7 +17,7 @@ def _open_position(tr, br):
 
 
 def test_exec_quote_uses_rest_when_ws_deviates_or_is_stale(tmp_path):
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     cfg.learning_enabled = False
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=1.0)
@@ -50,7 +50,7 @@ def test_exec_quote_uses_rest_when_ws_deviates_or_is_stale(tmp_path):
 
 
 def test_modify_results_closed_soft_and_refused_are_handled(tmp_path):
-    cfg = EngineConfig()
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
     cfg.learning_enabled = False
     tr, br = make(tmp_path, {"BTCUSDm": trend_then_pullback()}, cfg)
     _small_account(br, balance=100_000.0, margin_per_lot=1.0)

@@ -12,13 +12,13 @@ def _bar(t, o, h, l, c):
 
 
 def test_owner_defaults():
-    c = EngineConfig()
+    c = EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True)
     assert c.no_stop_mode and c.full_batch and c.max_orders_per_batch == 16 and not c.learning_enabled
     assert c.emergency_margin_level_pct == 110.0 and c.nostop_margin_use_pct == 75.0
 
 
 def test_full_batch_at_once_by_margin_without_sl(tmp_path):
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig())
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True))
     _small_account(br, balance=1000.0, margin_per_lot=100.0)
     _start(tr, br, T0 + 1)
     _force_signal(tr, "BUY", origin=T0 + 99.0)
@@ -34,7 +34,7 @@ def test_full_batch_at_once_by_margin_without_sl(tmp_path):
 
 
 def test_only_emergency_guards_close_in_no_stop_mode(tmp_path):
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig())
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True))
     _small_account(br, balance=1000.0, margin_per_lot=100.0)
     _start(tr, br, T0 + 1)
     _force_signal(tr, "BUY", origin=T0 + 99.0)
@@ -66,7 +66,7 @@ def test_zones_fvg_confirmation_and_wick_tip():
 
 
 def test_learner_is_record_only_by_default(tmp_path):
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig())
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig(precision_enabled=False, add_enabled=True, no_stop_mode=True))
     _small_account(br, balance=1000.0, margin_per_lot=100.0)
     tr.learner.decide = lambda *a, **k: (_ for _ in ()).throw(AssertionError("learner consulted"))
     _start(tr, br, T0 + 1)

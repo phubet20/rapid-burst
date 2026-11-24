@@ -129,7 +129,7 @@ def test_mtf_m5_forming_bar_without_close_wait():
 
 
 def test_t35u_entry_defaults_are_minimal_but_risk_guards_stay():
-    c = EngineConfig()
+    c = EngineConfig(precision_enabled=False, add_enabled=True)
     assert c.mb_threshold == 0.40 and c.mb_edge == 0.06 and c.min_orders_per_batch == 1     # t44u: edge 0.03 -> 0.06
     assert c.warmup_seconds <= 1.0 and c.reverse_enabled
-    assert c.small_account_batch_risk_pct > 0 and c.max_orders_per_batch == 16 and c.no_stop_mode
+    assert c.small_account_batch_risk_pct > 0 and c.max_orders_per_batch == 16 and not c.no_stop_mode
