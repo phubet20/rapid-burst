@@ -59,6 +59,7 @@ TUNABLE = {
     "precision_enabled": (0, 1), "pe_min": (0.3, 0.9), "pe_dir_relax": (0.0, 0.3), "pe_rr_min": (1.0, 4.0), "pe_min_depth": (0.1, 0.5), "pe_zone_chase_atr": (0.1, 1.0),
     "pe_max_sl_atr": (0.5, 3.0), "pe_min_confluence": (2, 4), "pe_range_prem_max": (0.6, 1.0), "pe_breakout_enabled": (0, 1), "pe_bo_cont_ext_atr": (0.2, 2.0), "pe_bo_max_bars": (2, 20), "pe_max_cost_frac": (0.05, 0.6), "pe_tgt_min_atr": (0.3, 3.0), "pe_disp_atr": (0.8, 3.0),
     "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 8),
+    "m1_only": (0, 1), "hold_winners": (0, 1), "hold_flip_bias": (0.1, 0.8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
     "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 200), "max_positions_per_symbol": (1, 100),
     "max_lot_per_order": (0.01, 100.0), "max_batch_lots": (0.01, 500.0), "max_total_lots": (0.01, 1000.0),
@@ -268,6 +269,16 @@ class EngineConfig:
     # displacement), OB, liquidity targets, fibo as ONE confluence factor, trigger on the live M1, structural stop,
     # reward-to-risk to the Target LIQ. The Position Entry Score is separate from the directional momentum score.
     precision_enabled: bool = True
+    # t46u (owner): FAST M1 TREND MODE - entries are scored on M1 only (EMA / MACD / RSI / tick force; the M5 family and the
+    # M5 structure / regime vetoes and the M5 precision plan are not used), trade WITH the M1 trend, add on shallow pullbacks
+    # that resume, re-enter at once after a close. While on, precision_enabled is forced off and every order keeps its broker SL.
+    m1_only: bool = True
+    # t46u (owner): HOLD WINNERS - a basket in net profit is not closed by the discretionary exits (momentum exhausted, spike,
+    # profit protection, zone target, auto-reversal) unless the M1 trend has really turned against it; while the whole bot
+    # portfolio is still negative a winner whose stop is already at break-even / trailing is held to that stop. Hard risk exits,
+    # the break-even / trailing stop and the broker SL are untouched.
+    hold_winners: bool = True
+    hold_flip_bias: float = 0.25      # M1 trend bias against the basket (with RSI on the other side of 50) = the trend turned
     pe_min: float = 0.58              # Position Entry Score needed (0..1)
     pe_dir_relax: float = 0.10        # the directional threshold is lowered by x here (the pullback trigger is the timing)
     pe_pivot_k: int = 2
@@ -388,6 +399,11 @@ class EngineConfig:
                     setattr(cfg, k, v)
                 else:
                     setattr(cfg, k, type(cur)(v))
+        if cfg.m1_only:
+            cfg.precision_enabled = False  # t46u: the M1 fast mode replaces the M5 precision entry
+            cfg.no_stop_mode = False       # every order keeps its broker SL
+            if "add_enabled" not in data:
+                cfg.add_enabled = True     # follow the trend: add on a pullback that resumes (same lot, only into a protected winner)
         if cfg.precision_enabled:
             cfg.no_stop_mode = False       # t45u: the precision entry is defined by its structural stop - never no-SL
         cfg.hedge_enabled = False          # t44u (owner): the hedge / averaging recovery is cancelled - never re-enabled

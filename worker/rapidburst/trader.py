@@ -243,6 +243,9 @@ class Trader:
                 setattr(self.cfg, k, v)
                 self.tune[k] = v
                 changed[k] = {"old": old, "new": v}
+            if self.cfg.m1_only:                       # t46u: the M1 fast mode owns these (never no-SL, no M5 precision plan)
+                self.cfg.precision_enabled = False
+                self.cfg.no_stop_mode = False
             if changed:
                 self.add_log("WARNING", "TUNE (runtime, no redeploy): " + ", ".join(
                     f"{k} {c['old']} -> {c['new']}" for k, c in changed.items()))
@@ -1662,6 +1665,8 @@ class Trader:
                         soft = self._reversal_check(legs, m, st)
                     if soft and not lq and self._pullback_hold(legs, soft, m, now_wall, key):
                         soft = None                                                 # t37u: pullback into own zone
+                    if soft and not lq and self._hold_winner(key, legs, live, m, soft, now_wall):
+                        soft = None                                                 # t46u: keep the winner
                     reason = self._confirm_soft_exit(key, sym, soft, m, now_wall)   # t36u: anti-jitter
             else:
                 self._exit_pending.pop(key, None)
@@ -1729,6 +1734,41 @@ class Trader:
             return (f"STRUCTURE INVALIDATED: price {px:.5g} took out {pl['inval']:.5g} ({pl['kind']} setup "
                     f"[{'+'.join(pl['tags'])}]) - the setup failed, leaving now instead of waiting for the stop")
         return None
+
+    def _hold_winner(self, key: str, legs: list, live: dict, m, soft: str, now_wall: float) -> bool:
+        """t46u HOLD WINNERS: a discretionary exit must not bank a small profit while the trend is still with the basket
+        (and, with the whole bot portfolio still negative, not at all once the basket's stop is at break-even / trailing:
+        that stop already protects the profit). True = do not close now. Hard risk exits, the BE / trailing stop and the
+        broker SL never pass through here. Never applies to a basket that is not in net profit."""
+        cfg = self.cfg
+        if not cfg.hold_winners:
+            return False
+        money = self._net(legs, live)
+        if money <= 0:
+            return False
+        d = 1 if legs[0].side == "BUY" else -1
+        g = self.bursts.get(key) or {}
+        v = getattr(m, "mtf", None)
+        v1 = v.m1 if (v is not None and v.m1.ready) else None
+        flipped = False
+        if v1 is not None:
+            flipped = (d * v.bias <= -cfg.hold_flip_bias and (not v1.rsi_ready or d * (v1.rsi - 50.0) < 0)) \
+                or v1.sbreak == -d
+        portfolio = sum(float(p.get("profit", 0.0)) + float(p.get("swap", 0.0)) for p in self.own_positions)
+        protected = bool(g.get("prot"))
+        if portfolio < 0 and protected:
+            hold, why = True, f"portfolio {portfolio:+.2f} still negative, stop already {g.get('prot')} (profit protected)"
+        elif not flipped:
+            hold, why = True, "M1 trend still with the basket"
+        else:
+            hold, why = False, ""
+        if hold and now_wall - self._exit_held_log.get("hw" + key, 0.0) > 10.0:
+            self._exit_held_log["hw" + key] = now_wall
+            self.add_log("INFO", f"HOLD WINNER basket {key} {legs[0].symbol} {legs[0].side} {money:+.2f}: not closing on "
+                                 f"'{soft[:60]}' - {why}")
+        if hold:
+            self.exits_filtered += 1
+        return hold
 
     def _pullback_hold(self, legs: list, soft: str, m, now_wall: float, key: str) -> bool:
         """t37u: a mere pullback INTO a demand zone / bullish FVG (BUY basket; supply / bearish FVG for SELL) does not
@@ -2666,7 +2706,7 @@ class Trader:
                               f"< {c.emergency_margin_level_pct:g}% or data-feed loss)") if c.no_stop_mode
                              else ("ON" if c.broker_sl else "OFF"), "exec_halt": self.exec_halt,
                 "no_stop_mode": c.no_stop_mode, "nostop_margin_use_pct": c.nostop_margin_use_pct,
-                "precision_enabled": c.precision_enabled, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
+                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
                 "batch_margin_pct": c.batch_margin_pct, "avg_max_layers": c.avg_max_layers, "avg_lot_mult": c.avg_lot_mult,
                 "avg_spacing_atr": c.avg_spacing_atr, "hedge_enabled": c.hedge_enabled, "recovery_after_s": c.recovery_after_s,
                 "recovery_loss_pct": c.recovery_loss_pct, "cycle_tp_pct": c.cycle_tp_pct, "recoveries": dict(self.recoveries),

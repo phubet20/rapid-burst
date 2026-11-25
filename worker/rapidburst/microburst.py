@@ -590,14 +590,14 @@ W_M1, W_TREND, W_IND = 1.0, 0.8, 1.2   # D = M1 timing, E = M1 main trend, F = i
 FAMILIES = ("A", "B", "C", "D", "E", "F")
 
 
-def _mtf_scores(m: Micro, d: int) -> tuple:
+def _mtf_scores(m: Micro, d: int, cfg=None) -> tuple:
     """(D, E, M1 trend bias signed for this side) or None for a family whose timeframe has no data yet."""
     v = m.mtf
     if v is None:
         return None, None, 0.0
     dd = v.timing(d) if v.m1.ready else None
     # t34u: E = M5 MAIN MOMENTUM on the forming M5 bar (no close wait); before M5 bars exist, the M1 trend
-    if v.m5.ready:
+    if v.m5.ready and not (cfg is not None and getattr(cfg, "m1_only", False)):
         e = v.m5_momentum(d)
         return dd, e, d * v.m5_bias
     e = _clip(d * v.bias / 0.6) if v.m1.ready else None
@@ -650,7 +650,7 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
     volume, continuation), E M5 direction bias. Families without data (no bars yet) drop out of the mean."""
     c = _components(m, d, cfg)
     a, b, cs = _scanners(c)
-    dd, e, bias = _mtf_scores(m, d)
+    dd, e, bias = _mtf_scores(m, d, cfg)
     wa, wb, wc = SCAN_W.get(m.regime, SCAN_W["normal"])
     num, den = wa * a + wb * b + wc * cs, wa + wb + wc
     if dd is not None:
@@ -673,7 +673,8 @@ def side_strength(m: Micro, d: int, cfg) -> tuple[float, dict, tuple, list]:
         c["zones"] = z
     vetoes = []
     rv = m.trend
-    if rv is not None and getattr(rv, "ready", False) and getattr(cfg, "regime_enabled", True):
+    if (rv is not None and getattr(rv, "ready", False) and getattr(cfg, "regime_enabled", True)
+            and not getattr(cfg, "m1_only", False)):
         zv2 = m.zones if (m.zones is not None and getattr(m.zones, "ready", False)) else None
         wick = zv2 is not None and zv2.wick == d
         in_zone = zv2 is not None and zv2.holds(d)

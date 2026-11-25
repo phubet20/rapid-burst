@@ -504,6 +504,21 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   `regime_mid_penalty` 0.06 -> 0.10 (middle of a sideways range); `mb_edge` 0.03 -> 0.06 (a near-tie BUY/SELL is
   noise). These are reasoned changes, NOT back-tested on real data.
 
+## t46u — M1 fast trend mode + hold winners (owner request)
+
+* `m1_only` (default ON): entries are scored on **M1 only** - EMA trend, MACD, RSI and tick force. The M5 momentum family, the
+  M5 structure / regime vetoes and the M5 precision plan are not used, so the bot no longer waits for M5. While it is on,
+  `precision_enabled` and `no_stop_mode` are forced off (every order keeps its broker SL) and `add_enabled` defaults to ON:
+  a pyramid add (same lot, no multiplier, only into a winner whose stop is already at break-even / trailing) on a shallow
+  pullback that resumes with the trend. Set `{"m1_only": false}` in `RB_CONFIG_JSON` (or tune `m1_only` = 0) to go back to
+  the t45u precision entry.
+* `hold_winners` (default ON): a basket in net profit is **not** closed by the discretionary exits (momentum exhausted,
+  spike, profit protection, zone target, auto-reversal) unless the M1 trend has turned (EMA bias <= -`hold_flip_bias` with RSI
+  on the other side of 50, or the M1 swing is broken). While the whole bot portfolio is still negative, a winner whose stop is
+  already at break-even / trailing is held to that stop. Hard risk exits, the break-even / trailing stop, the broker SL and the
+  margin / data-feed emergencies are untouched. A winner that has no protective stop yet and whose trend turned may still leave.
+* No martingale, no averaging down, no hedge, no recovery lots.
+
 ## t45u — Structure-to-Liquidity precision entry (owner spec)
 
 Entry logic of the existing engine changed in place (`worker/rapidburst/precision.py`, wired into `microburst.decide` and the trader; no new engine, no new UI page).
