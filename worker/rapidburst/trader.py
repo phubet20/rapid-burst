@@ -152,6 +152,7 @@ class Trader:
         self.skip_last: dict[str, float] = {}
         self.decisions: deque = deque(maxlen=40)
         self.last_why_log = 0.0
+        self.last_loc: dict[str, str] = {}
 
         avail, why = broker.available()
         if not avail:
@@ -2462,9 +2463,32 @@ class Trader:
                 if eng is not None:
                     eng.seed_vu = 0.15 * self.atr_m1[s]
 
+    _LOC_LABELS = (("m5 structure is", "location: M5 structure against this side"),
+                   ("no displacement", "location: no M5 impulse yet"),
+                   ("impulse leg too small", "location: M5 impulse too small"),
+                   ("structure lost", "location: structure lost (pullback too deep)"),
+                   ("no confluence", "location: no confluence in the zone"),
+                   ("extreme of the m5 range", "location: premium/discount extreme"),
+                   ("not in the pullback zone", "location: waiting for the pullback zone"),
+                   ("waiting for the trigger", "location: in zone, waiting for the trigger"),
+                   ("beyond the invalidation", "location: past the invalidation level"),
+                   ("too wide", "location: structural stop too wide"),
+                   ("of the stop risk", "location: spread too high vs the stop"),
+                   ("at liquidity already", "location: no room to liquidity"),
+                   ("no liquidity target", "location: no target with enough R:R"),
+                   ("no m5 structure data", "location: no M5 structure data"))
+
     @staticmethod
     def _category(reason: str) -> str:
         r = (reason or "").lower()
+        if "location rejected" in r:                      # t46u: name the exact precision veto instead of a garbled label
+            tail = r.split("):", 1)[-1]
+            for k, v in Trader._LOC_LABELS:
+                if k in tail:
+                    return v
+            return "location: other"
+        if "position score" in r and "<" in r:
+            return "location: entry score below minimum"
         table = [("safe mode", "safe mode"), ("exhaustion", "exhaustion"), ("speed-only", "speed-only (B/C weak)"),
                  ("structure-only", "no tick force (scanner A)"), ("managing", "managing basket"),
                  ("duplicate", "duplicate burst"), ("warming", "warming up"), ("no ticks", "no live ticks"),
@@ -2490,6 +2514,8 @@ class Trader:
         if now_wall - self.skip_last.get((s, cat), 0.0) < 1.0:   # sample each reason at most 1/s per symbol
             return
         self.skip_last[(s, cat)] = now_wall
+        if cat.startswith("location"):
+            self.last_loc[s] = reason[:230]
         self.skip_counts.setdefault(s, Counter())[cat] += 1
         self.skip_window.setdefault(s, Counter())[cat] += 1
         if sig is not None and sig.action != "HOLD":
@@ -2509,7 +2535,8 @@ class Trader:
         parts = []
         for s, c in self.skip_window.items():
             if c:
-                parts.append(f"{s}: " + ", ".join(f"{k} {v}" for k, v in c.most_common(4)))
+                parts.append(f"{s}: " + ", ".join(f"{k} {v}" for k, v in c.most_common(5))
+                             + (f" || last location: {self.last_loc[s]}" if s in self.last_loc else ""))
         self.skip_window = {}
         if parts:
             self.add_log("INFO", "WHY NO TRADE (last 60s, samples/s) " + " | ".join(parts))
