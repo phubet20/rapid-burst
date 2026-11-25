@@ -59,7 +59,8 @@ TUNABLE = {
     "precision_enabled": (0, 1), "pe_min": (0.3, 0.9), "pe_dir_relax": (0.0, 0.3), "pe_rr_min": (1.0, 4.0), "pe_min_depth": (0.1, 0.5), "pe_zone_chase_atr": (0.1, 1.0),
     "pe_max_sl_atr": (0.5, 3.0), "pe_min_confluence": (2, 4), "pe_range_prem_max": (0.6, 1.0), "pe_breakout_enabled": (0, 1), "pe_bo_cont_ext_atr": (0.2, 2.0), "pe_bo_max_bars": (2, 20), "pe_max_cost_frac": (0.05, 0.6), "pe_tgt_min_atr": (0.3, 3.0), "pe_disp_atr": (0.8, 3.0),
     "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 8),
-    "m1_only": (0, 1), "m1_every_bar": (0, 1), "hold_winners": (0, 1), "hold_flip_bias": (0.1, 0.8),
+    "m1_only": (0, 1), "m1_every_bar": (0, 1), "hold_winners": (0, 1),
+    "ladder_enabled": (0, 1), "ladder_first_frac": (0.25, 1.0), "ladder_step_atr": (0.15, 1.5), "ladder_levels": (1, 4), "ladder_ttl_s": (30, 1800), "hold_flip_bias": (0.1, 0.8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
     "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 200), "max_positions_per_symbol": (1, 100),
     "max_lot_per_order": (0.01, 100.0), "max_batch_lots": (0.01, 500.0), "max_total_lots": (0.01, 1000.0),
@@ -283,6 +284,16 @@ class EngineConfig:
     # applies: clean feed, spread / data checks, broker SL on every order, the risk / lot / margin / exposure caps, no hedge
     # and no averaging down (a second basket is only stacked onto a symbol whose open baskets are all the same side and in profit).
     m1_every_bar: bool = True
+    # t46u (owner): PULLBACK LADDER - a new basket sends only `ladder_first_frac` of its orders at market; the rest wait for price
+    # to pull back `ladder_step_atr` x M1 ATR (x1, x2 ... `ladder_levels` steps) and are then sent at market, SAME lot, SAME structural
+    # stop (so each later order risks LESS than the first), total orders / lots / risk = the one batch budget (no martingale, no
+    # lot growth). Dropped when the M1 trend turns against the basket, the stop is too close, the basket reaches break-even / trail,
+    # or after `ladder_ttl_s`. Needs a broker SL; never used in no-stop mode.
+    ladder_enabled: bool = True
+    ladder_first_frac: float = 0.5
+    ladder_step_atr: float = 0.35
+    ladder_levels: int = 2
+    ladder_ttl_s: float = 240.0
     hold_flip_bias: float = 0.25      # M1 trend bias against the basket (with RSI on the other side of 50) = the trend turned
     pe_min: float = 0.58              # Position Entry Score needed (0..1)
     pe_dir_relax: float = 0.10        # the directional threshold is lowered by x here (the pullback trigger is the timing)

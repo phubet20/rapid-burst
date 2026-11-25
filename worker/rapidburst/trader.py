@@ -1040,6 +1040,8 @@ class Trader:
                 bar_side = st.bar_side                      # t46u: a new M1 bar without an entry yet
             if mine:
                 g = self.bursts.get(mine[0].batch_id) or {}
+                if self._ladder_step(s, mine, g, m, st, info, status, now_wall, t_dec):
+                    continue
                 why_not = self._add_check(s, mine, g, m, st, now_wall)
                 status["reason"] = (f"managing {mine[0].side} basket {mine[0].batch_id} ({len(mine)} order(s), "
                                     f"net {g.get('net_px', 0.0):+.5g}, protection {g.get('prot') or 'hard stop'}, "
@@ -1118,6 +1120,88 @@ class Trader:
                     g = self.bursts.get(self.last_burst.get(s, {}).get("gid", ""), {})
                     g["reversal"] = True
                     self.reversals += 1
+
+    def _ladder_step(self, s: str, legs: list, g: dict, m, st, info: dict, status: dict, now_wall: float,
+                     t_dec: float) -> bool:
+        """t46u PULLBACK LADDER: send the next tranche of the basket's reserved orders when price has pulled back the next
+        step (same lot, the basket's own structural stop - never widened, so each later order risks less). Dropped when the M1
+        trend turned against the basket, the stop is too close, protection already moved the stop (basket is in profit), the
+        ladder expired, or the order caps say no. True = orders were sent."""
+        lad = g.get("ladder")
+        if not lad or lad.get("left", 0) <= 0 or not getattr(m, "ready", False):
+            return False
+        cfg = self.cfg
+        side = legs[0].side
+        d = 1 if side == "BUY" else -1
+
+        def drop(why: str) -> bool:
+            g.pop("ladder", None)
+            self.add_log("INFO", f"LADDER basket {legs[0].batch_id} {side} {s} dropped ({lad.get('left', 0)} order(s) not sent): {why}")
+            return False
+        if lad.get("side") != side or not cfg.ladder_enabled:
+            return drop("side / setting changed")
+        if now_wall > lad["exp"]:
+            return drop(f"expired after {cfg.ladder_ttl_s:g}s without the pullback")
+        if g.get("prot"):
+            return drop(f"basket already protected ({g['prot']}) - no more orders into it")
+        v = m.mtf
+        if v is not None and v.m1.ready and d * v.bias <= -cfg.hold_flip_bias:
+            return drop(f"M1 trend turned against the basket (bias {v.bias:+.2f})")
+        ref_px = m.ask if side == "BUY" else m.bid
+        trigger = lad["ref"] - d * lad["step"] * (lad["done"] + 1)
+        if (ref_px - trigger) * d > 0:
+            return False                                      # not pulled back far enough yet
+        point = float(info["point"])
+        stops = (int(info.get("trade_stops_level", 0)) + 5) * point
+        sl = float(lad["sl"])
+        if (ref_px - sl) * d < stops + 1.5 * m.spread:
+            return drop("price is too close to the stop")
+        if self.exec_halt or not self.pacer.can_enter(s, now_wall)[0]:
+            return False
+        left_levels = max(1, lad["levels"] - lad["done"])
+        n = max(1, -(-lad["left"] // left_levels))             # ceil: spread the rest over the remaining steps
+        lot = float(lad["lot"])
+        ts, tv = self._tv(s)
+        sl_dist = abs(ref_px - sl)
+        risk = sl_dist / ts * tv * lot if ts and tv else 0.0
+        size = SizeResult(lot, risk, "pullback ladder (same lot, shared stop)")
+        gid = legs[0].batch_id
+        plans: list = []
+        for i in range(n):
+            ok, why, margin = self._check_order(s, side, len(legs) + i, size, m, False, plans, add=True, ladder=True)
+            if not ok:
+                if not plans:
+                    status["reason"] = f"ladder blocked: {why}"
+                    return False
+                break
+            plans.append((i, margin))
+        dev = self._deviation(s, m.spread, m.vu)
+        opened = 0
+        self.pacer.inflight.add(s)
+        try:
+            for i, _ in plans:
+                r, t_send, t_fill = self._send_raw(s, side, lot, sl, dev, f"{cfg.comment_prefix}-{gid}-l{len(legs) + i + 1}")
+                if self._book_fill(s, side, len(legs) + i, len(legs) + len(plans), gid, size, sl, sl_dist, m, st, info,
+                                   now_wall, t_dec, r, t_send, t_fill, False):
+                    opened += 1
+                else:
+                    break
+        finally:
+            self.pacer.inflight.discard(s)
+        self.pacer.on_entry(s, now_wall)
+        lad["done"] += 1                                       # the step is consumed even if the caps trimmed it
+        lad["left"] = max(0, lad["left"] - opened) if opened else lad["left"]
+        if lad["done"] >= lad["levels"]:
+            lad["left"] = 0
+        if opened:
+            g["peak_pl"] = 0.0                                 # the average price moved - restart the peak on the new basket
+            self.add_log("INFO", f"LADDER fill basket {gid} {side} {s}: +{opened} order(s) x {lot:g} at {ref_px:.5g} "
+                                 f"(step {lad['done']}/{lad['levels']}, stop {sl:.5g} unchanged, {lad['left']} left) "
+                                 f"- {len(legs) + opened} order(s) now")
+            self._decision(s, side, st.score, f"LADDER {opened} to basket {gid}")
+            self._refresh_account()
+            self._save_state()
+        return opened > 0
 
     def _add_check(self, s: str, legs: list, g: dict, m, st, now_wall: float) -> Optional[str]:
         """Pyramid ADD (None = add now, else why not): only into a basket whose stop is already at break-even or
@@ -1403,6 +1487,17 @@ class Trader:
         n = len(plans)
         gid = uuid.uuid4().hex[:6]
         sl = (ref - d * sl_dist) if (cfg.broker_sl and not cfg.no_stop_mode) else 0.0   # t38u: no per-order SL
+        ladder = None
+        atr_l = (m.atr or self._atr(s)[0] or (sl_dist / max(cfg.sl_atr, 0.1))) if cfg.ladder_enabled else 0.0
+        if cfg.ladder_enabled and sl and n >= 2 and not floor and atr_l:
+            # t46u: only the first tranche goes now; the rest waits for a pullback (same lot, same structural stop)
+            step = cfg.ladder_step_atr * atr_l
+            levels = min(cfg.ladder_levels, int((0.8 * sl_dist) // step)) if step > 0 else 0
+            n_now = max(1, int(round(n * cfg.ladder_first_frac)))
+            if levels >= 1 and n_now < n:
+                ladder = {"side": side, "ref": ref, "step": step, "levels": levels, "done": 0, "left": n - n_now,
+                          "lot": size.volume, "sl": sl, "exp": now_wall + cfg.ladder_ttl_s, "total": n}
+                plans, n = plans[:n_now], n_now
         dev = self._deviation(s, m.spread, m.vu)
         opened, why_stop = 0, ""
         self.pacer.inflight.add(s)
@@ -1447,7 +1542,12 @@ class Trader:
                              "level": m.micro_hi if side == "BUY" else m.micro_lo}
             return False
         g = self.bursts[gid]
-        g["planned"], g["score_q"] = n, round(sq, 2)
+        g["planned"], g["score_q"] = (ladder["total"] if ladder else n), round(sq, 2)
+        if ladder:
+            g["ladder"] = ladder
+            self.add_log("INFO", f"LADDER basket {gid} {side} {s}: {opened} order(s) now, {ladder['left']} more at "
+                                 f"{ladder['levels']} pullback step(s) of {ladder['step']:.5g} below {ref:.5g} "
+                                 f"(same lot {ladder['lot']:g}, same stop {sl:.5g}, total <= batch budget)")
         self.last_burst[s] = {"side": side, "origin": st.origin, "tick_t": m.t, "gid": gid,
                              "level": m.micro_hi if side == "BUY" else m.micro_lo}
         if probe:
@@ -1515,7 +1615,7 @@ class Trader:
         self._save_state()
         return True
 
-    def _check_order(self, s, side, i, size, m, floor, plans, add: bool = False) -> tuple:
+    def _check_order(self, s, side, i, size, m, floor, plans, add: bool = False, ladder: bool = False) -> tuple:
         """Risk / exposure / margin check for order i of a batch, counting the batch's earlier orders."""
         cfg = self.cfg
         acct = self._acct()
@@ -1530,7 +1630,7 @@ class Trader:
                      for _ in plans]
         ok, why = self.risk.check_entry(s, side, open_pos, acct, size.volume, size.risk_money, margin, True,
                                         self._notional(s, size.volume, price), batch_leg=(i > 0 and not add)
-                                        or (add and bool(plans)), floor_mode=floor)
+                                        or (add and bool(plans)) or ladder, floor_mode=floor)   # t46u: a ladder leg is a planned leg of its batch
         if ok:
             cap = acct.equity * cfg.max_margin_use_pct / 100.0
             used = self._margin_used() + sum(mg for _, mg in plans)

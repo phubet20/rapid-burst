@@ -115,11 +115,11 @@ def test_decide_gives_an_m1_bar_side_even_when_nothing_passes_the_threshold():
 
 def _bar_play(tmp_path, side="BUY", profit=None, **cfgkw):
     from dataclasses import replace as rep
-    tr, br = make(tmp_path, {"BTCUSDm": series_up()},
-                  EngineConfig(precision_enabled=False, m1_only=True, add_enabled=False, hold_winners=False,
-                               zones_enabled=False, pullback_hold=False, zone_target_exit=False, regime_enabled=False,
-                               max_orders_per_batch=2, min_orders_per_batch=1, max_positions_per_symbol=8,
-                               max_entries_per_minute=100, **cfgkw))
+    base = dict(precision_enabled=False, m1_only=True, add_enabled=False, hold_winners=False, ladder_enabled=False,
+                zones_enabled=False, pullback_hold=False, zone_target_exit=False, regime_enabled=False,
+                max_orders_per_batch=2, min_orders_per_batch=1, max_positions_per_symbol=8, max_entries_per_minute=100)
+    base.update(cfgkw)
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig(**base))
     _start(tr, br, T0 + 1)
     orig = tr._micro
     tr._micro_exit = lambda *a, **k: None
@@ -167,3 +167,74 @@ def test_no_bar_entry_when_the_feature_is_off(tmp_path):
     tr, br = _bar_play(tmp_path, profit=3.0, m1_every_bar=False)
     run(tr, br, T0 + 1, T0 + 200)
     assert not _entries(tr)
+
+
+# ------------------------------------------------------------------ pullback ladder
+def _ladder_play(tmp_path, **kw):
+    cfg = dict(ladder_enabled=True, max_orders_per_batch=4, min_orders_per_batch=4, max_positions_per_symbol=8)
+    cfg.update(kw)
+    tr, br = _bar_play(tmp_path, **cfg)
+    real = tr._ladder_step
+    tr._ladder_step = lambda *a, **k: False                 # the random-walk price must not trigger the ladder by itself
+    run(tr, br, T0 + 1, T0 + 3)
+    tr._ladder_step = real
+    return tr, br
+
+
+def _step(tr, now, ask_shift=None, **over):
+    from dataclasses import replace as rep
+    m, st = tr._micro("BTCUSDm", now)
+    m = rep(m, ready=True)                                  # the sim feed ends after the opening run: judge the rule, not staleness
+    legs = [ps for ps in tr.pos_state.values() if ps.ticket in {int(p["ticket"]) for p in tr.own_positions}]
+    g = tr.bursts[legs[0].batch_id]
+    lad = g.get("ladder")
+    if ask_shift is not None and lad:
+        px = lad["ref"] - lad["step"] * ask_shift
+        m = rep(m, ask=px, bid=px - m.spread)
+    m = rep(m, **over) if over else m
+    return tr._ladder_step("BTCUSDm", legs, g, m, st, tr.sym_info["BTCUSDm"], {}, now, now), g, legs
+
+
+def test_ladder_sends_only_the_first_tranche_and_keeps_the_rest_for_the_pullback(tmp_path):
+    tr, br = _ladder_play(tmp_path)
+    assert len(br.positions_) == 2                         # 4 planned, half now
+    g = next(iter(tr.bursts.values()))
+    lad = g["ladder"]
+    assert lad["left"] == 2 and g["planned"] == 4 and lad["levels"] >= 1
+    assert {round(p["sl"], 6) for p in br.positions_.values()} == {round(lad["sl"], 6)}
+    assert any("LADDER basket" in l["msg"] for l in tr.logs)
+
+
+def test_ladder_fills_on_pullback_with_same_lot_and_same_stop_and_never_more_than_planned(tmp_path):
+    tr, br = _ladder_play(tmp_path)
+    lots = {p["volume"] for p in br.positions_.values()}
+    sl0 = {round(p["sl"], 6) for p in br.positions_.values()}
+    done, g, _ = _step(tr, T0 + 4, ask_shift=0.2)           # not pulled back a full step yet
+    assert done is False and len(br.positions_) == 2
+    lad = g["ladder"]
+    k = 0
+    while g.get("ladder") and g["ladder"]["left"] > 0 and k < 6:        # step down level by level until the reserve is used
+        k += 1
+        done, g, _ = _step(tr, T0 + 4 + k, ask_shift=lad["done"] + 1.05)
+        assert done is True
+    assert len(br.positions_) == 4                                      # exactly the planned batch
+    assert {p["volume"] for p in br.positions_.values()} == lots        # no lot growth
+    assert {round(p["sl"], 6) for p in br.positions_.values()} == sl0   # the stop never moved or widened
+    done, g, _ = _step(tr, T0 + 20, ask_shift=9.0)
+    assert done is False and len(br.positions_) == 4                    # total = the planned batch, never more
+
+
+def test_ladder_is_dropped_when_the_m1_trend_turns_against_the_basket(tmp_path):
+    from tests.test_mtf import _view
+    tr, br = _ladder_play(tmp_path)
+    done, g, _ = _step(tr, T0 + 4, ask_shift=1.05, mtf=_view(-0.6))
+    assert done is False and "ladder" not in g and len(br.positions_) == 2
+    assert any("dropped" in l["msg"] and "trend turned" in l["msg"] for l in tr.logs)
+
+
+def test_ladder_expires_and_off_means_the_whole_batch_goes_at_once(tmp_path):
+    tr, br = _ladder_play(tmp_path, ladder_ttl_s=5.0)
+    done, g, _ = _step(tr, T0 + 60, ask_shift=1.05)
+    assert done is False and "ladder" not in g and len(br.positions_) == 2
+    tr2, br2 = _ladder_play(tmp_path / "off", ladder_enabled=False)
+    assert len(br2.positions_) == 4

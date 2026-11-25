@@ -522,7 +522,14 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   Small baskets (weak score = minimum order count, 0.6x risk). A second basket is stacked only when every open basket on the
   symbol is the same side and the combined net is in profit (never averaging down, never a hedge). Still enforced: clean feed,
   spread / data checks, broker SL on every order, risk / lot / margin / exposure caps. Tune `m1_every_bar` = 0 to turn it off.
-* No martingale, no averaging down, no hedge, no recovery lots.
+* `ladder_enabled` (default ON): **pullback ladder** - a new basket sends only `ladder_first_frac` (50 %) of its orders at market;
+  the rest are sent at market when price pulls back `ladder_step_atr` x M1 ATR (x1 ... `ladder_levels` steps), **same lot, same
+  structural stop** (so every later order risks less than the first) - total orders, lots and risk are the one batch budget
+  (planned up front, never grown: no martingale, no lot multiplier). The ladder is dropped when the M1 trend turns against the
+  basket, price is too close to the stop, the basket's stop already reached break-even / trail, after `ladder_ttl_s` (240 s), or
+  when any cap (positions / lots / margin / total risk) says no. If price never pulls back, the reserve is simply not used.
+  Adding in the main direction stays: the pyramid add (protected winner, shallow pullback that resumes) and the every-bar stack.
+* No martingale, no lot growth, no hedge, no recovery lots.
 
 ## t45u — Structure-to-Liquidity precision entry (owner spec)
 
