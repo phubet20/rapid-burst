@@ -1,5 +1,5 @@
 # Render Blueprint - backend + iPhone UI. ENGINE_MODE=cloud runs the launcher+engine beside the backend
-# (MT5 via TickerAll, demo only); ENGINE_MODE=launcher relays to a Windows launcher. Free plan sleeps when unused.
+# (MT5 via TickerAll; demo on the free plan, real needs a paid plan); ENGINE_MODE=launcher relays to a Windows launcher. Free plan sleeps when unused.
 services:
   - type: web
     name: rapid-burst

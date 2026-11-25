@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from rapidburst.broker_mt5 import MT5Broker  # noqa: E402
-from rapidburst.config import EngineConfig  # noqa: E402
+from rapidburst.config import EngineConfig, allow_live_from_env  # noqa: E402
 from rapidburst.proclock import ProcessLock  # noqa: E402
 from rapidburst.trader import Trader  # noqa: E402
 
@@ -82,7 +82,7 @@ def main() -> None:
         fh.write(str(os.getpid()))
 
     trader = Trader(make_broker(), MemoryCredStore(), EngineConfig.load(), data_dir,
-                    allow_live=os.environ.get("RB_ALLOW_LIVE", "") == "I_UNDERSTAND_LIVE_RISK")
+                    allow_live=allow_live_from_env())
     th = threading.Thread(target=trader.run_forever, daemon=True, name="trader")
     th.start()
 

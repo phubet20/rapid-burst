@@ -19,19 +19,68 @@ def connect_and_start(trader, broker, t):
     return trader.cmd_start()
 
 
-def test_live_account_refused(tmp_path):
+def _enc(tr, creds):
+    pub = serialization.load_der_public_key(base64.b64decode(tr.store.public_key_spki_b64()))
+    ct = pub.encrypt(json.dumps(creds).encode(),
+                     padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+    return base64.b64encode(ct).decode()
+
+
+def test_real_account_allowed_by_default(tmp_path):
+    """t46u: no demo-only lock - a REAL (and CONTEST) account connects and starts without any extra setting."""
+    for mode in (2, 1, 0):
+        tr, br = make(tmp_path / f"m{mode}", {"XAUUSD": gen_ticks(1, T0, 300)}, trade_mode=mode)
+        assert tr.allow_live is True
+        assert connect_and_start(tr, br, T0 + 1)["ok"], mode
+
+
+def test_real_account_locked_only_by_server_flag(tmp_path):
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 900)}, trade_mode=2)
+    tr.allow_live = False            # server-side RB_ALLOW_LIVE=0
     r = connect_and_start(tr, br, T0 + 1)
     assert not r["ok"] and "Account type" in r["msg"]
     run(tr, br, T0 + 1, T0 + 900)
     assert br.sent_orders == 0
-    assert any(c["name"] == "Account type" and "LIVE trading is disabled" in c["detail"] for c in tr.validation["checks"])
+    assert any(c["name"] == "Account type" and "RB_ALLOW_LIVE=0" in c["detail"] for c in tr.validation["checks"])
 
 
-def test_live_needs_server_flag(tmp_path):
-    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 300)}, trade_mode=2)
-    tr.allow_live = True
+def test_allow_live_env_parsing():
+    from rapidburst.config import allow_live_from_env
+    assert allow_live_from_env({}) is True
+    assert allow_live_from_env({"RB_ALLOW_LIVE": "I_UNDERSTAND_LIVE_RISK"}) is True
+    assert allow_live_from_env({"RB_ALLOW_LIVE": "1"}) is True
+    for v in ("0", "false", "No", "off", "demo_only", " 0 "):
+        assert allow_live_from_env({"RB_ALLOW_LIVE": v}) is False, v
+
+
+def test_switch_account_resets_per_account_state(tmp_path):
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 300)})
+    br.advance(T0 + 1); tr.step(T0 + 1)
+    assert tr.saved_login == 12345678
+    tr.bursts["x"] = {"symbol": "XAUUSD"}
+    tr.saved_pos_meta = {"1": {"batch_id": "x"}}
+    tr._pe_used[("XAUUSD", "k")] = 1.0
+    r = tr.cmd_connect(_enc(tr, {"login": 87654321, "password": "pw", "server": "Sim-Real"}))
+    assert r["ok"], r
+    assert tr.saved_login == br.login == 87654321
+    assert tr.bursts == {} and tr.saved_pos_meta == {} and not tr._pe_used
+    assert tr._load_state()["login"] == 87654321
+
+
+def test_same_account_reconnect_keeps_state(tmp_path):
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 300)})
+    br.advance(T0 + 1); tr.step(T0 + 1)
+    tr.bursts["x"] = {"symbol": "XAUUSD"}
+    assert tr.cmd_connect(_enc(tr, {"login": 12345678, "password": "pw", "server": "Sim-Demo"}))["ok"]
+    assert "x" in tr.bursts
+
+
+def test_switch_account_refused_while_running(tmp_path):
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 300)})
     assert connect_and_start(tr, br, T0 + 1)["ok"]
+    r = tr.cmd_connect(_enc(tr, {"login": 87654321, "password": "pw", "server": "Sim-Real"}))
+    assert not r["ok"] and "STOP" in r["msg"]
+    assert br.login == 12345678 and tr.saved_login == 12345678
 
 
 def test_algo_trading_disabled_blocks_start(tmp_path):

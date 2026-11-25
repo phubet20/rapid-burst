@@ -11,7 +11,7 @@ Settings (environment or worker.env):
   RB_LINGER_SECONDS  keep the backend connection this long after the app was last open (300)
   RB_STANDBY_SECONDS shut an engine that was only CONNECTed (not STARTed) after this long (600)
   RB_FALLBACK_POLL_MINUTES  optional periodic check-in if the wake channel is unreachable (0 = off)
-  RB_ALLOW_LIVE      leave unset. Only "I_UNDERSTAND_LIVE_RISK" lets the engine trade a REAL account.
+  RB_ALLOW_LIVE      leave unset: demo, contest and REAL accounts can all be connected. Set 0 / false / off to lock REAL out.
 """
 from __future__ import annotations
 

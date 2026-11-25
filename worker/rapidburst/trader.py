@@ -45,12 +45,12 @@ DEAL_ENTRY_IN = 0
 
 
 class Trader:
-    def __init__(self, broker, store, cfg: EngineConfig, data_dir: str, allow_live: bool = False):
+    def __init__(self, broker, store, cfg: EngineConfig, data_dir: str, allow_live: bool = True):
         self.broker = broker
         self.store = store
         self.cfg = cfg
         self.data_dir = data_dir
-        self.allow_live = bool(allow_live)  # server-side flag only, never from the UI
+        self.allow_live = bool(allow_live)  # t46u: any account may be connected; only a server-side RB_ALLOW_LIVE=0 locks REAL out (never from the UI)
         self.cmdq: "queue.Queue[tuple[str, dict, Future]]" = queue.Queue()
         self.lock = threading.Lock()
         self.logs: deque = deque(maxlen=300)
@@ -59,7 +59,7 @@ class Trader:
         self.stop_event = threading.Event()
 
         self.conn_state = "NO_CREDENTIALS"
-        self.conn_msg = "Enter MT5 demo credentials with CONNECT MT5"
+        self.conn_msg = "Enter MT5 login / password / server with CONNECT MT5 (demo or real)"
         self.next_reconnect = 0.0
         self.reconnect_backoff = 5.0
         self.validation: dict = {"ok": False, "checks": []}
@@ -164,6 +164,7 @@ class Trader:
         self.batch: dict = st.get("batch", {})
         self.server_offset: float = float(st.get("server_offset", 0.0))
         self.saved_pos_meta: dict = st.get("positions", {})
+        self.saved_login = st.get("login")      # t46u: account the persisted state belongs to
         self.bursts = st.get("bursts", {}) or {}
         self.skip_counts = {k: Counter(v) for k, v in (st.get("skip_counts") or {}).items()}
         self.decisions.extend(st.get("decisions") or [])
@@ -183,7 +184,7 @@ class Trader:
     def _save_state(self) -> None:
         data = {
             "selected": self.selected, "running": self.running, "batch": self.batch,
-            "server_offset": self.server_offset,
+            "login": self.saved_login, "server_offset": self.server_offset,
             "positions": {str(k): {"entry_vu": v.entry_vu, "peak_units": v.peak_units, "open_time": v.open_time,
                                    "reason": v.reason, "batch_id": v.batch_id,
                                    "hard_dist": v.hard_dist, "sl_state": v.sl_state} for k, v in self.pos_state.items()},
@@ -259,11 +260,53 @@ class Trader:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "msg": f"could not decrypt credentials ({type(exc).__name__})"}
         self.add_log("INFO", f"CONNECT MT5 requested for account {creds['login']} on {creds['server']}")
+        why = self._switch_block(creds)
+        if why:
+            self.add_log("WARNING", why)
+            return {"ok": False, "msg": why, "validation": self.validation}
         ok, msg = self._connect(creds)
         if ok:
             where = self.store.save_credentials(creds)
             self.add_log("INFO", f"Credentials {where}")
         return {"ok": ok, "msg": msg, "validation": self.validation}
+
+    def _switch_block(self, creds: dict) -> str:
+        """t46u: switching to a DIFFERENT account is refused while the bot trades or still holds its own positions
+        on the current one (they would be orphaned). Same account re-connect is always allowed."""
+        cur = self.account.get("login") if (self.conn_state == "CONNECTED" and self.account) else None
+        try:
+            if cur is None or int(cur) == int(creds["login"]):
+                return ""
+        except (TypeError, ValueError):
+            return ""
+        if self.running:
+            return f"account {cur} is trading - STOP first, then connect account {creds['login']}"
+        if self.own_positions or self.flatten_pending:
+            return (f"bot positions are still open on account {cur} - close them (STOP) before "
+                    f"connecting account {creds['login']}")
+        return ""
+
+    def _account_changed(self, new_login) -> None:
+        """t46u: persisted per-account state (position meta, bursts, one-entry-per-event memory, guard/risk session)
+        must never leak from one account into another."""
+        old = self.saved_login
+        if old is not None and str(old) != str(new_login):
+            self.add_log("WARNING", f"account changed {old} -> {new_login}: per-account state reset "
+                                    f"(positions meta, bursts, risk session)")
+            self.pos_state.clear()
+            self.bursts = {}
+            self.saved_pos_meta = {}
+            self._closed_tickets = {}
+            self._pe_used = {}
+            self.skip_counts = {}
+            self.guardian.view = {}
+            self.risk.reset_session(float(self.account.get("equity", 0) or 0))
+            self.batch = {}
+        self.saved_login = new_login
+        try:
+            self._save_state()
+        except OSError:
+            pass
 
     def cmd_start(self) -> dict:
         """Idempotent START. Re-reads everything from the broker before trading and
@@ -437,6 +480,7 @@ class Trader:
         mode = ACCOUNT_MODE.get(int(self.account.get("trade_mode", -1)), "UNKNOWN")
         self.add_log("INFO", f"MT5 connected: {self.account.get('login')} {self.account.get('server')} "
                              f"[{mode}] {self.account.get('company', '')}")
+        self._account_changed(self.account.get("login", creds.get("login")))
         self._prepare_symbols()
         self._refresh_account()
         self._adopt_positions(initial=True)
@@ -537,9 +581,10 @@ class Trader:
         acct = self.account
         if connected:
             mode = ACCOUNT_MODE.get(int(acct.get("trade_mode", -1)), "UNKNOWN")
-            demo_ok = mode == "DEMO" or (mode == "REAL" and self.allow_live)
+            demo_ok = mode in ("DEMO", "CONTEST") or (mode == "REAL" and self.allow_live)
             add("Account type", demo_ok,
-                f"{mode}" + ("" if demo_ok else " - LIVE trading is disabled (DEMO only)"))
+                f"{mode}" + ("" if demo_ok else " - REAL accounts are locked by the server (RB_ALLOW_LIVE=0)"
+                             if mode == "REAL" else " - unknown account type"))
             term = self.terminal
             algo = bool(term.get("trade_allowed")) and not bool(term.get("tradeapi_disabled"))
             add("Algo trading enabled in terminal", algo,

@@ -1,10 +1,11 @@
 """Engine / risk configuration (one engine: the M1 Rapid Basket Scalper).
 
-DEMO account only. t30u: the owner asked to remove the risk-amount limits so the account can compound as fast as
+Any MT5 account (demo or real) can be connected from the UI (t46u); set the server-side RB_ALLOW_LIVE=0 to lock
+REAL accounts out. t30u: the owner asked to remove the risk-amount limits so the account can compound as fast as
 possible; the defaults below are therefore AGGRESSIVE (half the equity at risk per basket if every stop is hit,
 safe mode only at a 50 % drawdown). Every order still carries a hard broker stop.  They can be
 overridden with a JSON file (``RB_CONFIG_FILE``) on the worker machine.  The
-UI cannot change risk limits and can never enable LIVE trading.
+UI cannot change risk limits.
 """
 from __future__ import annotations
 
@@ -21,6 +22,14 @@ RISK_ENV = (("RB_SAFE_PAUSE_S", "safe_pause_s"),
             ("RB_GROUP_LOSS_PCT", "group_loss_pct"), ("RB_MB_MAX_CHASE_ATR", "mb_max_chase_atr"),
             ("RB_MB_MAX_BAR_ATR", "mb_max_bar_atr"), ("RB_MB_THRESHOLD", "mb_threshold"),
             ("RB_SL_ATR", "sl_atr"), ("RB_COMMISSION_PER_LOT", "commission_per_lot"))
+def allow_live_from_env(env=None) -> bool:
+    """t46u: the engine trades ANY account the user connects (demo, contest or real). Only an explicit server-side
+    RB_ALLOW_LIVE=0 / false / no / off / demo_only locks it back to DEMO accounts."""
+    import os
+    env = os.environ if env is None else env
+    return str(env.get("RB_ALLOW_LIVE", "")).strip().lower() not in ("0", "false", "no", "off", "demo_only", "demo")
+
+
 INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE", "RB_CONFIG_JSON", "RB_DATA_DIR",
              "RB_ENV_FILE", "RB_FALLBACK_POLL_MINUTES", "RB_LEARN_REDIS_URL", "RB_KEEPALIVE_SECONDS", "RB_LINGER_SECONDS",
              "RB_STANDBY_SECONDS", "RB_TEST_BROKER_FACTORY", "RB_UI_PASSWORD", "RB_WAKE_URL"}

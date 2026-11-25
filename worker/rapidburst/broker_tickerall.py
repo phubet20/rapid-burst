@@ -218,6 +218,9 @@ class TickerAllBroker:
         ok, why = self.available()
         if not ok:
             return False, why
+        prev = self._creds
+        if prev and self.account_id and (int(prev.get("login", 0)) != int(login) or prev.get("server") != server):
+            self.shutdown()          # t46u: switching account - release the previous session, stop its stream
         try:
             res = self._open_session(int(login), password, server, timeout_ms / 1000.0)
         except TickerAllError as e:

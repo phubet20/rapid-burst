@@ -1,7 +1,7 @@
 # Rapid Burst Auto Scalping Bot (MetaTrader 5)
 
 Autonomous tick-based momentum scalper for MT5 (primary symbol XAUUSD, any broker symbol selectable),
-operated from a single-screen iPhone web app. **DEMO only by default.**
+operated from a single-screen iPhone web app. **Connect any MT5 account (demo or real) from the app - no code change needed; the engine trades one account at a time.**
 
 ```
  iPhone (Safari) ─HTTPS/WSS─> Backend + UI (Render free, sleeps when unused) <─outbound WSS (only while needed)─ Launcher
@@ -263,8 +263,9 @@ Defaults (all in `worker/rapidburst/config.py`, overridable by env / `RB_CONFIG_
   already has someone else's position.
 * STOP blocks entries and closes every bot position, verifying each close (retried each loop).
 * Recovery: bot positions are re-adopted by magic after a restart and managed by the same engine; trading
-  only resumes on an explicit START. LIVE accounts are refused unless the worker sets
-  `RB_ALLOW_LIVE=I_UNDERSTAND_LIVE_RISK` (never from the UI, never automatic).
+  only resumes on an explicit START. Any account type (demo / contest / real) can be connected; set the server-side
+  `RB_ALLOW_LIVE=0` to lock REAL accounts out (never changeable from the UI). Switching to a different login needs
+  STOP + no open bot positions and resets the per-account state (position meta, bursts, risk session).
 
 Defaults are a starting point, **not calibrated on enough real ticks** – run on DEMO first. No profit
 guarantee.
@@ -360,9 +361,9 @@ LIVE stays disabled. Two independent gates must both be opened deliberately:
 1. **Price/execution path.** TickerAll Free refuses live accounts (`FREE_TIER_LIVE_REJECTED`).
    Either upgrade to a paid TickerAll tier that allows live accounts, or run the Windows
    launcher with a real MT5 terminal (see "Install the launcher").
-2. **Engine gate.** The engine refuses non-DEMO accounts unless the machine running it sets
-   `RB_ALLOW_LIVE=I_UNDERSTAND_LIVE_RISK` (environment variable on Render or the Windows PC). It
-   can never be enabled from the web UI.
+2. **Engine gate (t46u).** There is no demo-only lock any more: enter login / password / server in the app and
+   CONNECT. Only an explicit `RB_ALLOW_LIVE=0` (environment variable on Render or the Windows PC) locks REAL accounts
+   out; the web UI can never change it. The only remaining limit is the price/execution path above (TickerAll Free = demo).
 Test on DEMO first, then reduce `small_account_max_loss_pct` / `batch_max` for real money.
 
 ## Install the launcher (your Windows PC or a Windows VPS, elevated PowerShell)
