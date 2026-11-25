@@ -579,6 +579,8 @@ class Strength:
     vetoes: list = field(default_factory=list)
     pe: dict = field(default_factory=dict)         # t45u: Position Entry Score per side (separate from buy/sell momentum)
     plans: dict = field(default_factory=dict)      # t45u: precision.Plan per side (structural stop, Target LIQ, R:R)
+    bar_side: str = ""                             # t46u: M1 trend side for the every-M1-bar entry ("" = not available)
+    bar_reason: str = ""
 
     @property
     def score(self) -> float:
@@ -790,6 +792,13 @@ def decide(m: Micro, cfg) -> Strength:
     if not m.stable:
         st.reason = f"feed unstable (gap {m.gap_max:.1f}s)"
         return st
+    v1 = m.mtf
+    if getattr(cfg, "m1_only", False) and getattr(cfg, "m1_every_bar", False) and v1 is not None and v1.m1.ready:
+        bias = float(v1.bias)
+        bd = (1 if bias > 0 else -1) if abs(bias) >= 0.10 else (1 if b >= s else -1)
+        st.bar_side = "BUY" if bd > 0 else "SELL"
+        st.bar_reason = (f"M1 BAR ENTRY {st.bar_side}: M1 trend bias {bias:+.2f} (M1 indicators), BUY {b:.2f} vs SELL {s:.2f} "
+                         f"- no threshold / agreement wait")
     # DUAL-SIDE: each side is checked on its OWN evidence (threshold, vetoes, agreement); a weak or vetoed
     # side never implies the other one and never blocks it. The side that passes must also beat the other
     # side's raw score by the edge (no SELL into a strong up-move just because BUY was vetoed for chasing).

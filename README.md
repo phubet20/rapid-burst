@@ -517,6 +517,11 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   on the other side of 50, or the M1 swing is broken). While the whole bot portfolio is still negative, a winner whose stop is
   already at break-even / trailing is held to that stop. Hard risk exits, the break-even / trailing stop, the broker SL and the
   margin / data-feed emergencies are untouched. A winner that has no protective stop yet and whose trend turned may still leave.
+* `m1_every_bar` (default ON, needs `m1_only`): **one entry per new M1 bar** with no threshold / agreement / trigger / anti-chase
+  wait - the side is the M1 trend (EMA / MACD / RSI bias; the stronger side when flat). A natural signal still enters first.
+  Small baskets (weak score = minimum order count, 0.6x risk). A second basket is stacked only when every open basket on the
+  symbol is the same side and the combined net is in profit (never averaging down, never a hedge). Still enforced: clean feed,
+  spread / data checks, broker SL on every order, risk / lot / margin / exposure caps. Tune `m1_every_bar` = 0 to turn it off.
 * No martingale, no averaging down, no hedge, no recovery lots.
 
 ## t45u — Structure-to-Liquidity precision entry (owner spec)

@@ -153,6 +153,7 @@ class Trader:
         self.decisions: deque = deque(maxlen=40)
         self.last_why_log = 0.0
         self.last_loc: dict[str, str] = {}
+        self._bar_entry: dict[str, int] = {}    # t46u: symbol -> M1 bar (minute) that already got an entry
 
         avail, why = broker.available()
         if not avail:
@@ -1033,6 +1034,10 @@ class Trader:
                 status["reason"] = (f"recovery cycle: {len(mine)} legs on both sides - closes together once the "
                                     f"combined net is in profit")
                 continue
+            bar = int(float(getattr(m, "t", 0.0) or 0.0) // 60)
+            bar_side = ""
+            if cfg.m1_only and cfg.m1_every_bar and st.bar_side and bar and self._bar_entry.get(s) != bar:
+                bar_side = st.bar_side                      # t46u: a new M1 bar without an entry yet
             if mine:
                 g = self.bursts.get(mine[0].batch_id) or {}
                 why_not = self._add_check(s, mine, g, m, st, now_wall)
@@ -1040,11 +1045,20 @@ class Trader:
                                     f"net {g.get('net_px', 0.0):+.5g}, protection {g.get('prot') or 'hard stop'}, "
                                     f"momentum {g.get('momentum', '-')}) - add: {why_not or 'now'}")
                 if why_not is None and not self.exec_halt and self.pacer.can_enter(s, now_wall)[0]:
-                    self._add_to_basket(s, mine, g, m, st, info, status, now_wall, t_dec)
-                continue
-            if st.side == "NO TRADE":
+                    if self._add_to_basket(s, mine, g, m, st, info, status, now_wall, t_dec):
+                        self._bar_entry[s] = bar
+                        continue
+                # t46u: every-M1-bar entry on top of open baskets ONLY when they are all the same side as the trend side,
+                # in net profit together (never averaging down, never a hedge); it is a new basket with its own SL
+                live_now = {int(p["ticket"]): p for p in self.own_positions}
+                if not (bar_side and hedging and {ps.side for ps in mine} == {bar_side}
+                        and self._net(mine, live_now) > 0 and not self.exec_halt):
+                    continue
+            if st.side == "NO TRADE" and not bar_side:
                 self._skip(s, status, st.reason, now_wall)
                 continue
+            if st.side == "NO TRADE" or (mine and st.side != mine[0].side):
+                st = dc_replace(st, side=bar_side, reason=st.bar_reason)      # t46u: the M1 bar entry
             if self.exec_halt:
                 self._skip(s, status, "execution protection: close failures - new entries halted", now_wall)
                 continue
@@ -1099,6 +1113,7 @@ class Trader:
                     learn.why += " -> min lot (no skip)"
             rev = self._reverse_to.pop(s, None)
             if self._open_batch(s, side, m, st, info, status, now_wall, t_dec, learn):
+                self._bar_entry[s] = bar
                 if rev:
                     g = self.bursts.get(self.last_burst.get(s, {}).get("gid", ""), {})
                     g["reversal"] = True

@@ -98,3 +98,72 @@ def test_a_winning_basket_is_not_closed_by_a_soft_exit_while_the_trend_holds(tmp
     assert closed(tr_free)                                              # without the rule the soft exit banks the profit
     assert not closed(tr_hold) and br_hold.positions_                   # with the rule the winner is kept (trend with it)
     assert any("HOLD WINNER" in l["msg"] for l in tr_hold.logs)
+
+
+# ------------------------------------------------------------------ every M1 bar
+def test_decide_gives_an_m1_bar_side_even_when_nothing_passes_the_threshold():
+    from tests.test_mtf import _live, _view
+    cfg = EngineConfig(precision_enabled=False, mb_threshold=0.95)
+    up = mb.decide(_live(mtf=_view(0.6)), cfg)
+    assert up.bar_side == "BUY" and "M1 BAR ENTRY" in up.bar_reason
+    assert mb.decide(_live(mtf=_view(-0.6)), cfg).bar_side == "SELL"
+    off = mb.decide(_live(mtf=_view(0.6)), EngineConfig(precision_enabled=False, mb_threshold=0.95, m1_every_bar=False))
+    assert off.bar_side == ""
+    legacy = mb.decide(_live(mtf=_view(0.6)), EngineConfig(precision_enabled=False, m1_only=False, mb_threshold=0.95))
+    assert legacy.bar_side == ""
+
+
+def _bar_play(tmp_path, side="BUY", profit=None, **cfgkw):
+    from dataclasses import replace as rep
+    tr, br = make(tmp_path, {"BTCUSDm": series_up()},
+                  EngineConfig(precision_enabled=False, m1_only=True, add_enabled=False, hold_winners=False,
+                               zones_enabled=False, pullback_hold=False, zone_target_exit=False, regime_enabled=False,
+                               max_orders_per_batch=2, min_orders_per_batch=1, max_positions_per_symbol=8,
+                               max_entries_per_minute=100, **cfgkw))
+    _start(tr, br, T0 + 1)
+    orig = tr._micro
+    tr._micro_exit = lambda *a, **k: None
+    tr._reversal_check = lambda *a, **k: None
+    tr._hard_risk_exit = lambda *a, **k: None          # isolate the entry rule from the random-walk price
+
+    def marks_only():                                   # keep prices / P&L fresh but never stop a position out
+        for t, p in list(br.positions_.items()):
+            tk = br._tick(p["symbol"])
+            if tk:
+                px = tk[1] if p["type"] == 0 else tk[2]
+                p["price_current"], p["profit"] = px, round(br._pnl(p, px), 2)
+    br._check_stops = marks_only
+
+    def micro(s, now):
+        m, st = orig(s, now)
+        return m, rep(st, side="NO TRADE", reason="no edge (test)", bar_side=side, bar_reason="M1 BAR ENTRY (test)")
+    tr._micro = micro
+    if profit is not None:
+        tr._net = lambda legs, live: profit
+    return tr, br
+
+
+def _entries(tr):
+    import re
+    return sorted({re.search(r"batch (\w+)", l["msg"]).group(1) for l in tr.logs if l["msg"].startswith("ENTRY")})
+
+
+def test_one_basket_per_m1_bar_and_none_while_the_open_basket_is_not_in_profit(tmp_path):
+    tr, br = _bar_play(tmp_path, profit=-3.0)
+    run(tr, br, T0 + 1, T0 + 200)
+    assert len(_entries(tr)) == 1                       # first bar enters; the red basket is never stacked / averaged down
+
+
+def test_every_m1_bar_stacks_a_new_basket_onto_a_winning_same_side_basket(tmp_path):
+    tr, br = _bar_play(tmp_path, profit=3.0)
+    run(tr, br, T0 + 1, T0 + 200)
+    n = len(_entries(tr))
+    assert n >= 3, n                                    # ~ one per M1 bar over 200 s
+    assert n <= 200 // 60 + 2                           # never more than one per bar
+    assert all(p["sl"] for p in br.positions_.values())  # every order carries its broker SL
+
+
+def test_no_bar_entry_when_the_feature_is_off(tmp_path):
+    tr, br = _bar_play(tmp_path, profit=3.0, m1_every_bar=False)
+    run(tr, br, T0 + 1, T0 + 200)
+    assert not _entries(tr)
