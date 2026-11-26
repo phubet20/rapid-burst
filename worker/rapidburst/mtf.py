@@ -105,6 +105,8 @@ class TFState:
     live_lo_wick: float = 0.0    # same for the forming bar (0 until its range is >= 0.2 average range)
     live_up_wick: float = 0.0
     bar_age: float = 0.0         # seconds since the forming bar opened
+    ip_up: dict = field(default_factory=dict)    # t48u: raw impulse / pullback measurements of an UP leg (see _impulse)
+    ip_dn: dict = field(default_factory=dict)    # ... of a DOWN leg
 
     def brief(self) -> dict:
         r = lambda x, n=2: None if x is None else round(x, n)   # noqa: E731
@@ -114,6 +116,76 @@ class TFState:
                 "vol_src": self.vol_src, "structure": self.structure, "exhaust": self.exhaust,
                 "rsi": r(self.rsi, 1), "rsi_slope": r(self.rsi_slope, 1), "rsi_ready": self.rsi_ready,
                 "swing": self.swing, "sbreak": self.sbreak}
+
+
+def _impulse(pts: list, d: int, ar: float, look: int = 12, max_bars: int = 8) -> dict:
+    """t48u: the latest impulse leg in direction d inside the last `look` points (closed bars + the forming bar as the last point)
+    and where price is relative to it. All distances in average-range units; fractions of the leg for retracements.
+      size   leg (start extreme -> end extreme) / ar          eff   leg / sum of the bars' ranges (a clean push has eff ~ 1)
+      retr   deepest pullback after the leg end / leg          retr_now   how far price is below (BUY) the leg end now / leg
+      resume distance price has turned back from the pullback extreme / ar          running = the leg end is the forming bar"""
+    pts = pts[-look:]
+    n = len(pts)
+    if n < 3 or ar <= 0:
+        return {}
+    hi_k, lo_k = ("high", "low") if d > 0 else ("low", "high")
+    ext = (lambda x: x[hi_k]) if d > 0 else (lambda x: -x[hi_k])          # larger = further with the trade
+    e = max(range(n), key=lambda i: (ext(pts[i]), i))                      # leg end: the most extended bar
+    lo = max(0, e - max_bars + 1)
+    sidx = min(range(lo, e + 1), key=lambda i: (ext_lo(pts[i], d), -i))    # leg start: the most counter-extended bar before it
+    end_px, start_px = pts[e][hi_k], pts[sidx][lo_k]
+    leg = (end_px - start_px) * d
+    if leg <= 0:
+        return {}
+    path = sum(b["high"] - b["low"] for b in pts[sidx:e + 1]) or leg
+    after = pts[e + 1:]
+    close = pts[-1]["close"]
+    out = {"size": leg / ar, "eff": min(1.0, leg / path), "bars": e - sidx + 1, "start_px": start_px, "end_px": end_px,
+           "start_t": pts[sidx]["time"], "end_t": pts[e]["time"], "running": not after}
+    if after:
+        pb = min(b["low"] for b in after) if d > 0 else max(b["high"] for b in after)
+        out["pb"] = pb
+        out["retr"] = max(0.0, (end_px - pb) * d / leg)
+        out["resume"] = (close - pb) * d / ar
+    else:
+        out.update(pb=close, retr=0.0, resume=0.0)
+    out["retr_now"] = max(0.0, (end_px - close) * d / leg)
+    return out
+
+
+def ext_lo(b: dict, d: int) -> float:
+    """counter-extension of a bar for direction d (smaller = further against the trade): low for BUY, -high for SELL"""
+    return b["low"] if d > 0 else -b["high"]
+
+
+def ip_eval(s: "TFState", d: int, bias5: float, cfg) -> tuple[bool, str, dict]:
+    """t48u IMPULSE -> PULLBACK entry check for direction d. (ok, why / reason, info). The direction filter is the M5 bias; the
+    rest is M1 only. Never fires at the bar open or while price is still running with the leg (no chase)."""
+    side = "BUY" if d > 0 else "SELL"
+    if d * bias5 < cfg.ip_m5_bias_min:
+        return False, f"{side}: M5 trend {bias5:+.2f} is not with it (needs {d * cfg.ip_m5_bias_min:+.2f})", {}
+    ip = s.ip_up if d > 0 else s.ip_dn
+    if not s.ready or not ip:
+        return False, f"{side}: no M1 impulse data yet", {}
+    if ip["size"] < cfg.ip_impulse_atr or ip["eff"] < cfg.ip_eff_min or ip["bars"] > 8:
+        return False, (f"{side}: no impulse (leg {ip['size']:.1f} ranges / efficiency {ip['eff']:.2f}, needs >= "
+                       f"{cfg.ip_impulse_atr:g} / {cfg.ip_eff_min:g})"), {}
+    head = f"{side}: impulse {ip['size']:.1f} ranges ({ip['bars']} bars, eff {ip['eff']:.2f})"
+    if ip["running"] or ip["retr"] < cfg.ip_retr_min:
+        return False, f"{head} - still running / pullback {ip['retr']:.0%} < {cfg.ip_retr_min:.0%}: waiting, not chasing", {}
+    if ip["retr"] > cfg.ip_fail_retr:
+        return False, f"{head} - pullback {ip['retr']:.0%} > {cfg.ip_fail_retr:.0%}: the impulse failed", {}
+    if ip["retr"] > cfg.ip_retr_max:
+        return False, f"{head} - pullback {ip['retr']:.0%} is deep, waiting for it to turn or fail", {}
+    if ip["resume"] < cfg.ip_resume_atr or ip["retr_now"] < 0.10:
+        return False, (f"{head} - pullback {ip['retr']:.0%}, turned back {ip['resume']:.2f} ranges "
+                       f"(needs {cfg.ip_resume_atr:g}, and not already back at the high): waiting"), {}
+    if s.exhaust == d:
+        return False, f"{head} - the move is exhausting", {}
+    info = {"key": (round(ip["start_t"]), round(ip["end_t"])), "stop": ip["pb"], "start": ip["start_px"], "end": ip["end_px"],
+            "retr": ip["retr"], "size": ip["size"], "eff": ip["eff"]}
+    return True, (f"IMPULSE-PULLBACK {side}: impulse {ip['size']:.1f} ranges (eff {ip['eff']:.2f}) with M5 {bias5:+.2f}, pulled back "
+                  f"{ip['retr']:.0%} and turned {ip['resume']:.2f} ranges - entering the pullback, not the chase"), info
 
 
 class TF:
@@ -290,6 +362,8 @@ class TF:
             out.live_lo_wick = (min(lv["open"], lv["close"]) - lv["low"]) / lrng
             out.live_up_wick = (lv["high"] - max(lv["open"], lv["close"])) / lrng
         out.bar_age = max(0.0, now - lv["time"])
+        pts = list(self.bars)[-14:] + [lv]
+        out.ip_up, out.ip_dn = _impulse(pts, 1, ar), _impulse(pts, -1, ar)
         ext = pos
         if ext > 1.5 and p.hist < h1 and h1 < h2:
             out.exhaust = 1

@@ -504,6 +504,30 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   `regime_mid_penalty` 0.06 -> 0.10 (middle of a sideways range); `mb_edge` 0.03 -> 0.06 (a near-tie BUY/SELL is
   noise). These are reasoned changes, NOT back-tested on real data.
 
+## t48u — M5 trend + M1 impulse -> pullback entry, loss out fast / winner runs, lot from 40 % of equity (owner request)
+
+Why (live logs 2026-11-26 after t47u): average win ~ +1, average loss ~ -4 (the scalp cut winners at 0.2-0.55 ATR while the stop stayed
+full size), few entries (wick sniper), and the every-bar / threshold entries still bought the break of the high / sold the break of
+the low (no pullback) and then sat in the pullback.
+
+* `ip_enabled` (default ON, needs `m1_only`): the ONLY entry in M1 mode. Two phases, nothing else:
+  1. **Impulse** (M1): a leg of >= `ip_impulse_atr` (2.2) average M1 ranges in <= 8 bars, efficiency (net / path) >= `ip_eff_min` (0.45),
+     in the direction of the **M5 trend** (M5 EMA / MACD / HH-HL swing bias >= `ip_m5_bias_min` 0.15). M5 is only the direction filter.
+  2. **Pullback** (M1): price retraces `ip_retr_min`..`ip_retr_max` (30-70 %) of the leg and has turned back >= `ip_resume_atr` (0.25)
+     ranges from the pullback extreme (and is not already back at the high). Still running with the leg = wait (no chase);
+     deeper than `ip_fail_retr` (80 %) = the impulse failed, no entry. **One entry per pullback.** Never at the bar open.
+  The stop is beyond the pullback extreme (+ spread + buffer, clamped to sl_min/max_atr and the broker stops level).
+* Exits: a **loss leaves fast** - IMPULSE FAILED (pullback extreme taken out), M5 TREND TURNED (bias <= -`ip_m5_flip`), NO FOLLOW-THROUGH
+  (`ip_stale_s` = 150 s, still red, never made 0.2 ATR), all 2 clean ticks, plus the existing structure / reversal exits. A **winner runs**:
+  no partial TP / giveback / tight trail (`scalp_enabled` is OFF by default), break-even only after `ip_be_atr` (0.9) ATR, then a trail
+  `ip_trail_atr` (1.2) ATR wide; `hold_winners` holds it until the M5 trend turns.
+* `alloc_enabled` (default ON, `alloc_margin_pct` 40): one basket may use up to 40 % of equity as **margin**, split into equal orders (the
+  pullback ladder spreads them). The loss if every stop is hit is still capped by `risk_per_batch_pct`, and the shared
+  `max_margin_use_pct` / `max_total_risk_pct` / free-margin caps apply. Lots follow equity: they grow after profit and shrink after a loss
+  (and "never size up after a loss" stays). `compound_enabled` (streak multiplier) is OFF.
+* Off by default now: `m1_every_bar`, `sniper_enabled`, `scalp_enabled`, `compound_enabled` (all still available as switches).
+  `ip_enabled` = 0 returns to the t46u behaviour. Reasoned rules, NOT back-tested on real data.
+
 ## t47u — scalp: short profit, wick sniper entry, lot compounding (owner request)
 
 Why (from the live logs of 2026-11-25): the big losses were 16-order baskets that hit the hard stop / broker SL (-50 .. -130) or

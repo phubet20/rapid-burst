@@ -15,8 +15,8 @@ from tests.test_t46u import _bar_play
 
 def test_defaults_and_tunables():
     c = EngineConfig()
-    assert c.scalp_enabled and c.sniper_enabled and c.compound_enabled
-    assert c.scalp_be_atr < c.be_trigger_atr                      # the scalp locks earlier than the old break-even
+    assert not c.scalp_enabled and not c.sniper_enabled and not c.compound_enabled   # t48u: off by default (let the profit run)
+    assert c.scalp_be_atr < c.be_trigger_atr                      # the scalp (when switched on) locks earlier than the old break-even
     for k in ("scalp_enabled", "scalp_be_atr", "scalp_target_atr", "scalp_giveback_frac", "sniper_min_wick",
               "sniper_min_score", "sniper_chase_atr", "compound_enabled", "compound_step", "compound_max_mult"):
         assert k in TUNABLE
@@ -80,7 +80,7 @@ def _view_with(state, bias):
 
 
 def test_decide_bar_entry_only_on_a_wick_and_threshold_signals_do_not_chase():
-    cfg = EngineConfig(precision_enabled=False, mb_threshold=0.95)         # nothing passes the threshold
+    cfg = EngineConfig(precision_enabled=False, mb_threshold=0.95, sniper_enabled=True, ip_enabled=False, m1_every_bar=True)         # nothing passes the threshold
     wick = _state((100.0, 100.4, 99.0, 100.3))
     st = mb.decide(_live(mtf=_view_with(wick, 0.6)), cfg)
     assert st.bar_side == "BUY" and "SNIPER" in st.bar_reason
@@ -88,17 +88,18 @@ def test_decide_bar_entry_only_on_a_wick_and_threshold_signals_do_not_chase():
     st = mb.decide(_live(mtf=_view_with(flat, 0.6)), cfg)
     assert st.bar_side == "" and "sniper waiting" in st.bar_reason
     # a normal (threshold) signal is also held back while there is no wick
-    easy = EngineConfig(precision_enabled=False)
+    easy = EngineConfig(precision_enabled=False, sniper_enabled=True, ip_enabled=False)
     assert mb.decide(_live(mtf=_view_with(wick, 0.7)), easy).side == "BUY"
     st = mb.decide(_live(mtf=_view_with(flat, 0.7)), easy)
     assert st.side == "NO TRADE" and "sniper waiting" in st.reason
-    off = EngineConfig(precision_enabled=False, sniper_enabled=False)
+    off = EngineConfig(precision_enabled=False, sniper_enabled=False, ip_enabled=False)
     assert mb.decide(_live(mtf=_view_with(flat, 0.7)), off).side == "BUY"
 
 
 # ------------------------------------------------------------------ scalp exits (rule level)
 def _scalp(net_px, peak, money, legs_n=8, prot="", tp1=False, spread=0.1, atr=1.0, **cfgkw):
     cfgkw.setdefault("commission_per_lot", 0.0)
+    cfgkw.setdefault("scalp_enabled", True)
     cfg = EngineConfig(**cfgkw)
     legs = [NS(ticket=i + 1, symbol="X", side="BUY") for i in range(legs_n)]
     g = {"scalp_peak": peak, "prot": prot, "scalp_tp1": tp1}
@@ -178,6 +179,7 @@ def test_break_even_lock_arms_earlier_in_scalp_mode(tmp_path):
 
 # ------------------------------------------------------------------ compounding
 def _first_lot(tmp_path, streak, **cfgkw):
+    cfgkw.setdefault("compound_enabled", True)
     tr, br = _bar_play(tmp_path, max_orders_per_batch=2, min_orders_per_batch=1, ladder_enabled=False, **cfgkw)
     tr.win_streak["BTCUSDm"] = streak
     run(tr, br, T0 + 1, T0 + 2)

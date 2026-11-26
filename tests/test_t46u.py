@@ -103,7 +103,7 @@ def test_a_winning_basket_is_not_closed_by_a_soft_exit_while_the_trend_holds(tmp
 # ------------------------------------------------------------------ every M1 bar
 def test_decide_gives_an_m1_bar_side_even_when_nothing_passes_the_threshold():
     from tests.test_mtf import _live, _view
-    cfg = EngineConfig(precision_enabled=False, mb_threshold=0.95, sniper_enabled=False)
+    cfg = EngineConfig(precision_enabled=False, mb_threshold=0.95, sniper_enabled=False, ip_enabled=False, m1_every_bar=True)
     up = mb.decide(_live(mtf=_view(0.6)), cfg)
     assert up.bar_side == "BUY" and "M1 BAR ENTRY" in up.bar_reason
     assert mb.decide(_live(mtf=_view(-0.6)), cfg).bar_side == "SELL"
@@ -117,7 +117,8 @@ def _bar_play(tmp_path, side="BUY", profit=None, **cfgkw):
     from dataclasses import replace as rep
     base = dict(precision_enabled=False, m1_only=True, add_enabled=False, hold_winners=False, ladder_enabled=False,
                 zones_enabled=False, pullback_hold=False, zone_target_exit=False, regime_enabled=False,
-                max_orders_per_batch=2, min_orders_per_batch=1, max_positions_per_symbol=8, max_entries_per_minute=100)
+                max_orders_per_batch=2, min_orders_per_batch=1, max_positions_per_symbol=8, max_entries_per_minute=100,
+                ip_enabled=False, m1_every_bar=True, alloc_enabled=False, sniper_enabled=False, scalp_enabled=False)
     base.update(cfgkw)
     tr, br = make(tmp_path, {"BTCUSDm": series_up()}, EngineConfig(**base))
     _start(tr, br, T0 + 1)

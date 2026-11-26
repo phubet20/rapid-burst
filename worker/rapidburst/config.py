@@ -63,6 +63,10 @@ TUNABLE = {
     "scalp_enabled": (0, 1), "scalp_be_atr": (0.08, 0.6), "scalp_trail_mult": (0.3, 1.0), "scalp_target_atr": (0.15, 2.0),
     "scalp_partial_frac": (0.25, 0.9), "scalp_giveback_min_atr": (0.05, 1.0), "scalp_giveback_frac": (0.2, 0.8),
     "sniper_enabled": (0, 1), "sniper_min_wick": (0.1, 0.6), "sniper_min_score": (0.3, 0.9), "sniper_chase_atr": (0.2, 1.5),
+    "ip_enabled": (0, 1), "ip_m5_bias_min": (0.0, 0.8), "ip_impulse_atr": (1.0, 6.0), "ip_eff_min": (0.2, 0.9),
+    "ip_retr_min": (0.15, 0.6), "ip_retr_max": (0.4, 0.85), "ip_fail_retr": (0.6, 1.0), "ip_resume_atr": (0.05, 1.0),
+    "ip_be_atr": (0.2, 3.0), "ip_trail_atr": (0.3, 4.0), "ip_m5_flip": (0.1, 0.9), "ip_stale_s": (20.0, 900.0),
+    "alloc_enabled": (0, 1), "alloc_margin_pct": (5.0, 90.0),
     "compound_enabled": (0, 1), "compound_step": (0.05, 1.0), "compound_max_mult": (1.0, 4.0),
     "ladder_enabled": (0, 1), "ladder_first_frac": (0.25, 1.0), "ladder_step_atr": (0.15, 1.5), "ladder_levels": (1, 4), "ladder_ttl_s": (30, 1800), "hold_flip_bias": (0.1, 0.8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
@@ -287,7 +291,7 @@ class EngineConfig:
     # basket in the M1 trend direction (EMA / MACD / RSI bias; the stronger side when flat). Only valid with m1_only. Still
     # applies: clean feed, spread / data checks, broker SL on every order, the risk / lot / margin / exposure caps, no hedge
     # and no averaging down (a second basket is only stacked onto a symbol whose open baskets are all the same side and in profit).
-    m1_every_bar: bool = True
+    m1_every_bar: bool = False
     # t46u (owner): PULLBACK LADDER - a new basket sends only `ladder_first_frac` of its orders at market; the rest wait for price
     # to pull back `ladder_step_atr` x M1 ATR (x1, x2 ... `ladder_levels` steps) and are then sent at market, SAME lot, SAME structural
     # stop (so each later order risks LESS than the first), total orders / lots / risk = the one batch budget (no martingale, no
@@ -304,7 +308,7 @@ class EngineConfig:
     # once (the runner); (3) GIVEBACK GUARD: once the basket peaked >= `scalp_giveback_min_atr` x ATR (and no break-even stop is in
     # place yet) it is closed in profit when it gives back `scalp_giveback_frac` of the peak - a winner is never allowed to run
     # back into a loss, and hold_winners never overrides it.
-    scalp_enabled: bool = True
+    scalp_enabled: bool = False       # t48u: OFF - let the profit run (no partial TP / giveback / tight trail)
     scalp_be_atr: float = 0.20
     scalp_trail_mult: float = 0.70
     scalp_target_atr: float = 0.55
@@ -315,14 +319,39 @@ class EngineConfig:
     # pullback wick has formed): BUY after a LOWER wick rejection, SELL after an UPPER wick rejection, price not chasing the move.
     # score = 0.40 wick + 0.20 close position + 0.25 trend alignment + 0.15 (1 - chase); needs wick >= `sniper_min_wick` (fraction of
     # the bar range), score >= `sniper_min_score` and the forming bar's move with the trade < `sniper_chase_atr` x average M1 range.
-    sniper_enabled: bool = True
+    sniper_enabled: bool = False      # t48u: replaced by the impulse -> pullback entry
     sniper_min_wick: float = 0.30
     sniper_min_score: float = 0.50
     sniper_chase_atr: float = 0.60
     # t47u (owner): COMPOUND the lot after wins (anti-martingale): lot x (1 + compound_step x consecutive winning baskets on that
     # symbol), capped at compound_max_mult; any losing basket resets it. Every risk / lot / margin / exposure cap still applies and
     # the stop-risk budget of the batch is never exceeded (the order count shrinks instead).
-    compound_enabled: bool = True
+    # t48u (owner): IMPULSE -> PULLBACK entry (needs m1_only). Direction = M5 trend (EMA / MACD / HH-HL swing structure bias
+    # >= `ip_m5_bias_min`); the entry = M1 only and NEVER at the bar open / on the way up: (1) IMPULSE = a leg of >= `ip_impulse_atr`
+    # average M1 ranges in <= 8 bars with efficiency (net / path) >= `ip_eff_min`, with the M5 trend; (2) PULLBACK = price retraces
+    # `ip_retr_min`..`ip_retr_max` of that leg and has turned back by >= `ip_resume_atr` ranges from the pullback extreme. A pullback
+    # deeper than `ip_fail_retr` = the impulse failed (no entry). One entry per pullback. The stop is beyond the pullback extreme.
+    # Exits: a loss leaves fast (stop beyond the pullback, impulse failed, no follow-through after `ip_stale_s`), a winner is held
+    # (break-even only after `ip_be_atr` ATR, trail `ip_trail_atr` ATR wide - no stop hugging the price) until the M5 trend turns
+    # (bias <= -`ip_m5_flip`) or the trail is hit.
+    ip_enabled: bool = True
+    ip_m5_bias_min: float = 0.15
+    ip_impulse_atr: float = 2.2
+    ip_eff_min: float = 0.45
+    ip_retr_min: float = 0.30
+    ip_retr_max: float = 0.70
+    ip_fail_retr: float = 0.80
+    ip_resume_atr: float = 0.25
+    ip_be_atr: float = 0.90
+    ip_trail_atr: float = 1.20
+    ip_m5_flip: float = 0.30
+    ip_stale_s: float = 150.0
+    # t48u (owner): lot from the PORTFOLIO - one basket may use `alloc_margin_pct` of equity as margin, split into equal orders
+    # (the ladder spreads them over the pullback). The loss if every stop is hit stays capped by risk_per_batch_pct, the shared
+    # max_margin_use_pct / max_total_risk_pct caps still apply, and the lot grows with equity after wins (no streak multiplier).
+    alloc_enabled: bool = True
+    alloc_margin_pct: float = 40.0
+    compound_enabled: bool = False    # t48u: the lot now compounds with equity (alloc_margin_pct of equity), no streak multiplier
     compound_step: float = 0.25
     compound_max_mult: float = 2.0
     hold_flip_bias: float = 0.25      # M1 trend bias against the basket (with RSI on the other side of 50) = the trend turned

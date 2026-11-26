@@ -104,6 +104,7 @@ class Trader:
         self._exit_held_log: dict = {}
         self.exits_filtered = 0
         self._prec = precision.Analyzer()  # t45u: structure / OB / liquidity cache per closed M5 bar
+        self._ip_used: dict = {}           # t48u: (symbol, impulse key) -> wall time: one entry per pullback
         self._pe_used: dict = {}           # t45u: (symbol, setup key) -> wall time of its entry (one entry per structure event)
         self._pe_log: dict = {}
         self._regime_last: dict = {}      # t40u: symbol -> (state, phase) for the REGIME change log
@@ -1077,6 +1078,10 @@ class Trader:
             if not ok:
                 self._skip(s, status, f"{side} blocked: {why}", now_wall, sig)
                 continue
+            if getattr(st, "ip_key", ()) and (s, tuple(st.ip_key)) in self._ip_used:
+                self._skip(s, status, f"{side} skipped: this pullback was already entered (one entry per pullback) - waiting for "
+                                      f"the next impulse", now_wall, Signal(side, st.score, st.reason, eng.last))
+                continue
             pl = st.plans.get(side) if cfg.precision_enabled else None
             if pl is not None and (s, pl.key) in self._pe_used:
                 self._skip(s, status, f"{side} skipped: this setup ({pl.kind} {pl.key}) was already entered - one entry per "
@@ -1346,6 +1351,16 @@ class Trader:
         point = float(info["point"])
         stops = (int(info.get("trade_stops_level", 0)) + 5) * point
         sl_dist, sl_src = self._sl_distance(side, m, stops)
+        ip_stop = float(getattr(st, "ip_stop", 0.0) or 0.0)
+        if ip_stop and cfg.ip_enabled:
+            # t48u: the stop sits just beyond the PULLBACK extreme - if price takes that out the impulse failed (clamped like the
+            # structure stop: never inside the broker stops level / 3x spread, never wider than sl_max_atr)
+            ref_ip = m.ask if side == "BUY" else m.bid
+            atr_ip = m.atr or self._atr(s)[0] or (sl_dist / max(cfg.sl_atr, 0.1))
+            if atr_ip > 0 and d * (ref_ip - ip_stop) > 0:
+                lo_ip = max(stops, 3.0 * m.spread, cfg.sl_min_atr * atr_ip)
+                dist_ip = d * (ref_ip - ip_stop) + m.spread + cfg.sl_struct_buffer_atr * atr_ip
+                sl_dist, sl_src = max(lo_ip, min(max(lo_ip, cfg.sl_max_atr * atr_ip), dist_ip)), "beyond the pullback extreme (impulse failed if taken out)"
         ts, tv = self._tv(s)
         acct = self._acct()
         sig = Signal(side, st.score, st.reason, self.engines[s].last)
@@ -1443,6 +1458,23 @@ class Trader:
                 size = type(size)(vmin, size.risk_money * vmin / size.volume, size.note + "; learning: losing setup, min lot")
             if probe and size.volume > vmin:
                 size = type(size)(vmin, size.risk_money * vmin / size.volume, size.note + "; safe-mode probe: min lot")
+            if cfg.alloc_enabled and not floor and not probe and not (learn is not None and learn.min_lot):
+                # t48u: the lot comes from the PORTFOLIO - the basket may use alloc_margin_pct of equity as margin, split into
+                # equal orders; the loss if every stop is hit stays <= risk_per_batch_pct (the shared margin / risk caps below
+                # still apply). Lots therefore grow with equity after wins and shrink after losses.
+                price_a = m.ask if side == "BUY" else m.bid
+                m_min_a = self.broker.calc_margin(side, s, vmin, price_a)
+                if m_min_a and size.volume > 0:
+                    room_a = min(acct.equity * cfg.alloc_margin_pct / 100.0,
+                                 acct.equity * cfg.max_margin_use_pct / 100.0 - self._margin_used(),
+                                 float(acct.margin_free) * 0.95 if acct.margin_free else 1e18)
+                    v_m = (max(0.0, room_a) / (n * m_min_a)) * vmin
+                    per_lot_risk = size.risk_money / size.volume
+                    v_r = (acct.equity * cfg.risk_per_batch_pct / 100.0) / (n * per_lot_risk) if per_lot_risk > 0 else v_m
+                    v_a = normalize_volume(min(v_m, v_r, cfg.max_lot_per_order, cfg.max_batch_lots / n), vmin, vmax, vstep)
+                    if v_a >= vmin and v_a != size.volume:
+                        size = type(size)(v_a, per_lot_risk * v_a, f"alloc {cfg.alloc_margin_pct:g}% of equity as margin: {n} x {v_a:g} lot "
+                                                                    f"(margin cap {v_m:.3g}, stop-risk cap {v_r:.3g})")
             cap_lot = self.no_up_after_loss.get(s)
             if cap_lot and size.volume > cap_lot:
                 size = type(size)(cap_lot, size.risk_money * cap_lot / size.volume, size.note + f"; capped {cap_lot:g} after a loss")
@@ -1600,6 +1632,16 @@ class Trader:
         if iv is not None and getattr(iv, "ready", False):
             g["ind_votes"] = {k: round(d * x, 3) for k, x in iv.votes.items()}      # toward the trade side
         g["sl_src"] = sl_src
+        if getattr(st, "ip_key", ()) and cfg.ip_enabled:
+            g["ip"] = {"key": list(st.ip_key), "stop": float(st.ip_stop), "start": float(st.ip_info.get("start", 0.0)),
+                       "end": float(st.ip_info.get("end", 0.0)), "retr": round(float(st.ip_info.get("retr", 0.0)), 3),
+                       "t0": now_wall, "best": 0.0}
+            self._ip_used[(s, tuple(st.ip_key))] = now_wall
+            if len(self._ip_used) > 500:
+                for k_ in sorted(self._ip_used, key=self._ip_used.get)[:200]:
+                    self._ip_used.pop(k_, None)
+            self.add_log("INFO", f"IMPULSE-PULLBACK {gid} {side} {s}: leg {st.ip_info.get('start', 0):.5g} -> {st.ip_info.get('end', 0):.5g}, "
+                                 f"pullback {float(st.ip_info.get('retr', 0)):.0%}, stop beyond {st.ip_stop:.5g}")
         if plan is not None:
             g["plan"] = {"key": plan.key, "kind": plan.kind, "tags": list(plan.tags), "pe": round(plan.score, 3),
                          "inval": plan.inval, "sl": plan.sl, "target": plan.target, "target_kind": plan.target_kind,
@@ -1783,6 +1825,8 @@ class Trader:
                 reason, part = self._scalp_exit(key, legs, live, m, now_wall)        # t47u: bank short, never give a winner back
                 if part:
                     legs = part                                                      # partial take-profit: only these legs
+            if not reason and self.running and not cfg.no_stop_mode and cfg.ip_enabled and (self.bursts.get(key) or {}).get("ip"):
+                reason = self._ip_exit(key, legs, live, m, now_wall)                  # t48u: a loss leaves fast
             if not reason and self.running and not cfg.no_stop_mode:
                 grp = self.bursts.get(key) or {}
                 lq = self._liq_exit(key, legs, live, m, now_wall) if (cfg.precision_enabled and grp.get("plan")) else None
@@ -1846,6 +1890,43 @@ class Trader:
                          + ", ".join(closed))
             self._refresh_account()
             self._adopt_positions()          # book the closed basket now: the same loop can re-enter on a fresh signal
+
+    def _ip_exit(self, key: str, legs: list, live: dict, m, now_wall: float) -> Optional[str]:
+        """t48u: exits of an impulse-pullback basket that cut a LOSS fast (a winner is only held / trailed, see _protect_basket):
+        * IMPULSE FAILED: price took out the pullback extreme (the setup's invalidation) - leave now instead of waiting for the broker;
+        * M5 TREND TURNED: the M5 bias is <= -ip_m5_flip against the basket;
+        * NO FOLLOW-THROUGH: `ip_stale_s` after the entry the basket is still red and never made 0.2 ATR of profit.
+        2 clean ticks, no time wait, own pending key (the regular soft exit of the same loop resets `key`)."""
+        cfg = self.cfg
+        g = self.bursts.get(key) or {}
+        ip = g.get("ip")
+        sym, side = legs[0].symbol, legs[0].side
+        d = 1 if side == "BUY" else -1
+        cand = None
+        if ip and getattr(m, "ready", False):
+            pl, money = self._group_pl(legs, live, m, now_wall)
+            if pl is not None:
+                vol = sum(p.volume for p in legs)
+                avg = sum(p.open_price * p.volume for p in legs) / vol
+                px = avg + d * pl
+                atr, _ = self._atr(sym)
+                atr = atr or float(getattr(m, "atr", 0.0) or 0.0)
+                ip["best"] = max(float(ip.get("best", 0.0)), pl)
+                v = getattr(m, "mtf", None)
+                if ip.get("stop") and d * (px - float(ip["stop"])) < 0 and not g.get("prot"):
+                    cand = (f"IMPULSE FAILED: price {px:.5g} took out the pullback extreme {float(ip['stop']):.5g} "
+                            f"- the setup is wrong, leaving now ({money:+.2f})")
+                elif v is not None and v.m5.ready and d * float(v.m5_bias) <= -cfg.ip_m5_flip:
+                    cand = f"M5 TREND TURNED against the {side} basket (M5 bias {float(v.m5_bias):+.2f}) - leaving ({money:+.2f})"
+                elif (money < 0 and not g.get("prot") and now_wall - float(ip.get("t0", now_wall)) >= cfg.ip_stale_s
+                      and atr > 0 and float(ip["best"]) < 0.2 * atr):
+                    cand = (f"NO FOLLOW-THROUGH: {now_wall - float(ip['t0']):.0f}s after the entry the basket is still red "
+                            f"({money:+.2f}) and never made 0.2 ATR - cutting the loss")
+        sk = key + "|ip"
+        if not cand:
+            self._confirm_soft_exit(sk, sym, None, m, now_wall)
+            return None
+        return self._confirm_soft_exit(sk, sym, cand, m, now_wall, confirm_s=0.0, ticks=2)
 
     def _scalp_exit(self, key: str, legs: list, live: dict, m, now_wall: float) -> tuple:
         """t47u: confirm (2 clean ticks, no time wait) the scalp candidate from `_scalp_pick`. Its own pending key - the regular soft
@@ -1941,7 +2022,9 @@ class Trader:
         v = getattr(m, "mtf", None)
         v1 = v.m1 if (v is not None and v.m1.ready) else None
         flipped = False
-        if v1 is not None:
+        if g.get("ip") and v is not None and v.m5.ready:
+            flipped = d * v.m5_bias <= -cfg.ip_m5_flip          # t48u: an impulse-pullback winner is held until the M5 trend turns
+        elif v1 is not None:
             flipped = (d * v.bias <= -cfg.hold_flip_bias and (not v1.rsi_ready or d * (v1.rsi - 50.0) < 0)) \
                 or v1.sbreak == -d
         portfolio = sum(float(p.get("profit", 0.0)) + float(p.get("swap", 0.0)) for p in self.own_positions)
@@ -1949,7 +2032,7 @@ class Trader:
         if portfolio < 0 and protected:
             hold, why = True, f"portfolio {portfolio:+.2f} still negative, stop already {g.get('prot')} (profit protected)"
         elif not flipped:
-            hold, why = True, "M1 trend still with the basket"
+            hold, why = True, ("M5 trend still with the basket" if g.get("ip") else "M1 trend still with the basket")
         else:
             hold, why = False, ""
         if hold and now_wall - self._exit_held_log.get("hw" + key, 0.0) > 10.0:
@@ -2506,6 +2589,11 @@ class Trader:
         k = {"strong": cfg.trail_atr_strong, "fading": cfg.trail_atr_fade}.get(mom, cfg.trail_atr_frac)
         if cfg.scalp_enabled:
             k *= cfg.scalp_trail_mult
+        if g.get("ip"):
+            # t48u: let the profit run - break-even only after ip_be_atr ATR, then a trail that is ip_trail_atr ATR wide (never a
+            # stop hugging the price); the M5 trend turning is the discretionary exit (_ip_exit)
+            trigger = max(trigger, cfg.ip_be_atr * atr)
+            k = max(k, cfg.ip_trail_atr)
         trail = max(k * atr, cfg.trail_spread_mult * spread, stops)
         level = float(g.get("prot_level") or 0.0)
         state = str(g.get("prot") or "")
@@ -2902,7 +2990,7 @@ class Trader:
                               f"< {c.emergency_margin_level_pct:g}% or data-feed loss)") if c.no_stop_mode
                              else ("ON" if c.broker_sl else "OFF"), "exec_halt": self.exec_halt,
                 "no_stop_mode": c.no_stop_mode, "nostop_margin_use_pct": c.nostop_margin_use_pct,
-                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "scalp_enabled": c.scalp_enabled, "sniper_enabled": c.sniper_enabled, "compound_enabled": c.compound_enabled, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
+                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "scalp_enabled": c.scalp_enabled, "sniper_enabled": c.sniper_enabled, "compound_enabled": c.compound_enabled, "ip_enabled": c.ip_enabled, "alloc_enabled": c.alloc_enabled, "alloc_margin_pct": c.alloc_margin_pct, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
                 "batch_margin_pct": c.batch_margin_pct, "avg_max_layers": c.avg_max_layers, "avg_lot_mult": c.avg_lot_mult,
                 "avg_spacing_atr": c.avg_spacing_atr, "hedge_enabled": c.hedge_enabled, "recovery_after_s": c.recovery_after_s,
                 "recovery_loss_pct": c.recovery_loss_pct, "cycle_tp_pct": c.cycle_tp_pct, "recoveries": dict(self.recoveries),

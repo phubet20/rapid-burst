@@ -42,7 +42,7 @@ def test_indicators_chop_and_sr_proximity():
 
 
 def test_confluence_family_f_vetoes_against_and_requires_d():
-    cfg = EngineConfig(precision_enabled=False, add_enabled=True, sniper_enabled=False)
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True, sniper_enabled=False, ip_enabled=False)
     good = ind.IndView(ready=True, votes={k: 0.8 for k in ind.NAMES}, adx=30.0)
     bad = ind.IndView(ready=True, votes={k: -0.8 for k in ind.NAMES}, adx=30.0)
     st = decide(_live(mtf=_view(0.7), ind=good), cfg)
@@ -76,7 +76,7 @@ def test_safe_mode_peak_is_closed_balance_not_a_floating_spike():
 
 def test_structure_stop_beyond_swing_clamped_to_atr():
     tr = Trader.__new__(Trader)
-    tr.cfg = EngineConfig(precision_enabled=False, add_enabled=True, sniper_enabled=False)
+    tr.cfg = EngineConfig(precision_enabled=False, add_enabled=True, sniper_enabled=False, ip_enabled=False)
     v = _view(0.6)
     v.m1.swing_lo, v.m1.swing_hi = 99.2, 101.5
     m = SimpleNamespace(atr=1.0, spread=0.1, ask=100.05, bid=99.95, mtf=v)
@@ -104,6 +104,6 @@ def test_learned_indicator_weights_persist_and_follow_outcomes(tmp_path):
 def test_new_tunables_validate():
     ok, bad = validate_tune({"sl_max_atr": 2.0, "ind_min_score": 0.3, "ind_chop_veto": 0, "safe_flatten_pct": 70})
     assert not bad and ok["ind_chop_veto"] is False and ok["sl_max_atr"] == 2.0
-    c = EngineConfig(precision_enabled=False, add_enabled=True)
+    c = EngineConfig(precision_enabled=False, add_enabled=True, ip_enabled=False)
     assert c.mb_cut_frac == 0.0 and c.mb_max_hold_seconds == 0.0 and c.min_orders_per_batch == 1
     assert c.risk_per_batch_pct == 10.0 and c.max_total_risk_pct == 25.0 and c.equity_drawdown_pct == 30.0

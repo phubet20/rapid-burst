@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from statistics import median
 from typing import Optional
 
-from .mtf import m1_sniper
+from .mtf import ip_eval, m1_sniper
 
 
 def _clip(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -583,6 +583,9 @@ class Strength:
     plans: dict = field(default_factory=dict)      # t45u: precision.Plan per side (structural stop, Target LIQ, R:R)
     bar_side: str = ""                             # t46u: M1 trend side for the every-M1-bar entry ("" = not available)
     bar_reason: str = ""
+    ip_key: tuple = ()                             # t48u: (leg start time, leg end time) of the impulse -> one entry per pullback
+    ip_stop: float = 0.0                           # t48u: the pullback extreme (the structural stop goes beyond it)
+    ip_info: dict = field(default_factory=dict)
 
     @property
     def score(self) -> float:
@@ -795,6 +798,26 @@ def decide(m: Micro, cfg) -> Strength:
         st.reason = f"feed unstable (gap {m.gap_max:.1f}s)"
         return st
     v1 = m.mtf
+    if getattr(cfg, "ip_enabled", False) and getattr(cfg, "m1_only", False) and v1 is not None and v1.m1.ready:
+        # t48u IMPULSE -> PULLBACK: the ONLY entry in M1 mode. M5 = trend direction, M1 = the impulse and the pullback that turned.
+        bias5 = float(v1.m5_bias) if v1.m5.ready else float(v1.bias)
+        res = {1: ip_eval(v1.m1, 1, bias5, cfg), -1: ip_eval(v1.m1, -1, bias5, cfg)}
+        for d_, vet_ in ((1, vb), (-1, vs)):
+            if res[d_][0] and any(x.startswith("spread") for x in vet_):
+                res[d_] = (False, f"{'BUY' if d_ > 0 else 'SELL'}: {next(x for x in vet_ if x.startswith('spread'))}", {})
+        pick = [d_ for d_ in (1, -1) if res[d_][0]]
+        if pick:
+            d_ = pick[0]
+            ok_, why_, info_ = res[d_]
+            q = min(1.0, 0.5 + 0.5 * float(info_.get("eff", 0.5)))
+            st.side = "BUY" if d_ > 0 else "SELL"
+            st.buy, st.sell = (q, 0.0) if d_ > 0 else (0.0, q)
+            st.reason, st.ip_key, st.ip_stop, st.ip_info = why_, tuple(info_["key"]), float(info_["stop"]), info_
+            st.origin = m.origin_up if d_ > 0 else m.origin_dn
+            return st
+        show = 1 if bias5 >= 0 else -1
+        st.reason = f"IMPULSE-PULLBACK waiting (M5 {bias5:+.2f}) - {res[show][1]}"
+        return st
     if getattr(cfg, "m1_only", False) and getattr(cfg, "m1_every_bar", False) and v1 is not None and v1.m1.ready:
         bias = float(v1.bias)
         bd = (1 if bias > 0 else -1) if abs(bias) >= 0.10 else (1 if b >= s else -1)
