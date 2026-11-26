@@ -60,6 +60,10 @@ TUNABLE = {
     "pe_max_sl_atr": (0.5, 3.0), "pe_min_confluence": (2, 4), "pe_range_prem_max": (0.6, 1.0), "pe_breakout_enabled": (0, 1), "pe_bo_cont_ext_atr": (0.2, 2.0), "pe_bo_max_bars": (2, 20), "pe_max_cost_frac": (0.05, 0.6), "pe_tgt_min_atr": (0.3, 3.0), "pe_disp_atr": (0.8, 3.0),
     "add_enabled": (0, 1), "add_pullback_atr": (0.03, 1.0), "add_max_per_step": (1, 8),
     "m1_only": (0, 1), "m1_every_bar": (0, 1), "hold_winners": (0, 1),
+    "scalp_enabled": (0, 1), "scalp_be_atr": (0.08, 0.6), "scalp_trail_mult": (0.3, 1.0), "scalp_target_atr": (0.15, 2.0),
+    "scalp_partial_frac": (0.25, 0.9), "scalp_giveback_min_atr": (0.05, 1.0), "scalp_giveback_frac": (0.2, 0.8),
+    "sniper_enabled": (0, 1), "sniper_min_wick": (0.1, 0.6), "sniper_min_score": (0.3, 0.9), "sniper_chase_atr": (0.2, 1.5),
+    "compound_enabled": (0, 1), "compound_step": (0.05, 1.0), "compound_max_mult": (1.0, 4.0),
     "ladder_enabled": (0, 1), "ladder_first_frac": (0.25, 1.0), "ladder_step_atr": (0.15, 1.5), "ladder_levels": (1, 4), "ladder_ttl_s": (30, 1800), "hold_flip_bias": (0.1, 0.8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
     "learn_max_mult": (1.0, 3.0), "learn_min_samples": (2, 50), "max_positions_total": (1, 200), "max_positions_per_symbol": (1, 100),
@@ -294,6 +298,33 @@ class EngineConfig:
     ladder_step_atr: float = 0.35
     ladder_levels: int = 2
     ladder_ttl_s: float = 240.0
+    # t47u (owner): SCALP - take short and lock fast. (1) the break-even lock arms at `scalp_be_atr` x M1 ATR of net basket profit
+    # (instead of be_trigger_atr) and the trail is `scalp_trail_mult` x tighter; (2) PARTIAL TAKE-PROFIT: at `scalp_target_atr` x ATR
+    # of net profit `scalp_partial_frac` of the basket's orders are closed in profit and the stop of the rest goes to break-even+ at
+    # once (the runner); (3) GIVEBACK GUARD: once the basket peaked >= `scalp_giveback_min_atr` x ATR (and no break-even stop is in
+    # place yet) it is closed in profit when it gives back `scalp_giveback_frac` of the peak - a winner is never allowed to run
+    # back into a loss, and hold_winners never overrides it.
+    scalp_enabled: bool = True
+    scalp_be_atr: float = 0.20
+    scalp_trail_mult: float = 0.70
+    scalp_target_atr: float = 0.55
+    scalp_partial_frac: float = 0.50
+    scalp_giveback_min_atr: float = 0.14
+    scalp_giveback_frac: float = 0.45
+    # t47u (owner): M1 WICK-REJECTION SNIPER entry (needs m1_only). The entry fires at the open of an M1 bar (or inside the bar once the
+    # pullback wick has formed): BUY after a LOWER wick rejection, SELL after an UPPER wick rejection, price not chasing the move.
+    # score = 0.40 wick + 0.20 close position + 0.25 trend alignment + 0.15 (1 - chase); needs wick >= `sniper_min_wick` (fraction of
+    # the bar range), score >= `sniper_min_score` and the forming bar's move with the trade < `sniper_chase_atr` x average M1 range.
+    sniper_enabled: bool = True
+    sniper_min_wick: float = 0.30
+    sniper_min_score: float = 0.50
+    sniper_chase_atr: float = 0.60
+    # t47u (owner): COMPOUND the lot after wins (anti-martingale): lot x (1 + compound_step x consecutive winning baskets on that
+    # symbol), capped at compound_max_mult; any losing basket resets it. Every risk / lot / margin / exposure cap still applies and
+    # the stop-risk budget of the batch is never exceeded (the order count shrinks instead).
+    compound_enabled: bool = True
+    compound_step: float = 0.25
+    compound_max_mult: float = 2.0
     hold_flip_bias: float = 0.25      # M1 trend bias against the basket (with RSI on the other side of 50) = the trend turned
     pe_min: float = 0.58              # Position Entry Score needed (0..1)
     pe_dir_relax: float = 0.10        # the directional threshold is lowered by x here (the pullback trigger is the timing)

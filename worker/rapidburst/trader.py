@@ -138,6 +138,7 @@ class Trader:
         self.exec_pause: dict[str, float] = {}
         self.exec_halt = False                       # close failures => no new entries
         self.no_up_after_loss: dict[str, float] = {}  # symbol -> max lot until a winning batch (no martingale)
+        self.win_streak: dict[str, int] = {}          # t47u: symbol -> consecutive winning baskets (lot compounding, anti-martingale)
         self.learner = Learner(os.path.join(data_dir, "learning.json"), min_samples=self.cfg.learn_min_samples,
                                half_life_h=self.cfg.learn_half_life_hours, max_mult=self.cfg.learn_max_mult,
                                remote=kv_from_env())
@@ -740,8 +741,11 @@ class Trader:
         self.pacer.on_close(ps.symbol, b["realized"], now)
         if b["realized"] < 0:
             self.no_up_after_loss[ps.symbol] = float(b.get("lot", ps.volume))   # never size up after a loss
+            self.win_streak[ps.symbol] = 0                                      # t47u: a loss resets the compounding
         else:
             self.no_up_after_loss.pop(ps.symbol, None)
+            if b["realized"] > 0:
+                self.win_streak[ps.symbol] = self.win_streak.get(ps.symbol, 0) + 1
         lb = self.last_burst.get(ps.symbol)
         if lb and lb.get("gid") == ps.batch_id:
             # a failed signal is not re-fired; a winning one - or one stopped at break-even / by the trail - may
@@ -1443,6 +1447,15 @@ class Trader:
             if cap_lot and size.volume > cap_lot:
                 size = type(size)(cap_lot, size.risk_money * cap_lot / size.volume, size.note + f"; capped {cap_lot:g} after a loss")
             budget = acct.equity * (cfg.small_account_batch_risk_pct if floor else cfg.risk_per_batch_pct) / 100.0
+            streak = self.win_streak.get(s, 0)
+            if cfg.compound_enabled and streak > 0 and not cap_lot and not probe and not (learn is not None and learn.min_lot):
+                mult_c = min(cfg.compound_max_mult, 1.0 + cfg.compound_step * streak)
+                v2 = normalize_volume(size.volume * mult_c, vmin, vmax, vstep)
+                if v2 > size.volume:
+                    r2 = size.risk_money * v2 / size.volume
+                    if n_min * r2 <= budget + 1e-9:          # the stop-risk budget of the batch is never exceeded
+                        size = type(size)(v2, r2, size.note + f"; compounded {size.volume:g} -> {v2:g} lot after "
+                                                              f"{streak} winning basket(s)")
             while n > n_min and (n * size.volume > cfg.max_batch_lots + 1e-9 or n * size.risk_money > budget + 1e-9):
                 n -= 1
             if size.volume > cfg.max_batch_lots + 1e-9:
@@ -1766,6 +1779,10 @@ class Trader:
             if not reason and self.running and not cfg.no_stop_mode:
                 # BE / trailing; its only exit is "protection failed" (stop not confirmed by MT5) = a RISK exit, never delayed
                 reason = self._protect_basket(key, legs, live, m, st, now_wall)
+            if not reason and self.running and not cfg.no_stop_mode and cfg.scalp_enabled:
+                reason, part = self._scalp_exit(key, legs, live, m, now_wall)        # t47u: bank short, never give a winner back
+                if part:
+                    legs = part                                                      # partial take-profit: only these legs
             if not reason and self.running and not cfg.no_stop_mode:
                 grp = self.bursts.get(key) or {}
                 lq = self._liq_exit(key, legs, live, m, now_wall) if (cfg.precision_enabled and grp.get("plan")) else None
@@ -1817,13 +1834,71 @@ class Trader:
                         self.exec_halt = True
                         self.add_log("ERROR", f"EXECUTION PROTECTION: #{ps.ticket} could not be closed "
                                               f"{ps.closing_attempts}x - new entries halted, still retrying the close")
+            partial = bool(reason.startswith("SCALP TP1"))
             if key in self.bursts:
-                self.bursts[key]["exit_reason"] = reason
+                if partial:
+                    if any(ps.ticket in self._closed_tickets for ps in todo):
+                        self.bursts[key]["scalp_tp1"] = True        # the rest of the basket keeps running
+                else:
+                    self.bursts[key]["exit_reason"] = reason
             self.add_log("INFO" if not any(" FAIL " in f" {c}" for c in closed) else "ERROR",
                          f"EXIT GROUP {key} {legs[0].side} {sum(p.volume for p in legs):g} {sym}: {reason} -> "
                          + ", ".join(closed))
             self._refresh_account()
             self._adopt_positions()          # book the closed basket now: the same loop can re-enter on a fresh signal
+
+    def _scalp_exit(self, key: str, legs: list, live: dict, m, now_wall: float) -> tuple:
+        """t47u: confirm (2 clean ticks, no time wait) the scalp candidate from `_scalp_pick`. Its own pending key - the regular soft
+        exit path of the same loop resets `key`, which would otherwise wipe this confirmation every tick."""
+        cand, part = self._scalp_pick(key, legs, live, m, now_wall)
+        sk, sym = key + "|scalp", legs[0].symbol
+        if not cand:
+            self._confirm_soft_exit(sk, sym, None, m, now_wall)
+            return None, None
+        r = self._confirm_soft_exit(sk, sym, cand, m, now_wall, confirm_s=0.0, ticks=2)
+        return r, (part if r else None)
+
+    def _scalp_pick(self, key: str, legs: list, live: dict, m, now_wall: float) -> tuple:
+        """t47u SCALP candidate: (reason, partial_legs). Two exits that bank a SHORT profit and never let a winner run back into a loss:
+        * SCALP TP1: net basket profit >= scalp_target_atr x ATR -> close `scalp_partial_frac` of the orders in profit (the runner
+          keeps going; _protect_basket then moves its stop to break-even+ at once);
+        * SCALP GIVEBACK: before any break-even stop is in place, a basket that peaked >= scalp_giveback_min_atr x ATR is closed
+          (in profit) once it gives back scalp_giveback_frac of the peak. hold_winners / pullback_hold never override it.
+        Money-side checks use the net of the legs (broker profit + swap); price-side ones the executable exit price."""
+        cfg = self.cfg
+        g = self.bursts.get(key)
+        if g is None or not getattr(m, "ready", False):
+            return None, None
+        d = 1 if legs[0].side == "BUY" else -1
+        sym = legs[0].symbol
+        pl, money = self._group_pl(legs, live, m, now_wall)
+        if pl is None:
+            return None, None
+        ts, tv = self._tv(sym)
+        cost = cfg.commission_per_lot / (tv / ts) if (cfg.commission_per_lot and ts and tv) else 0.0
+        net = pl - cost
+        atr, _ = self._atr(sym)
+        atr = atr or float(getattr(m, "atr", 0.0) or 0.0)
+        spread = float(getattr(m, "spread", 0.0) or 0.0)
+        if atr <= 0:
+            return None, None
+        peak = max(float(g.get("scalp_peak", 0.0)), net)
+        g["scalp_peak"] = peak
+        if money <= 0 or net <= 0:
+            return None, None                                    # only ever a PROFIT exit
+        floor = cost + 1.5 * spread
+        if not g.get("scalp_tp1") and len(legs) >= 2 and net >= max(cfg.scalp_target_atr * atr, floor + 2.0 * spread):
+            k = max(1, min(len(legs) - 1, int(round(cfg.scalp_partial_frac * len(legs)))))
+            part = sorted(legs, key=lambda ps: ps.ticket)[:k]
+            return (f"SCALP TP1: net {net:+.5g} >= {cfg.scalp_target_atr:g} ATR - banking {k}/{len(legs)} order(s) in "
+                    f"profit {money:+.2f}, the rest runs with a break-even+ stop"), part
+        arm = max(cfg.scalp_giveback_min_atr * atr, 3.0 * spread + cost)
+        if not g.get("prot") and peak >= arm:
+            level = max(peak * (1.0 - cfg.scalp_giveback_frac), floor)
+            if net <= level:
+                return (f"SCALP GIVEBACK: peak {peak:+.5g} -> {net:+.5g} (gave back >= {cfg.scalp_giveback_frac:.0%}, "
+                        f"no break-even stop yet) - closing in profit {money:+.2f}"), None
+        return None, None
 
     def _liq_exit(self, key: str, legs: list, live: dict, m, now_wall: float) -> Optional[str]:
         """t45u: exits that belong to a precision basket - the Target LIQ (take it), the structural invalidation (the
@@ -2417,7 +2492,11 @@ class Trader:
             return None
         stops = (max(int(info.get("trade_stops_level", 0)), int(info.get("trade_freeze_level", 0))) + 3) * point
         lock = cost + max(cfg.be_lock_spread_mult * spread, 2 * point)
-        trigger = max(cfg.be_trigger_atr * atr, cfg.be_trigger_spread * spread, stops + lock + spread)
+        floor_trig = stops + lock + spread
+        be_atr = cfg.scalp_be_atr if cfg.scalp_enabled else cfg.be_trigger_atr     # t47u: scalp = lock the profit early
+        trigger = max(be_atr * atr, cfg.be_trigger_spread * spread, floor_trig)
+        if cfg.scalp_enabled and g.get("scalp_tp1"):
+            trigger = floor_trig                                  # the partial profit is banked: the runner is locked at once
         mom = "normal"
         if getattr(m, "ready", False):
             sig = exit_signals(g, m, d, st.sell if d > 0 else st.buy, st.threshold, cfg)
@@ -2425,6 +2504,8 @@ class Trader:
             nsig = sum(1 for v in sig.values() if v)
             mom = "strong" if cont and nsig == 0 else "fading" if (nsig >= 2 or not cont) else "normal"
         k = {"strong": cfg.trail_atr_strong, "fading": cfg.trail_atr_fade}.get(mom, cfg.trail_atr_frac)
+        if cfg.scalp_enabled:
+            k *= cfg.scalp_trail_mult
         trail = max(k * atr, cfg.trail_spread_mult * spread, stops)
         level = float(g.get("prot_level") or 0.0)
         state = str(g.get("prot") or "")
@@ -2821,7 +2902,7 @@ class Trader:
                               f"< {c.emergency_margin_level_pct:g}% or data-feed loss)") if c.no_stop_mode
                              else ("ON" if c.broker_sl else "OFF"), "exec_halt": self.exec_halt,
                 "no_stop_mode": c.no_stop_mode, "nostop_margin_use_pct": c.nostop_margin_use_pct,
-                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
+                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "scalp_enabled": c.scalp_enabled, "sniper_enabled": c.sniper_enabled, "compound_enabled": c.compound_enabled, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
                 "batch_margin_pct": c.batch_margin_pct, "avg_max_layers": c.avg_max_layers, "avg_lot_mult": c.avg_lot_mult,
                 "avg_spacing_atr": c.avg_spacing_atr, "hedge_enabled": c.hedge_enabled, "recovery_after_s": c.recovery_after_s,
                 "recovery_loss_pct": c.recovery_loss_pct, "cycle_tp_pct": c.cycle_tp_pct, "recoveries": dict(self.recoveries),

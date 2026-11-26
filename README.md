@@ -504,6 +504,36 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   `regime_mid_penalty` 0.06 -> 0.10 (middle of a sideways range); `mb_edge` 0.03 -> 0.06 (a near-tie BUY/SELL is
   noise). These are reasoned changes, NOT back-tested on real data.
 
+## t47u — scalp: short profit, wick sniper entry, lot compounding (owner request)
+
+Why (from the live logs of 2026-11-25): the big losses were 16-order baskets that hit the hard stop / broker SL (-50 .. -130) or
+were closed by REVERSAL / "structure invalidated" a few seconds after entry, while the profit that had already appeared
+(+10 on a 12-order SELL) was held by `hold_winners` (no stop yet, trend "still with us") and gave back; several entries were
+chasing a move after the M1 low had already broken (large slippage, 20 s tick-to-decision, feed lag).
+
+* `scalp_enabled` (default ON) - take short, never hand a winner back:
+  * the break-even lock arms at `scalp_be_atr` (0.20) x M1 ATR of net basket profit (was `be_trigger_atr` 0.35) and the trail is
+    `scalp_trail_mult` (0.7) x tighter;
+  * **SCALP TP1**: at `scalp_target_atr` (0.55) x ATR of net profit, `scalp_partial_frac` (50 %) of the orders are closed in profit
+    (2 clean ticks) and the stop of the rest moves to break-even+ at once (the runner);
+  * **SCALP GIVEBACK**: before any break-even stop is in place, a basket that peaked >= `scalp_giveback_min_atr` (0.14) x ATR is
+    closed *in profit* when it gives back `scalp_giveback_frac` (45 %) of that peak. `hold_winners` never overrides it.
+    It only ever closes a basket whose net is positive.
+* `sniper_enabled` (default ON, needs `m1_only`) - **M1 wick-rejection entry**: BUY only after a LOWER wick, SELL only after an
+  UPPER wick, at the open of the next M1 bar (or inside the bar once the pullback wick has formed), and not while the bar is
+  already running away. Heuristic score (not a calibrated probability):
+  `score = 0.40 x wick + 0.20 x close-position + 0.25 x trend alignment + 0.15 x (1 - chase)`
+  (wick = rejection wick / range / 0.6; close-position = close in our half of the bar; trend = d x M1 bias / 0.4; chase = the
+  forming bar's body already with the trade / `sniper_chase_atr`). Needs wick >= `sniper_min_wick` (0.30), score >=
+  `sniper_min_score` (0.50). It gates both the every-bar entry and the normal threshold entry (so no more selling the break of the
+  M1 low). Switch off with `sniper_enabled` = 0.
+* `compound_enabled` (default ON) - **anti-martingale**: after each winning basket on a symbol the next basket's lot is
+  x(1 + `compound_step` (0.25) x consecutive wins), capped at `compound_max_mult` (2.0); any losing basket resets it (and the existing
+  "never size up after a loss" cap still applies). The batch stop-risk budget, lot, margin and exposure caps are never exceeded
+  (the order count shrinks instead).
+* Unchanged: every order keeps its broker SL, no averaging down, no hedge, no recovery lots. These are reasoned rule changes,
+  NOT back-tested on real data - the live demo results decide.
+
 ## t46u — M1 fast trend mode + hold winners (owner request)
 
 * `m1_only` (default ON): entries are scored on **M1 only** - EMA trend, MACD, RSI and tick force. The M5 momentum family, the
@@ -529,7 +559,7 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   basket, price is too close to the stop, the basket's stop already reached break-even / trail, after `ladder_ttl_s` (240 s), or
   when any cap (positions / lots / margin / total risk) says no. If price never pulls back, the reserve is simply not used.
   Adding in the main direction stays: the pyramid add (protected winner, shallow pullback that resumes) and the every-bar stack.
-* No martingale, no lot growth, no hedge, no recovery lots.
+* No martingale, no hedge, no recovery lots (t47u adds lot growth only AFTER winning baskets, see above).
 
 ## t45u — Structure-to-Liquidity precision entry (owner spec)
 

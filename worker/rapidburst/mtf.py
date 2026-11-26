@@ -97,6 +97,14 @@ class TFState:
     sbreak: int = 0              # +1 price is above the last swing high (break up), -1 below the last swing low
     swing_hi: float = 0.0
     swing_lo: float = 0.0
+    # t47u candle anatomy (sniper entry): last CLOSED bar wicks / close position as fractions of its range, and the forming bar's
+    prev_lo_wick: float = 0.0    # (min(open, close) - low) / range of the last closed bar
+    prev_up_wick: float = 0.0    # (high - max(open, close)) / range
+    prev_close_pos: float = 0.5  # (close - low) / range
+    prev_range_x: float = 0.0    # last closed bar range / average range
+    live_lo_wick: float = 0.0    # same for the forming bar (0 until its range is >= 0.2 average range)
+    live_up_wick: float = 0.0
+    bar_age: float = 0.0         # seconds since the forming bar opened
 
     def brief(self) -> dict:
         r = lambda x, n=2: None if x is None else round(x, n)   # noqa: E731
@@ -270,6 +278,18 @@ class TF:
             out.sbreak = 1
         elif pl and lv["close"] < pl[-1]:
             out.sbreak = -1
+        pb = recent[-1]
+        prng = pb["high"] - pb["low"]
+        if prng > 0:
+            out.prev_lo_wick = (min(pb["open"], pb["close"]) - pb["low"]) / prng
+            out.prev_up_wick = (pb["high"] - max(pb["open"], pb["close"])) / prng
+            out.prev_close_pos = (pb["close"] - pb["low"]) / prng
+            out.prev_range_x = prng / ar
+        lrng = lv["high"] - lv["low"]
+        if lrng >= 0.2 * ar:
+            out.live_lo_wick = (min(lv["open"], lv["close"]) - lv["low"]) / lrng
+            out.live_up_wick = (lv["high"] - max(lv["open"], lv["close"])) / lrng
+        out.bar_age = max(0.0, now - lv["time"])
         ext = pos
         if ext > 1.5 and p.hist < h1 and h1 < h2:
             out.exhaust = 1
@@ -356,6 +376,37 @@ def m1_timing(s: TFState, d: int, bias: float) -> float:
     if s.exhaust == d:
         x -= 0.2
     return _clip(x, 0.0, 1.0)
+
+
+def m1_sniper(s: TFState, d: int, bias: float, min_wick: float = 0.30, min_score: float = 0.50,
+              chase_atr: float = 0.60) -> tuple[bool, float, str]:
+    """t47u M1 wick-rejection sniper score for direction d (+1 BUY after a LOWER wick, -1 SELL after an UPPER wick).
+    HEURISTIC, not a calibrated probability:  score = 0.40 wick + 0.20 close-position + 0.25 trend alignment + 0.15 (1 - chase)
+      wick   = the larger of the last closed bar's rejection wick and the forming bar's (fraction of range), /0.6, clipped 0..1
+      close  = last closed bar closed in our half of its range ((pos - 0.4) / 0.5)
+      trend  = M1 bias with the trade (d x bias / 0.4)
+      chase  = the forming bar already moved with the trade (d x body / chase_atr)
+    OK = wick >= min_wick and score >= min_score and chase < 1 (not already running away from the wick)."""
+    if not s.ready or s.prev_range_x <= 0:
+        return False, 0.0, "no M1 candle data"
+    wick = max(s.prev_lo_wick, s.live_lo_wick) if d > 0 else max(s.prev_up_wick, s.live_up_wick)
+    cpos = s.prev_close_pos if d > 0 else 1.0 - s.prev_close_pos
+    wick_n = _clip(wick / 0.6, 0.0, 1.0)
+    close_n = _clip((cpos - 0.4) / 0.5, 0.0, 1.0)
+    cont = _clip(d * bias / 0.4, 0.0, 1.0)
+    chase = _clip(d * s.body / max(chase_atr, 1e-6), 0.0, 1.0)
+    score = 0.40 * wick_n + 0.20 * close_n + 0.25 * cont + 0.15 * (1.0 - chase)
+    side = "BUY" if d > 0 else "SELL"
+    kind = "lower" if d > 0 else "upper"
+    txt = (f"{side} sniper {score:.2f}: {kind} wick {wick:.0%} of the bar, close {cpos:.0%} of range, trend {d * bias:+.2f}, "
+           f"chase {chase:.0%}")
+    if chase >= 1.0:
+        return False, score, txt + f" - bar already ran {d * s.body:.2f} of the average range (chasing), waiting for the next wick"
+    if wick < min_wick:
+        return False, score, txt + f" - waiting for a {kind} wick >= {min_wick:.0%}"
+    if score < min_score:
+        return False, score, txt + f" - score < {min_score:.2f}"
+    return True, score, txt
 
 
 class MTF:

@@ -103,7 +103,7 @@ def test_a_winning_basket_is_not_closed_by_a_soft_exit_while_the_trend_holds(tmp
 # ------------------------------------------------------------------ every M1 bar
 def test_decide_gives_an_m1_bar_side_even_when_nothing_passes_the_threshold():
     from tests.test_mtf import _live, _view
-    cfg = EngineConfig(precision_enabled=False, mb_threshold=0.95)
+    cfg = EngineConfig(precision_enabled=False, mb_threshold=0.95, sniper_enabled=False)
     up = mb.decide(_live(mtf=_view(0.6)), cfg)
     assert up.bar_side == "BUY" and "M1 BAR ENTRY" in up.bar_reason
     assert mb.decide(_live(mtf=_view(-0.6)), cfg).bar_side == "SELL"

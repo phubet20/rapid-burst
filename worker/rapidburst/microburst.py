@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from statistics import median
 from typing import Optional
 
+from .mtf import m1_sniper
+
 
 def _clip(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return lo if x < lo else hi if x > hi else x
@@ -799,6 +801,13 @@ def decide(m: Micro, cfg) -> Strength:
         st.bar_side = "BUY" if bd > 0 else "SELL"
         st.bar_reason = (f"M1 BAR ENTRY {st.bar_side}: M1 trend bias {bias:+.2f} (M1 indicators), BUY {b:.2f} vs SELL {s:.2f} "
                          f"- no threshold / agreement wait")
+        if getattr(cfg, "sniper_enabled", False):
+            # t47u: the bar entry is the SNIPER - only after the pullback wick (BUY: lower wick, SELL: upper wick) and not chasing
+            ok_s, sc_s, txt_s = m1_sniper(v1.m1, bd, bias, cfg.sniper_min_wick, cfg.sniper_min_score, cfg.sniper_chase_atr)
+            if ok_s:
+                st.bar_reason = f"M1 SNIPER ENTRY (M1 bar open / wick): {txt_s}"
+            else:
+                st.bar_side, st.bar_reason = "", f"M1 sniper waiting: {txt_s}"
     # DUAL-SIDE: each side is checked on its OWN evidence (threshold, vetoes, agreement); a weak or vetoed
     # side never implies the other one and never blocks it. The side that passes must also beat the other
     # side's raw score by the edge (no SELL into a strong up-move just because BUY was vetoed for chasing).
@@ -846,6 +855,12 @@ def decide(m: Micro, cfg) -> Strength:
         st.reason = res[first][1] + ("" if res[-first][1] == res[first][1] else f" | {res[-first][1]}")
         return st
     d = ok[0]
+    if (getattr(cfg, "sniper_enabled", False) and getattr(cfg, "m1_only", False) and v1 is not None and v1.m1.ready):
+        # t47u: a threshold signal is also taken only on the M1 wick (no chasing the break of the M1 low / high)
+        ok_s, sc_s, txt_s = m1_sniper(v1.m1, d, float(v1.bias), cfg.sniper_min_wick, cfg.sniper_min_score, cfg.sniper_chase_atr)
+        if not ok_s:
+            st.reason = f"{res[d][1]} | M1 sniper waiting: {txt_s}"
+            return st
     st.side = "BUY" if d > 0 else "SELL"
     st.origin = m.origin_up if d > 0 else m.origin_dn
     st.reason = res[d][1]

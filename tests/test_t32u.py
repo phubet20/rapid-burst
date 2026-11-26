@@ -42,7 +42,7 @@ def test_indicators_chop_and_sr_proximity():
 
 
 def test_confluence_family_f_vetoes_against_and_requires_d():
-    cfg = EngineConfig(precision_enabled=False, add_enabled=True)
+    cfg = EngineConfig(precision_enabled=False, add_enabled=True, sniper_enabled=False)
     good = ind.IndView(ready=True, votes={k: 0.8 for k in ind.NAMES}, adx=30.0)
     bad = ind.IndView(ready=True, votes={k: -0.8 for k in ind.NAMES}, adx=30.0)
     st = decide(_live(mtf=_view(0.7), ind=good), cfg)
@@ -76,7 +76,7 @@ def test_safe_mode_peak_is_closed_balance_not_a_floating_spike():
 
 def test_structure_stop_beyond_swing_clamped_to_atr():
     tr = Trader.__new__(Trader)
-    tr.cfg = EngineConfig(precision_enabled=False, add_enabled=True)
+    tr.cfg = EngineConfig(precision_enabled=False, add_enabled=True, sniper_enabled=False)
     v = _view(0.6)
     v.m1.swing_lo, v.m1.swing_hi = 99.2, 101.5
     m = SimpleNamespace(atr=1.0, spread=0.1, ask=100.05, bid=99.95, mtf=v)
