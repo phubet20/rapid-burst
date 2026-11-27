@@ -505,6 +505,34 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   `regime_mid_penalty` 0.06 -> 0.10 (middle of a sideways range); `mb_edge` 0.03 -> 0.06 (a near-tie BUY/SELL is
   noise). These are reasoned changes, NOT back-tested on real data.
 
+## t50u — Shadow lab + TP-ladder (owner request: "copy the clip's capability")
+
+The TikTok clip that was analysed (a "FLASH AI BOT" page asking for MT5 credentials) shows balances rising by exactly 50.00 per
+cycle, BUY positions with identical profit but different prices below their entry, and deals that all close at +5.00 - the screens
+are scripted, so there is nothing to copy 1:1. What IS reproducible and testable is its visible mechanics: several equal orders
+at one entry with take-profits stepped by a small distance. This release builds that as a MEASURED strategy:
+
+* **Shadow lab** (`worker/rapidburst/shadow.py`, on by default, never sends an order): once per M1 bar, `shadow_confirm_s` (6 s)
+  after the bar opened, six rules look at the tape - `wick`, `flow` (tick imbalance + 5 s efficiency + tick run), `mom`
+  (velocity + acceleration), `loc` (swing location + rejection), `combo` (>= 3 of 4 agree, none against) and `ctrl` (alternating
+  BUY/SELL, the no-information control). Each opinion becomes a virtual entry at the real ask/bid and is scored NET of the spread:
+  the move after 1/3/5 minutes (win %, mean in ATR) and the TP ladder (`shadow_levels` legs, leg k at k x `shadow_step_atr` ATR,
+  one stop `shadow_sl_atr` ATR behind, whatever is open leaves after 3 minutes): per-leg hit rate, stop rate, ATR per leg.
+  Verdict: `collecting` below `shadow_min_n`, `positive` only with ladder mean > 0 and z >= 2, `negative`/`no edge` otherwise.
+  The table is in the app ("Shadow lab & TP-ladder") and in the snapshot (`shadow`). It is kept in `shadow.json` in the data dir
+  (on Render's free disk that is wiped by a redeploy). Statistics from other ladder settings are discarded, not mixed.
+* **Shadow only**: `entries_enabled=0` (button in the app): START runs the feed and the lab but never opens a position - collect
+  2-3 days on a demo, then look at the table.
+* **TP-ladder entry** (`tpl_enabled`, OFF by default): the only entry source while on. Fires once per bar for `tpl_rule`
+  (default `combo`) and only while the lab shows that rule `positive` (`tpl_require_evidence`, default on - switch it off only
+  knowingly). Opens `shadow_levels` equal legs (lot from the 40 % margin allocation, capped by the stop-risk budget), broker TP
+  on leg k at fill + k x step (never closer than the broker stops level + spread), one shared broker stop. The basket has one
+  owner: the broker TPs/stop, a TIME exit (`tpl_max_hold_s`, the lab's window) and FLOW TURNED (imbalance and efficiency against
+  it >= 1 s). No adds, no break-even/trail/soft exits fight it. One basket per symbol at a time (no hedging rule).
+* Honest limits: a small-target ladder wins often and loses rarely-but-big; the first legs can be smaller than the gold spread
+  (the lab skips bars whose spread is > `shadow_max_spread_atr` of ATR); real fills, slippage and latency differ from the lab.
+  Nothing here is a profit guarantee and none of it is validated on live data yet.
+
 ## t49u — no account locks, no bot-vs-bot collisions (owner request)
 
 * Any MT5 account of any broker (demo / contest / real, any server, any symbol naming) connects and trades. The account-type

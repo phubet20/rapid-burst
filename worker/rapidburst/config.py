@@ -66,6 +66,10 @@ TUNABLE = {
     "ip_be_atr": (0.2, 3.0), "ip_trail_atr": (0.3, 4.0), "ip_m5_flip": (0.1, 0.9), "ip_stale_s": (20.0, 900.0),
     "alloc_enabled": (0, 1), "alloc_margin_pct": (5.0, 90.0),
     "avoid_foreign_conflict": (0, 1), "ip_single_owner": (0, 1),
+    "shadow_enabled": (0, 1), "shadow_confirm_s": (2.0, 30.0), "shadow_wick": (0.2, 0.7), "shadow_step_atr": (0.05, 0.6),
+    "shadow_levels": (1, 10), "shadow_sl_atr": (0.4, 3.0), "shadow_max_spread_atr": (0.05, 1.0), "shadow_min_n": (20, 2000),
+    "entries_enabled": (0, 1), "tpl_enabled": (0, 1), "tpl_require_evidence": (0, 1), "tpl_max_hold_s": (30.0, 600.0),
+    "tpl_flip_imb": (0.1, 0.9),
     "compound_enabled": (0, 1), "compound_step": (0.05, 1.0), "compound_max_mult": (1.0, 4.0),
     "ladder_enabled": (0, 1), "ladder_first_frac": (0.25, 1.0), "ladder_step_atr": (0.15, 1.5), "ladder_levels": (1, 4), "ladder_ttl_s": (30, 1800), "hold_flip_bias": (0.1, 0.8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
@@ -338,6 +342,22 @@ class EngineConfig:
     # symbol, opposite side); (2) an impulse-pullback basket has ONE owner - only its own exits (hard stop, protect/trail,
     # _ip_exit) close it, the older soft exit families (micro/zone/reversal) never fight it
     avoid_foreign_conflict: bool = True
+    # t50u SHADOW LAB (rule hit-rates measured on the live feed, no orders) and the TP-LADDER entry that trades only what the lab
+    # has proven. entries_enabled=0 = "shadow only": START runs the feed + lab but never opens a position.
+    entries_enabled: bool = True
+    shadow_enabled: bool = True
+    shadow_confirm_s: float = 6.0          # evaluate this many seconds after the M1 bar opened
+    shadow_wick: float = 0.35              # min wick / range of the last closed bar for the wick rule
+    shadow_step_atr: float = 0.15          # take-profit step of ladder leg k = k * step (ATR of M1), net of the spread
+    shadow_levels: int = 5                 # legs of the ladder
+    shadow_sl_atr: float = 1.0             # the ladder's shared stop (ATR) behind the entry
+    shadow_max_spread_atr: float = 0.35    # spread above this share of ATR: no observation / no entry (cost eats the target)
+    shadow_min_n: int = 100                # observations before a verdict other than "collecting"
+    tpl_enabled: bool = False              # LIVE TP-ladder entries (off by default)
+    tpl_rule: str = "combo"                # which lab rule triggers it (wick/flow/mom/loc/combo)
+    tpl_require_evidence: bool = True      # trade only while the lab shows this rule 'positive' (n>=min_n, ladder>0, z>=2)
+    tpl_max_hold_s: float = 180.0          # what is still open leaves after this long (matches the lab's ladder window)
+    tpl_flip_imb: float = 0.35             # ... or when the tick imbalance turns this far against the basket
     ip_single_owner: bool = True
     ip_m5_bias_min: float = 0.15
     ip_impulse_atr: float = 2.2

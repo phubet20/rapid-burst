@@ -28,6 +28,7 @@ from .config import TUNABLE, EngineConfig, validate_tune
 from .engine import MomentumEngine, PositionState
 from .risk import AccountView, EntryPacer, OpenPos, RiskGuard, SizeResult, size_position
 from .mtf import MTF
+from .shadow import ShadowLab
 from . import indicators as ind
 from concurrent.futures import ThreadPoolExecutor
 from .microburst import Micro, Strength, decide, exit_reason, exit_signals
@@ -105,6 +106,8 @@ class Trader:
         self._exit_held_log: dict = {}
         self.exits_filtered = 0
         self._prec = precision.Analyzer()  # t45u: structure / OB / liquidity cache per closed M5 bar
+        self.shadow = ShadowLab(os.path.join(data_dir, "shadow.json"), cfg.shadow_step_atr, cfg.shadow_levels, cfg.shadow_sl_atr)
+        self._tpl_pend: dict = {}          # t50u: basket key -> first time the flow was seen against it
         self._ip_used: dict = {}           # t48u: (symbol, impulse key) -> wall time: one entry per pullback
         self._pe_used: dict = {}           # t45u: (symbol, setup key) -> wall time of its entry (one entry per structure event)
         self._pe_log: dict = {}
@@ -247,6 +250,7 @@ class Trader:
                 setattr(self.cfg, k, v)
                 self.tune[k] = v
                 changed[k] = {"old": old, "new": v}
+            self.shadow.configure(self.cfg.shadow_step_atr, self.cfg.shadow_levels, self.cfg.shadow_sl_atr)
             if self.cfg.m1_only:                       # t46u: the M1 fast mode owns these (never no-SL, no M5 precision plan)
                 self.cfg.precision_enabled = False
                 self.cfg.no_stop_mode = False
@@ -975,7 +979,14 @@ class Trader:
                     except Exception:  # noqa: BLE001 - no structure view = no entry (decide() reports it), never a crash
                         log.exception("precision analysis failed for %s", s)
                         m.prec = None
+            if cfg.shadow_enabled and self.running:
+                try:
+                    self.shadow.feed(s, m, now, cfg)
+                except Exception:  # noqa: BLE001 - the lab only observes; it can never break trading
+                    log.exception("shadow lab failed for %s", s)
             st = decide(m, cfg)
+            if cfg.tpl_enabled and m.ready:
+                st = self._tpl_signal(s, m, st, now)
             add = self.pacer.threshold_add(s)
             if add and st.side != "NO TRADE":
                 best = st.buy if st.side == "BUY" else st.sell
@@ -992,6 +1003,27 @@ class Trader:
             f.score = st.score
         self._mcache[s] = (now_wall, m, st)
         return m, st
+
+    def _tpl_signal(self, s: str, m, st, now: float):
+        """t50u: the TP-ladder entry is the ONLY entry source while tpl_enabled. It fires once per M1 bar at the lab's confirm
+        point, only for a rule the lab has proven (unless the evidence gate is switched off) and only when the cost is small."""
+        cfg = self.cfg
+
+        def wait(why: str):
+            return dc_replace(st, side="NO TRADE", buy=0.0, sell=0.0, reason=f"TP-LADDER waiting: {why}", tpl={})
+        why_ev = "evidence gate off"
+        if cfg.tpl_require_evidence:
+            ok, why_ev = self.shadow.evidence(s, cfg.tpl_rule, cfg.shadow_min_n)
+            if not ok:
+                return wait(why_ev)
+        if m.atr <= 0 or m.spread > cfg.shadow_max_spread_atr * m.atr:
+            return wait(f"spread {m.spread:.5g} is more than {cfg.shadow_max_spread_atr:.0%} of ATR - the cost would eat the targets")
+        sg = self.shadow.fire(s, cfg.tpl_rule, 90.0, now)
+        if not sg:
+            return wait(f"no '{cfg.tpl_rule}' signal at this bar's confirm point (+{cfg.shadow_confirm_s:g}s)")
+        side = "BUY" if sg["d"] > 0 else "SELL"
+        return dc_replace(st, side=side, buy=0.9 if sg["d"] > 0 else 0.0, sell=0.9 if sg["d"] < 0 else 0.0, threshold=0.5,
+                          reason=f"TP-LADDER {cfg.tpl_rule} {side} ({why_ev})", tpl=sg, ip_key=(), ip_stop=0.0, ip_info={})
 
     def _status(self, s: str, m, st, now_wall: float) -> dict:
         info = self.sym_info.get(s) or {}
@@ -1060,6 +1092,8 @@ class Trader:
                 if self._ladder_step(s, mine, g, m, st, info, status, now_wall, t_dec):
                     continue
                 why_not = self._add_check(s, mine, g, m, st, now_wall)
+                if g.get("tpl"):
+                    why_not = "TP-ladder basket: one basket per bar, never added to"
                 status["reason"] = (f"managing {mine[0].side} basket {mine[0].batch_id} ({len(mine)} order(s), "
                                     f"net {g.get('net_px', 0.0):+.5g}, protection {g.get('prot') or 'hard stop'}, "
                                     f"momentum {g.get('momentum', '-')}) - add: {why_not or 'now'}")
@@ -1379,6 +1413,15 @@ class Trader:
                 lo_ip = max(stops, 3.0 * m.spread, cfg.sl_min_atr * atr_ip)
                 dist_ip = d * (ref_ip - ip_stop) + m.spread + cfg.sl_struct_buffer_atr * atr_ip
                 sl_dist, sl_src = max(lo_ip, min(max(lo_ip, cfg.sl_max_atr * atr_ip), dist_ip)), "beyond the pullback extreme (impulse failed if taken out)"
+        tpl = dict(getattr(st, "tpl", None) or {}) if cfg.tpl_enabled else {}
+        tp_step = 0.0
+        if tpl:
+            # t50u TP-ladder: one shared stop sl_atr behind the entry (as measured by the lab), leg k takes profit at k * step
+            atr_t = m.atr or self._atr(s)[0]
+            if atr_t <= 0:
+                return self._skip(s, status, "TP-ladder: ATR unknown", now_wall) or False
+            sl_dist, sl_src = max(cfg.shadow_sl_atr * atr_t, stops, 3.0 * m.spread), "TP-ladder stop (lab-measured distance)"
+            tp_step = max(cfg.shadow_step_atr * atr_t, stops + m.spread)
         ts, tv = self._tv(s)
         acct = self._acct()
         sig = Signal(side, st.score, st.reason, self.engines[s].last)
@@ -1415,7 +1458,9 @@ class Trader:
             n = max(n_min, 1 + int(round(7 * sq)))
             if m.regime in ("quiet", "chop"):
                 n = min(n, max(2, n_min))           # weak tape: small baskets only
-        mult = float(getattr(learn, "mult", 1.0) or 1.0) if learn is not None else 1.0
+        if tpl:
+            n = max(1, min(cfg.shadow_levels, cfg.max_orders_per_batch))      # one leg per ladder level, never scaled up
+        mult = float(getattr(learn, "mult", 1.0) or 1.0) if learn is not None and not tpl else 1.0
         if mult > 1.0:
             n = int(round(n * mult))                # learning: a proven setup gets more orders
         n = max(1, min(n, cfg.max_orders_per_batch, cfg.max_positions_per_symbol))
@@ -1552,7 +1597,7 @@ class Trader:
         sl = (ref - d * sl_dist) if (cfg.broker_sl and not cfg.no_stop_mode) else 0.0   # t38u: no per-order SL
         ladder = None
         atr_l = (m.atr or self._atr(s)[0] or (sl_dist / max(cfg.sl_atr, 0.1))) if cfg.ladder_enabled else 0.0
-        if cfg.ladder_enabled and sl and n >= 2 and not floor and atr_l:
+        if cfg.ladder_enabled and sl and n >= 2 and not floor and atr_l and not tpl:
             # t46u: only the first tranche goes now; the rest waits for a pullback (same lot, same structural stop)
             step = cfg.ladder_step_atr * atr_l
             levels = min(cfg.ladder_levels, int((0.8 * sl_dist) // step)) if step > 0 else 0
@@ -1566,7 +1611,8 @@ class Trader:
         self.pacer.inflight.add(s)
         try:
             if bool(getattr(self.broker, "concurrent_io", False)) and n > 1:
-                futs = [self._io.submit(self._send_raw, s, side, size.volume, sl, dev, f"{cfg.comment_prefix}-{gid}-{i + 1}")
+                futs = [self._io.submit(self._send_raw, s, side, size.volume, sl, dev, f"{cfg.comment_prefix}-{gid}-{i + 1}",
+                                        (ref + d * (i + 1) * tp_step) if tpl else 0.0)
                         for i, _ in plans]
                 for (i, _), fu in zip(plans, futs):
                     r, t_send, t_fill = fu.result()
@@ -1591,7 +1637,8 @@ class Trader:
                             why_stop = f"spread widened to {sp:.5g}"
                         if why_stop:
                             break
-                    r, t_send, t_fill = self._send_raw(s, side, size.volume, sl, dev, f"{cfg.comment_prefix}-{gid}-{i + 1}")
+                    r, t_send, t_fill = self._send_raw(s, side, size.volume, sl, dev, f"{cfg.comment_prefix}-{gid}-{i + 1}",
+                                                       (ref + d * (i + 1) * tp_step) if tpl else 0.0)
                     if not self._book_fill(s, side, i, n, gid, size, sl, sl_dist, m, st, info, now_wall, t_dec, r, t_send, t_fill, floor):
                         why_stop = why_stop or "order not filled"
                         break
@@ -1650,7 +1697,13 @@ class Trader:
         if iv is not None and getattr(iv, "ready", False):
             g["ind_votes"] = {k: round(d * x, 3) for k, x in iv.votes.items()}      # toward the trade side
         g["sl_src"] = sl_src
-        if getattr(st, "ip_key", ()) and cfg.ip_enabled:
+        if tpl:
+            g["tpl"] = {"rule": tpl.get("rule"), "bar": tpl.get("bar"), "step": tp_step, "legs": n, "t0": now_wall,
+                        "ref": ref, "stop": ref - d * sl_dist}
+            self.add_log("INFO", f"TP-LADDER {gid} {side} {s} [{tpl.get('rule')}]: {opened}/{n} leg(s) of {size.volume:g} lot, leg k "
+                                 f"takes profit at {ref:.5g} {'+' if d > 0 else '-'} k x {tp_step:.5g}, shared stop {ref - d * sl_dist:.5g}, "
+                                 f"what is left leaves after {cfg.tpl_max_hold_s:.0f}s or when the tick flow turns")
+        if getattr(st, "ip_key", ()) and cfg.ip_enabled and not tpl:
             g["ip"] = {"key": list(st.ip_key), "stop": float(st.ip_stop), "start": float(st.ip_info.get("start", 0.0)),
                        "end": float(st.ip_info.get("end", 0.0)), "retr": round(float(st.ip_info.get("retr", 0.0)), 3),
                        "t0": now_wall, "best": 0.0}
@@ -1712,10 +1765,10 @@ class Trader:
                                   f"of equity ({cap:.2f})")
         return ok, why, margin
 
-    def _send_raw(self, s, side, volume, sl, dev, comment):
+    def _send_raw(self, s, side, volume, sl, dev, comment, tp: float = 0.0):
         t_send = time.time()
         try:
-            r = self.broker.market_order(s, side, volume, sl, 0.0, dev, self.cfg.magic, comment[:31])
+            r = self.broker.market_order(s, side, volume, sl, tp, dev, self.cfg.magic, comment[:31])
         except Exception as exc:  # noqa: BLE001
             r = {"ok": False, "msg": f"{type(exc).__name__}: {exc}"}
         return r, t_send, time.time()
@@ -1836,16 +1889,19 @@ class Trader:
                     legs = legs or []
                     if not reason:
                         continue
-            if not reason and self.running and not cfg.no_stop_mode:
+            tpl_owned = bool(cfg.tpl_enabled and (self.bursts.get(key) or {}).get("tpl"))
+            if not reason and tpl_owned and self.running:
+                reason = self._tpl_exit(key, legs, m, now_wall)                      # t50u: the TP-ladder basket's only discretionary exit
+            if not reason and self.running and not cfg.no_stop_mode and not tpl_owned:
                 # BE / trailing; its only exit is "protection failed" (stop not confirmed by MT5) = a RISK exit, never delayed
                 reason = self._protect_basket(key, legs, live, m, st, now_wall)
-            if not reason and self.running and not cfg.no_stop_mode and cfg.scalp_enabled:
+            if not reason and self.running and not cfg.no_stop_mode and cfg.scalp_enabled and not tpl_owned:
                 reason, part = self._scalp_exit(key, legs, live, m, now_wall)        # t47u: bank short, never give a winner back
                 if part:
                     legs = part                                                      # partial take-profit: only these legs
-            if not reason and self.running and not cfg.no_stop_mode and cfg.ip_enabled and (self.bursts.get(key) or {}).get("ip"):
+            if not reason and self.running and not cfg.no_stop_mode and cfg.ip_enabled and not tpl_owned and (self.bursts.get(key) or {}).get("ip"):
                 reason = self._ip_exit(key, legs, live, m, now_wall)                  # t48u: a loss leaves fast
-            ip_owned = bool(cfg.ip_single_owner and cfg.ip_enabled and (self.bursts.get(key) or {}).get("ip"))
+            ip_owned = tpl_owned or bool(cfg.ip_single_owner and cfg.ip_enabled and (self.bursts.get(key) or {}).get("ip"))
             if not reason and self.running and not cfg.no_stop_mode and not ip_owned:
                 grp = self.bursts.get(key) or {}
                 lq = self._liq_exit(key, legs, live, m, now_wall) if (cfg.precision_enabled and grp.get("plan")) else None
@@ -1909,6 +1965,29 @@ class Trader:
                          + ", ".join(closed))
             self._refresh_account()
             self._adopt_positions()          # book the closed basket now: the same loop can re-enter on a fresh signal
+
+    def _tpl_exit(self, key: str, legs: list, m, now_wall: float) -> Optional[str]:
+        """t50u: a TP-ladder basket is closed by its broker take-profits (leg by leg), the shared broker stop, and only these two:
+        TIME (the lab's ladder window ended - the rest leaves at that minute's price) and FLOW TURNED (tick imbalance and tape
+        efficiency both against the basket for >= 1 s)."""
+        cfg = self.cfg
+        tp = (self.bursts.get(key) or {}).get("tpl")
+        if not tp or not legs:
+            return None
+        age = now_wall - float(tp.get("t0", now_wall))
+        if age >= cfg.tpl_max_hold_s:
+            return f"TP-LADDER TIME: {age:.0f}s - the legs still open leave at this minute's price (the lab's ladder window)"
+        d = 1 if legs[0].side == "BUY" else -1
+        turned = bool(m.ready and age >= 8.0 and d * m.imbalance <= -cfg.tpl_flip_imb and d * m.eff <= -0.2)
+        pend = self._tpl_pend
+        if not turned:
+            pend.pop(key, None)
+            return None
+        t0 = pend.setdefault(key, now_wall)
+        if now_wall - t0 >= 1.0:
+            pend.pop(key, None)
+            return f"TP-LADDER FLOW TURNED: imbalance {m.imbalance:+.2f}, efficiency {m.eff:+.2f} against the basket"
+        return None
 
     def _ip_exit(self, key: str, legs: list, live: dict, m, now_wall: float) -> Optional[str]:
         """t48u: exits of an impulse-pullback basket that cut a LOSS fast (a winner is only held / trailed, see _protect_basket):
@@ -2911,6 +2990,8 @@ class Trader:
                 self._validate()
             self._update_candles(now_wall)
             self._manage_exits(now_wall)
+            if self.cfg.shadow_enabled:
+                self.shadow.save(now_wall)
             if self.running:
                 self._log_why(now_wall)
             if self.risk.catastrophic and self.own_positions and not self.cfg.no_stop_mode:
@@ -2919,7 +3000,13 @@ class Trader:
                 self.flatten_pending = not self._flatten("STOP retry")["ok"]
             if self.running and not self.stopping and self.cfg.no_stop_mode:
                 self.guardian.scan(now_wall)                # t42u: loss guardian, every loop
-            if self.running and not self.stopping and self.validation.get("ok") and (not self.risk.halted
+            if self.running and not self.stopping and not self.cfg.entries_enabled:
+                for s in list(self.engines):         # t50u SHADOW ONLY: the feed, the lab and the exits run; no entry is ever sent
+                    m, st = self._micro(s, now_wall)
+                    status = self._status(s, m, st, now_wall)
+                    status["signal"], status["reason"] = "HOLD", "SHADOW ONLY (entries_enabled=0): measuring, not trading"
+                    self.sym_status[s] = status
+            elif self.running and not self.stopping and self.validation.get("ok") and (not self.risk.halted
                                                                                     or self.cfg.no_stop_mode):
                 self._try_entries(now_wall)
             elif self.running and self.risk.halted:
@@ -3009,7 +3096,7 @@ class Trader:
                               f"< {c.emergency_margin_level_pct:g}% or data-feed loss)") if c.no_stop_mode
                              else ("ON" if c.broker_sl else "OFF"), "exec_halt": self.exec_halt,
                 "no_stop_mode": c.no_stop_mode, "nostop_margin_use_pct": c.nostop_margin_use_pct,
-                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "scalp_enabled": c.scalp_enabled, "sniper_enabled": c.sniper_enabled, "compound_enabled": c.compound_enabled, "ip_enabled": c.ip_enabled, "avoid_foreign_conflict": c.avoid_foreign_conflict, "ip_single_owner": c.ip_single_owner, "alloc_enabled": c.alloc_enabled, "alloc_margin_pct": c.alloc_margin_pct, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
+                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "scalp_enabled": c.scalp_enabled, "sniper_enabled": c.sniper_enabled, "compound_enabled": c.compound_enabled, "ip_enabled": c.ip_enabled, "tpl_enabled": c.tpl_enabled, "tpl_rule": c.tpl_rule, "entries_enabled": c.entries_enabled, "shadow_enabled": c.shadow_enabled, "avoid_foreign_conflict": c.avoid_foreign_conflict, "ip_single_owner": c.ip_single_owner, "alloc_enabled": c.alloc_enabled, "alloc_margin_pct": c.alloc_margin_pct, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
                 "batch_margin_pct": c.batch_margin_pct, "avg_max_layers": c.avg_max_layers, "avg_lot_mult": c.avg_lot_mult,
                 "avg_spacing_atr": c.avg_spacing_atr, "hedge_enabled": c.hedge_enabled, "recovery_after_s": c.recovery_after_s,
                 "recovery_loss_pct": c.recovery_loss_pct, "cycle_tp_pct": c.cycle_tp_pct, "recoveries": dict(self.recoveries),
@@ -3214,6 +3301,7 @@ class Trader:
                          "margin_free": acct.get("margin_free"), "margin_level": acct.get("margin_level"),
                          "profit": acct.get("profit")} if acct else None),
             "validation": self.validation,
+            "shadow": self.shadow.view(self.cfg.shadow_min_n) if self.cfg.shadow_enabled else None,
             "engine": {"running": self.running, "start_wall": getattr(self, "start_wall", None), "halted": self.risk.halted, "halt_reason": self.risk.halt_reason,
                        "blocked": self.unverified_entry, "batch": self.batch, "symbols": self._symbol_view(),
                        "selected": self.selected, "live_allowed": self.allow_live,

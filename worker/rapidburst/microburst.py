@@ -586,6 +586,7 @@ class Strength:
     ip_key: tuple = ()                             # t48u: (leg start time, leg end time) of the impulse -> one entry per pullback
     ip_stop: float = 0.0                           # t48u: the pullback extreme (the structural stop goes beyond it)
     ip_info: dict = field(default_factory=dict)
+    tpl: dict = field(default_factory=dict)        # t50u: TP-ladder signal {"rule","d","bar","atr"} (see shadow.ShadowLab.fire)
 
     @property
     def score(self) -> float:

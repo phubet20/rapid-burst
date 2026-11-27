@@ -49,6 +49,25 @@
     if (atBottom) box.scrollTop = box.scrollHeight;
   }
 
+  function renderShadow(s) {
+    const sh = s.shadow, rc = (s.engine || {}).risk_config || {};
+    const on = (x) => (x ? "ON" : "OFF");
+    $("btnShadowOnly").textContent = "Shadow only (no entries): " + on(rc.entries_enabled === false);
+    $("btnTpl").textContent = "TP-ladder entries: " + on(rc.tpl_enabled);
+    $("btnEvid").textContent = "Evidence gate: " + on(rc.tpl_require_evidence !== false);
+    if (!sh) { $("shMeta").textContent = "off"; $("shadow").innerHTML = '<div class="tiny muted">Lab is off (shadow_enabled=0).</div>'; return; }
+    const since = sh.since ? new Date(sh.since * 1000).toLocaleString() : "—";
+    $("shMeta").textContent = `since ${since} · ${sh.pending} open · ladder ${sh.levels} legs x ${sh.step_atr} ATR, stop ${sh.sl_atr} ATR`;
+    const v = { positive: "pos-v", negative: "neg-v" };
+    const rows = (sh.rows || []).map((r) => `<tr><td>${esc(r.sym)}</td><td><b>${esc(r.rule)}</b></td><td>${r.n}</td>` +
+      `<td>${r.win["1"]}/${r.win["3"]}/${r.win["5"]}%</td><td>${r.avg["1"]}/${r.avg["3"]}/${r.avg["5"]}</td>` +
+      `<td>${r.hit.map((x) => x + "%").join(" ")}</td><td>${r.stop_pct}%</td><td class="${r.ladder >= 0 ? "pos-v" : "neg-v"}">${r.ladder > 0 ? "+" : ""}${r.ladder}</td>` +
+      `<td class="${v[r.verdict] || "muted"}">${esc(r.verdict)} (z ${r.z_ladder})</td></tr>`).join("");
+    $("shadow").innerHTML = (rows ? `<div class="tablewrap"><table><thead><tr><th>sym</th><th>rule</th><th>n</th><th>win 1/3/5 bar</th><th>avg ATR 1/3/5</th>` +
+      `<th>leg hit rate</th><th>stop</th><th>ladder ATR/leg</th><th>verdict</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="tiny muted">No observation yet - the lab fills while the bot is STARTED (one look per M1 bar, ${esc(String(sh.min_n))} needed for a verdict).</div>`) +
+      `<div class="tiny muted">${esc(sh.note)}. ctrl = no-information control (alternating BUY/SELL): a rule is only worth trading if it beats it. Costs skipped: ${sh.skipped_cost}. This is sample evidence, not a guarantee.</div>`;
+  }
+
   function render() {
     const s = S.snapshot || {};
     const conn = s.conn || {};
@@ -117,6 +136,7 @@
     $("btnStop").disabled = false;
     $("btnConnect").textContent = conn.state === "CONNECTED" ? "RECONNECT MT5" : "CONNECT MT5";
 
+    renderShadow(s);
     $("checks").innerHTML = (val.checks || []).map((c) =>
       `<li><span>${c.ok ? "✅" : c.soft ? "⚠️" : "❌"}</span><span>${esc(c.name)}</span><span class="d">${esc(c.detail)}</span></li>`).join("")
       || `<li class="muted">${!online ? "Launcher not connected" : st === "IDLE" ? "Engine off - checks run on CONNECT MT5 / START" : "Waiting for MT5 connection"}</li>`;
@@ -247,6 +267,10 @@
   });
   $("btnStart").addEventListener("click", () => act("Starting engine + MT5 (fresh account check, ~60s tick warm-up)", () => cmd("start")));
   $("btnStop").addEventListener("click", () => act("Stopping (closing bot positions, then shutting engine + MT5 down)", () => cmd("stop")));
+  const flip = (name, cur, label) => act(label, () => cmd("tune", { values: { [name]: cur ? 0 : 1 } }));
+  $("btnShadowOnly").addEventListener("click", () => { const rc = ((S.snapshot || {}).engine || {}).risk_config || {}; flip("entries_enabled", rc.entries_enabled !== false, "Switching shadow-only"); });
+  $("btnTpl").addEventListener("click", () => { const rc = ((S.snapshot || {}).engine || {}).risk_config || {}; flip("tpl_enabled", !!rc.tpl_enabled, "Switching TP-ladder entries"); });
+  $("btnEvid").addEventListener("click", () => { const rc = ((S.snapshot || {}).engine || {}).risk_config || {}; flip("tpl_require_evidence", rc.tpl_require_evidence !== false, "Switching the evidence gate"); });
   $("btnRefresh").addEventListener("click", () => act("Refreshing", () => cmd("refresh")));
 
   let symOffset = 0, symQuery = "", symAll = [];

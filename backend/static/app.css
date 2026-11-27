@@ -53,3 +53,6 @@ main{width:100%}
 .card,.grid,.actions{max-width:100%;min-width:0}
 table.pos{table-layout:fixed}
 table.pos td,table.pos th{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tablewrap{overflow-x:auto;margin:6px 0}
+.tablewrap table{border-collapse:collapse;font-size:11px;width:100%}
+.tablewrap th,.tablewrap td{padding:3px 5px;text-align:left;white-space:nowrap;border-bottom:1px solid rgba(128,128,128,.25)}
