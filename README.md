@@ -361,9 +361,10 @@ LIVE stays disabled. Two independent gates must both be opened deliberately:
 1. **Price/execution path.** TickerAll Free refuses live accounts (`FREE_TIER_LIVE_REJECTED`).
    Either upgrade to a paid TickerAll tier that allows live accounts, or run the Windows
    launcher with a real MT5 terminal (see "Install the launcher").
-2. **Engine gate (t46u).** There is no demo-only lock any more: enter login / password / server in the app and
-   CONNECT. Only an explicit `RB_ALLOW_LIVE=0` (environment variable on Render or the Windows PC) locks REAL accounts
-   out; the web UI can never change it. The only remaining limit is the price/execution path above (TickerAll Free = demo).
+2. **Engine gate (t49u): none.** No demo/real/contest lock, no broker or server lock (not only Exness), no symbol-suffix
+   lock, no account lock: enter login / password / server in the app and CONNECT. `RB_ALLOW_LIVE` is ignored. Connecting a
+   different account while the bot trades STOPs it and closes the bot's own positions on the old account first.
+   The only remaining limit is the price/execution path above (TickerAll Free = demo; the engine speaks MT5 only).
 Test on DEMO first, then reduce `small_account_max_loss_pct` / `batch_max` for real money.
 
 ## Install the launcher (your Windows PC or a Windows VPS, elevated PowerShell)
@@ -503,6 +504,17 @@ All of this is the **account owner's explicit request on a DEMO account, risk ac
   in UP / BUY in DOWN) unless a wick tip or demand/supply zone backs it; `regime_chase_atr` 2.0 -> 1.5;
   `regime_mid_penalty` 0.06 -> 0.10 (middle of a sideways range); `mb_edge` 0.03 -> 0.06 (a near-tie BUY/SELL is
   noise). These are reasoned changes, NOT back-tested on real data.
+
+## t49u — no account locks, no bot-vs-bot collisions (owner request)
+
+* Any MT5 account of any broker (demo / contest / real, any server, any symbol naming) connects and trades. The account-type
+  check is informational only; unknown types are accepted; `RB_ALLOW_LIVE` is gone.
+* Switching account: the bot is STOPped and its own positions closed on the old account first (a failed close blocks the
+  switch so nothing is orphaned); the launcher goes back to STOPPED - press START for the new account.
+* Anti-collision: START is refused while a STOP is still closing positions; the bot never opens against a position that is
+  not its own (other EA / manual, opposite side, `avoid_foreign_conflict`) and never touches such positions (magic filter);
+  an impulse-pullback basket has one owner (`ip_single_owner`): only hard stop, protect/trail and `_ip_exit` close it;
+  one engine process per machine (engine.lock) and one worker per cloud backend as before.
 
 ## t48u — M5 trend + M1 impulse -> pullback entry, loss out fast / winner runs, lot from 40 % of equity (owner request)
 

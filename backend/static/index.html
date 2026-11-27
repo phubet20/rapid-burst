@@ -56,11 +56,11 @@
 
   <section id="connectPanel" class="card hidden">
     <form id="connectForm" autocomplete="off">
-      <div class="row"><input id="cLogin" inputmode="numeric" placeholder="MT5 login (number)" required></div>
+      <div class="row"><input id="cLogin" inputmode="numeric" placeholder="MT5 login (number) - any account" required></div>
       <div class="row"><input id="cPass" type="password" placeholder="MT5 password" required autocomplete="new-password"></div>
-      <div class="row"><input id="cServer" placeholder="Broker server, e.g. Exness-MT5Trial" required></div>
+      <div class="row"><input id="cServer" placeholder="Broker server (exactly as in MT5), any broker, demo or real" required></div>
       <div class="row"><button class="btn primary" type="submit">Encrypt &amp; connect</button></div>
-      <div class="tiny muted">Encrypted on this phone with the engine's public key (RSA-OAEP). Windows mode: stored only on your PC (DPAPI). Cloud mode: decrypted only inside the engine on the server, kept in memory (not on disk) and sent to TickerAll to open the MT5 demo session.</div>
+      <div class="tiny muted">Encrypted on this phone with the engine's public key (RSA-OAEP). Windows mode: stored only on your PC (DPAPI). Cloud mode: decrypted only inside the engine on the server, kept in memory (not on disk) and sent to TickerAll to open the MT5 session (demo or real - the account type is not restricted by the bot).</div>
     </form>
   </section>
 

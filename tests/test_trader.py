@@ -34,23 +34,19 @@ def test_real_account_allowed_by_default(tmp_path):
         assert connect_and_start(tr, br, T0 + 1)["ok"], mode
 
 
-def test_real_account_locked_only_by_server_flag(tmp_path):
-    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 900)}, trade_mode=2)
-    tr.allow_live = False            # server-side RB_ALLOW_LIVE=0
-    r = connect_and_start(tr, br, T0 + 1)
-    assert not r["ok"] and "Account type" in r["msg"]
-    run(tr, br, T0 + 1, T0 + 900)
-    assert br.sent_orders == 0
-    assert any(c["name"] == "Account type" and "RB_ALLOW_LIVE=0" in c["detail"] for c in tr.validation["checks"])
-
-
-def test_allow_live_env_parsing():
+def test_no_account_lock_even_with_old_env_flag(tmp_path):
+    """t49u: RB_ALLOW_LIVE is ignored - nothing can lock REAL / UNKNOWN account types out."""
     from rapidburst.config import allow_live_from_env
-    assert allow_live_from_env({}) is True
-    assert allow_live_from_env({"RB_ALLOW_LIVE": "I_UNDERSTAND_LIVE_RISK"}) is True
-    assert allow_live_from_env({"RB_ALLOW_LIVE": "1"}) is True
-    for v in ("0", "false", "No", "off", "demo_only", " 0 "):
-        assert allow_live_from_env({"RB_ALLOW_LIVE": v}) is False, v
+    for v in ("0", "false", "No", "off", "demo_only", " 0 ", "1", ""):
+        assert allow_live_from_env({"RB_ALLOW_LIVE": v}) is True, v
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 300)}, trade_mode=2)
+    assert connect_and_start(tr, br, T0 + 1)["ok"]
+    assert any(c["name"] == "Account type" and c["ok"] for c in tr.validation["checks"])
+
+
+def test_unknown_account_type_is_accepted(tmp_path):
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 300)}, trade_mode=7)
+    assert connect_and_start(tr, br, T0 + 1)["ok"]
 
 
 def test_switch_account_resets_per_account_state(tmp_path):
@@ -75,12 +71,23 @@ def test_same_account_reconnect_keeps_state(tmp_path):
     assert "x" in tr.bursts
 
 
-def test_switch_account_refused_while_running(tmp_path):
+def test_switch_account_while_running_stops_first(tmp_path):
+    """t49u: connecting a different account is not refused - the bot is stopped (positions closed) on the old one first."""
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 300)})
     assert connect_and_start(tr, br, T0 + 1)["ok"]
+    assert tr.running
     r = tr.cmd_connect(_enc(tr, {"login": 87654321, "password": "pw", "server": "Sim-Real"}))
+    assert r["ok"], r
+    assert not tr.running and not tr.own_positions
+    assert br.login == 87654321 and tr.saved_login == 87654321
+
+
+def test_start_refused_while_stop_is_closing(tmp_path):
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(1, T0, 300)})
+    br.advance(T0 + 1); tr.step(T0 + 1)
+    tr.flatten_pending = True
+    r = tr.cmd_start()
     assert not r["ok"] and "STOP" in r["msg"]
-    assert br.login == 12345678 and tr.saved_login == 12345678
 
 
 def test_algo_trading_disabled_blocks_start(tmp_path):
@@ -116,6 +123,7 @@ def test_autonomous_session_respects_invariants(tmp_path):
 
 def test_stop_closes_only_bot_positions(tmp_path):
     cfg = legacy()
+    cfg.avoid_foreign_conflict = False       # this test places BOTH a SELL and a BUY of other owners: it tests STOP isolation
     tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 3600)}, cfg)
     assert connect_and_start(tr, br, T0 + 1)["ok"]
     manual = br.add_foreign_position("XAUUSD", "SELL", 0.05, magic=0)
@@ -241,6 +249,19 @@ def test_netting_account_does_not_touch_manual_symbol(tmp_path):
     assert connect_and_start(tr, br, T0 + 1)["ok"]
     run(tr, br, T0 + 1, T0 + 1800)
     assert br.sent_orders == 0 and manual in br.positions_
+
+
+def test_bot_never_trades_against_a_foreign_position(tmp_path):
+    """t49u: another EA / manual trade on the symbol in the OPPOSITE direction -> the bot does not open against it."""
+    cfg = legacy()
+    tr, br = make(tmp_path, {"XAUUSD": gen_ticks(5, T0, 1800)}, cfg)
+    br.advance(T0 + 1)
+    sells = br.add_foreign_position("XAUUSD", "SELL", 0.05, magic=0)
+    buys = br.add_foreign_position("XAUUSD", "BUY", 0.05, magic=777)
+    assert connect_and_start(tr, br, T0 + 1)["ok"]
+    run(tr, br, T0 + 1, T0 + 1800)
+    assert br.sent_orders == 0                       # whichever way it wants to go, one of the two is opposite
+    assert sells in br.positions_ and buys in br.positions_
 
 
 def test_encrypted_connect_roundtrip(tmp_path):

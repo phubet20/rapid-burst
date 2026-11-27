@@ -71,6 +71,7 @@ class Trader:
         self.last_receipt: dict[str, float] = {}
         self.sym_status: dict[str, dict] = {}
         self.slippage: dict[str, deque] = {}
+        self._handoff_done = False
         self.pos_state: dict[int, PositionState] = {}
         self.own_positions: list[dict] = []
         self.foreign_positions: list[dict] = []
@@ -278,19 +279,24 @@ class Trader:
         return {"ok": ok, "msg": msg, "validation": self.validation}
 
     def _switch_block(self, creds: dict) -> str:
-        """t46u: switching to a DIFFERENT account is refused while the bot trades or still holds its own positions
-        on the current one (they would be orphaned). Same account re-connect is always allowed."""
+        """t49u: switching to a DIFFERENT account is never refused any more. If the bot is trading (or still holds its
+        own positions) on the current account, it is STOPPED and its positions are closed there first - so nothing is
+        orphaned and two accounts never run at once. Only a failed close blocks the switch (a position that cannot be
+        closed must not be left behind). Same account re-connect is always allowed. Returns "" when the way is clear."""
         cur = self.account.get("login") if (self.conn_state == "CONNECTED" and self.account) else None
         try:
             if cur is None or int(cur) == int(creds["login"]):
                 return ""
         except (TypeError, ValueError):
             return ""
-        if self.running:
-            return f"account {cur} is trading - STOP first, then connect account {creds['login']}"
-        if self.own_positions or self.flatten_pending:
-            return (f"bot positions are still open on account {cur} - close them (STOP) before "
-                    f"connecting account {creds['login']}")
+        if not (self.running or self.own_positions or self.flatten_pending):
+            return ""
+        self.add_log("WARNING", f"switching account {cur} -> {creds['login']}: STOP and close the bot's positions on {cur} first")
+        r = self.cmd_stop()
+        self._handoff_done = bool(r.get("ok"))
+        if not r.get("ok"):
+            return (f"could not close the bot's positions on account {cur} ({r.get('msg')}) - "
+                    f"not switching to {creds['login']} so nothing is left orphaned; press STOP again")
         return ""
 
     def _account_changed(self, new_login) -> None:
@@ -320,6 +326,9 @@ class Trader:
         rebuilds tick buffers from live ticks only (no stale signals)."""
         if self.running:
             return {"ok": True, "msg": "already running", "batch": self.batch.get("id")}
+        if self.stopping or self.flatten_pending:
+            return {"ok": False, "msg": "STOP is still closing the bot's positions - wait until flat, then START "
+                                        "(two actions must never run against each other)"}
         if self.conn_state != "CONNECTED" or not self.broker.is_connected():
             creds = self.store.load_credentials()
             if not creds:
@@ -382,8 +391,14 @@ class Trader:
         if not creds:
             return {"ok": False, "msg": "no credentials"}
         self.add_log("INFO", f"CONNECT MT5 for account {creds['login']} on {creds['server']}")
+        self._handoff_done = False
+        why = self._switch_block(creds)
+        if why:
+            self.add_log("WARNING", why)
+            return {"ok": False, "msg": why, "validation": self.validation, "account": self._account_brief()}
         ok, msg = self._connect(creds)
-        return {"ok": ok, "msg": msg, "validation": self.validation, "account": self._account_brief()}
+        return {"ok": ok, "msg": msg, "validation": self.validation, "account": self._account_brief(),
+                "handoff": bool(self._handoff_done)}
 
     def _account_brief(self) -> Optional[dict]:
         a = self.account if self.conn_state == "CONNECTED" else {}
@@ -588,10 +603,7 @@ class Trader:
         acct = self.account
         if connected:
             mode = ACCOUNT_MODE.get(int(acct.get("trade_mode", -1)), "UNKNOWN")
-            demo_ok = mode in ("DEMO", "CONTEST") or (mode == "REAL" and self.allow_live)
-            add("Account type", demo_ok,
-                f"{mode}" + ("" if demo_ok else " - REAL accounts are locked by the server (RB_ALLOW_LIVE=0)"
-                             if mode == "REAL" else " - unknown account type"))
+            add("Account type", True, f"{mode} - any account type is accepted (no demo/real lock)")
             term = self.terminal
             algo = bool(term.get("trade_allowed")) and not bool(term.get("tradeapi_disabled"))
             add("Algo trading enabled in terminal", algo,
@@ -1074,6 +1086,12 @@ class Trader:
             if not hedging and any(p["symbol"] == s for p in self.foreign_positions):
                 self._skip(s, status, "netting account: symbol already has a (manual) position", now_wall, sig)
                 continue
+            if cfg.avoid_foreign_conflict and hedging:
+                opp = [p for p in self.foreign_positions if p["symbol"] == s and self._side(p) != side]
+                if opp:
+                    self._skip(s, status, f"{side} skipped: another bot / manual position ({self._side(opp[0])} #{opp[0].get('ticket')}) "
+                                          f"is open on {s} - the bot never trades against positions that are not its own", now_wall, sig)
+                    continue
             ok, why = self.pacer.can_enter(s, now_wall)
             if not ok:
                 self._skip(s, status, f"{side} blocked: {why}", now_wall, sig)
@@ -1827,7 +1845,8 @@ class Trader:
                     legs = part                                                      # partial take-profit: only these legs
             if not reason and self.running and not cfg.no_stop_mode and cfg.ip_enabled and (self.bursts.get(key) or {}).get("ip"):
                 reason = self._ip_exit(key, legs, live, m, now_wall)                  # t48u: a loss leaves fast
-            if not reason and self.running and not cfg.no_stop_mode:
+            ip_owned = bool(cfg.ip_single_owner and cfg.ip_enabled and (self.bursts.get(key) or {}).get("ip"))
+            if not reason and self.running and not cfg.no_stop_mode and not ip_owned:
                 grp = self.bursts.get(key) or {}
                 lq = self._liq_exit(key, legs, live, m, now_wall) if (cfg.precision_enabled and grp.get("plan")) else None
                 if lq and lq.startswith("TARGET LIQ"):
@@ -2990,7 +3009,7 @@ class Trader:
                               f"< {c.emergency_margin_level_pct:g}% or data-feed loss)") if c.no_stop_mode
                              else ("ON" if c.broker_sl else "OFF"), "exec_halt": self.exec_halt,
                 "no_stop_mode": c.no_stop_mode, "nostop_margin_use_pct": c.nostop_margin_use_pct,
-                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "scalp_enabled": c.scalp_enabled, "sniper_enabled": c.sniper_enabled, "compound_enabled": c.compound_enabled, "ip_enabled": c.ip_enabled, "alloc_enabled": c.alloc_enabled, "alloc_margin_pct": c.alloc_margin_pct, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
+                "precision_enabled": c.precision_enabled, "m1_only": c.m1_only, "hold_winners": c.hold_winners, "scalp_enabled": c.scalp_enabled, "sniper_enabled": c.sniper_enabled, "compound_enabled": c.compound_enabled, "ip_enabled": c.ip_enabled, "avoid_foreign_conflict": c.avoid_foreign_conflict, "ip_single_owner": c.ip_single_owner, "alloc_enabled": c.alloc_enabled, "alloc_margin_pct": c.alloc_margin_pct, "pe_min": c.pe_min, "pe_rr_min": c.pe_rr_min, "pe_min_confluence": c.pe_min_confluence,
                 "batch_margin_pct": c.batch_margin_pct, "avg_max_layers": c.avg_max_layers, "avg_lot_mult": c.avg_lot_mult,
                 "avg_spacing_atr": c.avg_spacing_atr, "hedge_enabled": c.hedge_enabled, "recovery_after_s": c.recovery_after_s,
                 "recovery_loss_pct": c.recovery_loss_pct, "cycle_tp_pct": c.cycle_tp_pct, "recoveries": dict(self.recoveries),

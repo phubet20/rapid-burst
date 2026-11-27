@@ -232,3 +232,24 @@ def test_pullback_entry_opens_one_basket_with_the_stop_beyond_the_pullback_and_n
     assert "pullback extreme" in g["sl_src"] and g["ip"]["retr"] == 0.45
     assert all(float(p.get("sl", 0.0)) > 0 for p in br.positions_.values())        # broker SL on every order
     assert any("IMPULSE-PULLBACK" in l["msg"] for l in tr.logs if isinstance(l, dict))
+
+
+def test_an_impulse_basket_has_one_owner_the_old_soft_exits_never_fight_it(tmp_path):
+    """t49u: with ip_single_owner the micro/zone/reversal exit families do not close an impulse-pullback basket."""
+    def play(owner):
+        tr, br = _bar_play(tmp_path / ("own" if owner else "off"), ip_enabled=True, m1_every_bar=False, ladder_enabled=False,
+                           max_orders_per_batch=2, min_orders_per_batch=1, alloc_enabled=False, ip_single_owner=owner)
+        base = tr._micro
+
+        def ipm(s, now):
+            m, st = base(s, now)
+            stop = m.bid - 50.0 * (m.atr or 1.0)
+            return m, rep(st, side="BUY", buy=0.8, sell=0.0, reason="IMPULSE-PULLBACK BUY (test)", ip_key=(10, 20), ip_stop=stop,
+                          ip_info={"start": stop - 1.0, "end": m.ask + 1.0, "retr": 0.45, "key": (10, 20), "stop": stop})
+        tr._micro = ipm
+        tr._micro_exit = lambda *a, **k: "MICRO test exit"
+        tr._confirm_soft_exit = lambda key, sym, soft, m, now: soft
+        run(tr, br, T0 + 1, T0 + 8)
+        return [l["msg"] for l in tr.logs if isinstance(l, dict) and "MICRO test exit" in l["msg"]]
+    assert play(False), "control: the legacy soft exit does close the basket"
+    assert not play(True)

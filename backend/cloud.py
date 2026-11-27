@@ -4,7 +4,7 @@ Windows terminal.
 
 * The unchanged launcher (worker/main.py) is started as a child process and
   joins this backend over the loopback WebSocket with WORKER_SECRET, so every
-  START/STOP/CONNECT rule, DEMO gate and ownership rule is exactly the same as
+  START/STOP/CONNECT rule and ownership rule is exactly the same as
   on Windows.
 * Keep-awake: Render free sleeps after 15 minutes without inbound traffic. While
   the engine is STARTING/RUNNING/STOPPING (or holds bot positions) this module

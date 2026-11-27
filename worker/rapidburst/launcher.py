@@ -342,7 +342,11 @@ class Launcher:
                 self.last_connect = {"ok": False, "ts": time.time(), "msg": err}
                 self._save()
                 return {"ok": False, "msg": err}
-            r = await self.engine.request("connect_stored", timeout=120)
+            r = await self.engine.request("connect_stored", timeout=240)
+            if r.get("handoff"):            # t49u: the bot was stopped + flattened on the previous account
+                self.desired = "STOPPED"
+                self.phase = "IDLE" if self.phase in ("RUNNING", "STARTING") else self.phase
+                self.add_log("INFO", "Account switched: the bot was stopped on the previous account - press START for the new one")
             v = r.get("validation") or {}
             self.last_connect = {"ok": bool(r.get("ok")), "validation_ok": bool(v.get("ok")), "ts": time.time(),
                                  "msg": r.get("msg"), "account": r.get("account"),

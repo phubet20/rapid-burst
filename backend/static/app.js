@@ -101,7 +101,7 @@
       if (eng.blocked) why.push("Blocked: " + eng.blocked);
       if (!(eng.selected || []).length && !eng.running) why.push("No symbol selected - CONNECT MT5, then search in Symbols, tick the assets you want (up to 6) and press APPLY.");
       if (!liveOk && !storedOk && !eng.running) {
-        if (!L.has_credentials && st !== "CONNECTED") why.push("CONNECT MT5 has not been done yet - press CONNECT MT5 and enter the demo login, password and server.");
+        if (!L.has_credentials && st !== "CONNECTED") why.push("CONNECT MT5 has not been done yet - press CONNECT MT5 and enter the account login, password and server (demo or real, any broker).");
         else {
           const det = (conn.state === "CONNECTED" ? (val.checks || []).filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`) : (lc && !lc.validation_ok ? (lc.failed_details || lc.failed_checks || []) : []));
           if (det.length) det.forEach((d) => why.push("Check failed - " + d));

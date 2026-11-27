@@ -1,6 +1,6 @@
 """Engine / risk configuration (one engine: the M1 Rapid Basket Scalper).
 
-Any MT5 account (demo or real) can be connected from the UI (t46u); set the server-side RB_ALLOW_LIVE=0 to lock
+Any MT5 account (demo or real, any broker) can be connected from the UI (t46u, t49u: no lock at all); formerly RB_ALLOW_LIVE=0 locked
 REAL accounts out. t30u: the owner asked to remove the risk-amount limits so the account can compound as fast as
 possible; the defaults below are therefore AGGRESSIVE (half the equity at risk per basket if every stop is hit,
 safe mode only at a 50 % drawdown). Every order still carries a hard broker stop.  They can be
@@ -23,11 +23,9 @@ RISK_ENV = (("RB_SAFE_PAUSE_S", "safe_pause_s"),
             ("RB_MB_MAX_BAR_ATR", "mb_max_bar_atr"), ("RB_MB_THRESHOLD", "mb_threshold"),
             ("RB_SL_ATR", "sl_atr"), ("RB_COMMISSION_PER_LOT", "commission_per_lot"))
 def allow_live_from_env(env=None) -> bool:
-    """t46u: the engine trades ANY account the user connects (demo, contest or real). Only an explicit server-side
-    RB_ALLOW_LIVE=0 / false / no / off / demo_only locks it back to DEMO accounts."""
-    import os
-    env = os.environ if env is None else env
-    return str(env.get("RB_ALLOW_LIVE", "")).strip().lower() not in ("0", "false", "no", "off", "demo_only", "demo")
+    """t49u: NO account lock of any kind - demo, contest and real accounts of any broker/server connect and trade.
+    (The old RB_ALLOW_LIVE=0 server switch was removed on the owner's request; the variable is ignored.)"""
+    return True
 
 
 INFRA_ENV = {"RB_ALLOW_LIVE", "RB_BROKER", "RB_CLOUD_DATA_DIR", "RB_CONFIG_FILE", "RB_CONFIG_JSON", "RB_DATA_DIR",
@@ -67,6 +65,7 @@ TUNABLE = {
     "ip_retr_min": (0.15, 0.6), "ip_retr_max": (0.4, 0.85), "ip_fail_retr": (0.6, 1.0), "ip_resume_atr": (0.05, 1.0),
     "ip_be_atr": (0.2, 3.0), "ip_trail_atr": (0.3, 4.0), "ip_m5_flip": (0.1, 0.9), "ip_stale_s": (20.0, 900.0),
     "alloc_enabled": (0, 1), "alloc_margin_pct": (5.0, 90.0),
+    "avoid_foreign_conflict": (0, 1), "ip_single_owner": (0, 1),
     "compound_enabled": (0, 1), "compound_step": (0.05, 1.0), "compound_max_mult": (1.0, 4.0),
     "ladder_enabled": (0, 1), "ladder_first_frac": (0.25, 1.0), "ladder_step_atr": (0.15, 1.5), "ladder_levels": (1, 4), "ladder_ttl_s": (30, 1800), "hold_flip_bias": (0.1, 0.8),
     "exit_spike_atr": (0.1, 3.0), "exit_spike_wick_frac": (0.1, 0.9), "candle_poll_m1_s": (3, 60),
@@ -335,6 +334,11 @@ class EngineConfig:
     # (break-even only after `ip_be_atr` ATR, trail `ip_trail_atr` ATR wide - no stop hugging the price) until the M5 trend turns
     # (bias <= -`ip_m5_flip`) or the trail is hit.
     ip_enabled: bool = True
+    # t49u anti-collision: (1) never open against a position that is NOT the bot's (another EA / manual trade on the same
+    # symbol, opposite side); (2) an impulse-pullback basket has ONE owner - only its own exits (hard stop, protect/trail,
+    # _ip_exit) close it, the older soft exit families (micro/zone/reversal) never fight it
+    avoid_foreign_conflict: bool = True
+    ip_single_owner: bool = True
     ip_m5_bias_min: float = 0.15
     ip_impulse_atr: float = 2.2
     ip_eff_min: float = 0.45
